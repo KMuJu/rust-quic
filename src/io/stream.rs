@@ -7,13 +7,9 @@ use std::{
 
 use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::io::{
-    connection::{Connection, ConnectionInner},
-    frame::Frame,
-    frame_assembler::FrameAssembler,
-};
+use crate::io::{connection::ConnectionInner, frame::Frame, frame_assembler::FrameAssembler};
 
 #[derive(Debug)]
 pub enum Dir {
@@ -36,6 +32,7 @@ pub struct SendStream {
     id: StreamID,
     buffer: BytesMut,
     offset: u64,
+    state: SendState,
 }
 
 pub struct SendStreamHandle {
@@ -89,12 +86,22 @@ impl RecvStream {
     }
 }
 
+enum SendState {
+    Ready,
+    Send,
+    DataSent,
+    DataRecvd,
+    ResetSent,
+    ResetRecvd,
+}
+
 impl SendStream {
     pub(super) fn new(id: StreamID) -> Self {
         Self {
             id,
             buffer: BytesMut::new(),
             offset: 0,
+            state: SendState::Ready,
         }
     }
 
@@ -114,6 +121,17 @@ impl SendStream {
 
     pub(super) fn offset(&self) -> u64 {
         self.offset
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        matches!(
+            self.state,
+            // TODO: Should it be these states?
+            SendState::DataSent
+                | SendState::DataRecvd
+                | SendState::ResetSent
+                | SendState::ResetRecvd
+        )
     }
 }
 
@@ -151,18 +169,62 @@ impl SendStreamHandle {
             // TODO: Different error?
             return Err(SendError::ClosedStream);
         };
+
+        if !matches!(send.state, SendState::Ready | SendState::Send) {
+            return Err(SendError::WrongState);
+        }
+
         send.buffer.put_slice(buf);
         inner.mark_pending_on_send(self.id.clone());
-        println!("Buffered and marked pending");
+        println!("Marked as pending");
 
         Ok(buf.len())
+    }
+
+    pub fn finish(&mut self) -> Result<(), SendError> {
+        let mut inner = self.connection.lock().unwrap();
+
+        let Some(send) = inner.send(&self.id) else {
+            // Stream does not exist, this means that something is wrong
+            // TODO: Different error?
+            return Err(SendError::ClosedStream);
+        };
+
+        if !matches!(send.state, SendState::Send) {
+            return Err(SendError::WrongState);
+        }
+
+        send.state = SendState::DataSent;
+
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StreamID(pub usize);
+pub struct StreamID(usize);
 
 impl StreamID {
+    pub fn new_unchecked(value: usize) -> Self {
+        Self(value)
+    }
+
+    pub fn new(mut value: usize, side: &Side, dir: Dir) -> Self {
+        value -= value & 0b11;
+        value += match side {
+            Side::Client => 0,
+            Side::Server => 0b1,
+        };
+        value += match dir {
+            Dir::Bidir => 0,
+            Dir::Uni => 0b10,
+        };
+        StreamID(value)
+    }
+
+    pub fn value(&self) -> usize {
+        self.0
+    }
+
     pub fn dir(&self) -> Dir {
         if self.0 & 0b10 == 0 {
             Dir::Bidir
@@ -192,4 +254,6 @@ pub enum ReadError {
 pub enum SendError {
     #[error("Closed stream")]
     ClosedStream,
+    #[error("Wrong state")]
+    WrongState,
 }

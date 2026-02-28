@@ -12,7 +12,6 @@ use tokio::net::UdpSocket;
 async fn main() -> io::Result<()> {
     // let socket = UdpSocket::bind("127.0.0.1:32030").await?;
     // socket.connect(("127.0.0.1", 42069)).await?;
-
     // send_packets(&socket).await?;
 
     let mut endpoint = Endpoint::new(([127, 0, 0, 1], 32030).into()).await?;

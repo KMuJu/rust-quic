@@ -165,7 +165,7 @@ impl Frame {
                 })
             }
             RESET_STREAM => {
-                let id = StreamID(variable_length_decode(buf)?);
+                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
                 let error_code = variable_length_decode(buf)?;
                 let final_size = variable_length_decode(buf)?;
                 Ok(ResetStream {
@@ -175,7 +175,7 @@ impl Frame {
                 })
             }
             STOP_SENDING => {
-                let id = StreamID(variable_length_decode(buf)?);
+                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
                 let error_code = variable_length_decode(buf)?;
                 Ok(StopSending { id, error_code })
             }
@@ -205,7 +205,7 @@ impl Frame {
                 Ok(MaxData { max_data })
             }
             MAX_STREAM_DATA => {
-                let id = StreamID(variable_length_decode(buf)?);
+                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
                 let max_stream_data = variable_length_decode(buf)?;
                 Ok(MaxStreamData {
                     id,
@@ -226,7 +226,7 @@ impl Frame {
                 Ok(DataBlocked { max_data })
             }
             STREAM_DATA_BLOCKED => {
-                let id = StreamID(variable_length_decode(buf)?);
+                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
                 let max_stream_data = variable_length_decode(buf)?;
                 Ok(StreamDataBlocked {
                     id,
@@ -307,7 +307,7 @@ impl Frame {
             }
             HANDSHAKE_DONE => Ok(HandshakeDone),
             val if STREAM.contains(&val) => {
-                let id = StreamID(variable_length_decode(buf)?);
+                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
                 let fin = t & 0x1 == 0x1;
                 let offset = if t & 0x04 == 0x04 {
                     variable_length_decode(buf)?
@@ -375,13 +375,13 @@ impl Frame {
                 final_size,
             } => {
                 variable_length_encode(buf, RESET_STREAM as usize)?;
-                variable_length_encode(buf, id.0)?;
+                variable_length_encode(buf, id.value())?;
                 variable_length_encode(buf, *error_code)?;
                 variable_length_encode(buf, *final_size)?;
             }
             Frame::StopSending { id, error_code } => {
                 variable_length_encode(buf, STOP_SENDING as usize)?;
-                variable_length_encode(buf, id.0)?;
+                variable_length_encode(buf, id.value())?;
                 variable_length_encode(buf, *error_code)?;
             }
             Frame::Crypto { offset, data } => {
@@ -408,7 +408,7 @@ impl Frame {
                     + (if *fin { 1 } else { 0 });
 
                 variable_length_encode(buf, t)?;
-                variable_length_encode(buf, id.0)?;
+                variable_length_encode(buf, id.value())?;
                 if *offset > 0 {
                     variable_length_encode(buf, *offset)?;
                 }
@@ -431,7 +431,7 @@ impl Frame {
                 max_stream_data,
             } => {
                 variable_length_encode(buf, MAX_STREAM_DATA as usize)?;
-                variable_length_encode(buf, id.0)?;
+                variable_length_encode(buf, id.value())?;
                 variable_length_encode(buf, *max_stream_data)?;
             }
             Frame::MaxStreams { dir, max_streams } => {
@@ -450,7 +450,7 @@ impl Frame {
                 max_stream_data,
             } => {
                 variable_length_encode(buf, STREAM_DATA_BLOCKED as usize)?;
-                variable_length_encode(buf, id.0)?;
+                variable_length_encode(buf, id.value())?;
                 variable_length_encode(buf, *max_stream_data)?;
             }
             Frame::StreamsBlocked { dir, max_streams } => {
@@ -568,7 +568,7 @@ impl Frame {
                 offset,
                 data,
             } => {
-                let i = variable_length(id.0 as u64);
+                let i = variable_length(id.value() as u64);
                 let o = if *offset != 0 {
                     variable_length(*offset as u64)
                 } else {
@@ -679,7 +679,7 @@ mod test {
     #[test]
     fn encode_decode_stream_frame() {
         let stream = Frame::Stream {
-            id: StreamID(1),
+            id: StreamID::new_unchecked(1),
             fin: false,
             last: true,
             offset: 3,
@@ -706,7 +706,7 @@ mod test {
                 offset,
                 data,
             } => {
-                assert_eq!(id.0, 1);
+                assert_eq!(id.value(), 1);
                 assert!(!fin);
                 assert!(last);
                 assert_eq!(offset, 3);

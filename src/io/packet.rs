@@ -136,6 +136,20 @@ impl PacketNumber {
     }
 }
 
+impl From<usize> for PacketNumber {
+    fn from(value: usize) -> Self {
+        if value <= 255 {
+            Self::U8(value as u8)
+        } else if value <= 65_535 {
+            Self::U16(value as u16)
+        } else if value <= 16_777_215 {
+            Self::U24(value as u32)
+        } else {
+            Self::U32(value as u32)
+        }
+    }
+}
+
 impl Debug for PacketNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("PacketNumber").field(&self.u32()).finish()

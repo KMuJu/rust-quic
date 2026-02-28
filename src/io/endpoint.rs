@@ -1,14 +1,13 @@
-use core::task::Poll::Ready;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, Cursor},
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
-use futures::task::AtomicWaker;
+use bytes::BytesMut;
 use rand::rngs::StdRng;
 use thiserror::Error;
 use tokio::{
@@ -18,20 +17,22 @@ use tokio::{
 };
 
 use crate::io::{
-    connection::{Connection, ConnectionID, Incoming, IncomingInner},
+    ConnectionToEndpoint, EndpointToConnection,
+    connection::{Connection, ConnectionHandle, ConnectionID, Incoming, IncomingInner},
     packet::{Packet, PacketError},
     stream::Side,
 };
 
 pub struct EndpointState {
-    pub socket: UdpSocket,
-    pub connections: HashMap<ConnectionID, Connection>,
+    socket: UdpSocket,
+    connection_handles: HashMap<ConnectionID, ConnectionHandle>,
+    pub(super) connections: HashMap<ConnectionID, Connection>,
     rng: StdRng,
     incoming_tx: UnboundedSender<IncomingInner>,
-    stashed_packet: Option<(Vec<u8>, ConnectionID)>,
-    cid_to_ip: HashMap<ConnectionID, SocketAddr>,
+    stashed_packet: VecDeque<(BytesMut, SocketAddr)>,
     cid_len: u8,
-    driver_waker: Arc<AtomicWaker>,
+    outgoing_rx: UnboundedReceiver<ConnectionToEndpoint>, // Receives data from connections
+    outgoing_tx: UnboundedSender<ConnectionToEndpoint>,   // To be cloned into connections
 }
 
 pub struct EndpointInner {
@@ -46,15 +47,17 @@ pub struct Endpoint {
 impl Endpoint {
     pub async fn new(addr: SocketAddr) -> io::Result<Self> {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = EndpointState {
             socket: UdpSocket::bind(addr).await?,
+            connection_handles: HashMap::new(),
             connections: HashMap::new(),
             rng: rand::make_rng(),
             incoming_tx,
-            stashed_packet: None,
-            cid_to_ip: HashMap::new(),
-            cid_len: 8,
-            driver_waker: Arc::new(AtomicWaker::new()),
+            stashed_packet: VecDeque::new(),
+            cid_len: 4,
+            outgoing_rx,
+            outgoing_tx,
         };
         let endpoint = EndpointInner {
             state: Mutex::new(state),
@@ -85,9 +88,22 @@ impl Endpoint {
         let peer_cid = ConnectionID::new(state.cid_len, &mut state.rng);
         let cid = ConnectionID::new(state.cid_len, &mut state.rng);
 
-        let conn = Connection::new(cid, peer_cid, Side::Client, state.driver_waker.clone());
+        let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = Connection::new(
+            cid,
+            peer_cid,
+            addr,
+            Side::Client,
+            incoming_rx,
+            state.outgoing_tx.clone(),
+        );
+        let handle = ConnectionHandle {
+            addr,
+            incoming_data,
+        };
+
+        state.connection_handles.insert(cid, handle);
         state.connections.insert(cid, conn.clone());
-        state.cid_to_ip.insert(cid, addr);
 
         conn.init();
 
@@ -104,18 +120,33 @@ impl EndpointState {
         src_cid: ConnectionID,
         addr: SocketAddr,
     ) {
+        let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         // TODO: Always server??
-        let connection = Connection::new(dst_cid, src_cid, Side::Server, self.driver_waker.clone());
-        self.connections.insert(dst_cid, connection.clone());
+        let connection = Connection::new(
+            dst_cid,
+            src_cid,
+            addr,
+            Side::Server,
+            incoming_rx,
+            self.outgoing_tx.clone(),
+        );
+
+        let handle = ConnectionHandle {
+            addr,
+            incoming_data,
+        };
+
+        self.connection_handles.insert(dst_cid, handle);
+        self.connections.insert(dst_cid, connection);
 
         // TODO: Handle create incomming connection
         let incoming = IncomingInner::new(dst_cid, src_cid);
         self.incoming_tx.send(incoming).unwrap();
-        self.cid_to_ip.insert(dst_cid, addr);
     }
 
     fn handle_datagram(&mut self, data: &[u8], addr: SocketAddr) {
-        println!("Datagram: {data:?}");
+        // println!("Datagram: {data:?}");
+        // TODO: Swap with peek header thingy
         let packet = match Packet::decode(&mut Cursor::new(data), self.cid_len) {
             Ok(p) => p,
             Err(e) => {
@@ -123,18 +154,20 @@ impl EndpointState {
                 return;
             }
         };
+        let cid = packet.dst_cid();
         if let Some(src_cid) = packet.src_cid() {
-            self.insert_new_connection(packet.dst_cid(), src_cid, addr);
+            self.insert_new_connection(cid, src_cid, addr);
         }
 
-        let cid = packet.dst_cid();
-        let Some(connection) = self.connections.get_mut(&cid) else {
-            println!("Could not get connection: {cid:?}");
-            println!("Connections: {:?}", self.connections);
-            return;
-        };
-
-        connection.handle_datagram(packet);
+        if let Some(handle) = self.connection_handles.get(&cid) {
+            handle
+                .incoming_data
+                .send(EndpointToConnection {
+                    data: data.to_vec(),
+                    addr,
+                })
+                .unwrap();
+        }
     }
 
     fn handle_recv(&mut self, cx: &mut Context<'_>) -> Result<bool, io::Error> {
@@ -162,37 +195,28 @@ impl EndpointState {
     }
 
     fn handle_send(&mut self, cx: &mut Context<'_>) -> Result<bool, PacketError> {
-        if let Some((packet, cid)) = &self.stashed_packet {
-            let Ready(_) = self
-                .socket
-                .poll_send_to(cx, packet, *self.cid_to_ip.get(cid).unwrap())
-            else {
+        while let Some((packet, addr)) = self.stashed_packet.pop_front() {
+            let Poll::Ready(_) = self.socket.poll_send_to(cx, &packet, addr) else {
+                self.stashed_packet.push_front((packet, addr));
                 return Ok(false); // False because poll_send_to will wake
             };
-            self.stashed_packet = None;
         }
 
-        println!("Handling send");
-        let mut did_work = false;
-        for (cid, conn) in self.connections.iter_mut() {
-            let Some(packet) = conn.get_packet(1200) else {
-                continue;
-            };
+        loop {
+            let msg = match self.outgoing_rx.poll_recv(cx) {
+                Poll::Pending => return Ok(false),
+                Poll::Ready(msg) => msg,
+            }
+            .unwrap(); // WARN: Handle?
 
-            let mut buf: Vec<u8> = Vec::new();
-            packet.encode(&mut buf)?;
-
-            let Ready(_) = self
+            if self
                 .socket
-                .poll_send_to(cx, &buf, *self.cid_to_ip.get(cid).unwrap())
-            else {
-                self.stashed_packet = Some((buf, *cid));
-                return Ok(false); // False because poll_send_to will wake
-            };
-            did_work = true;
+                .poll_send_to(cx, &msg.data, msg.addr)
+                .is_pending()
+            {
+                self.stashed_packet.push_back((msg.data, msg.addr));
+            }
         }
-
-        Ok(did_work)
     }
 }
 
@@ -219,11 +243,7 @@ impl Future for EndpointDriver {
         //     return Poll::Pending;
         // };
 
-        // println!("Waiting for endpoint");
         let mut endpoint = self.0.state.lock().unwrap();
-        // println!("Got endpoint");
-
-        endpoint.driver_waker.register(cx.waker());
 
         let mut did_work = false;
         // Receive packets

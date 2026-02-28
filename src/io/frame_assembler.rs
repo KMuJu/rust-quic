@@ -6,7 +6,6 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use bytes::BytesMut;
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, ReadBuf};
 
