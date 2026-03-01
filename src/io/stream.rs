@@ -26,6 +26,7 @@ pub enum Side {
 pub struct RecvStream {
     id: StreamID,
     assembler: FrameAssembler,
+    state: RecvState,
 }
 
 pub struct SendStream {
@@ -56,6 +57,7 @@ impl RecvStream {
         Self {
             id,
             assembler: FrameAssembler::new(),
+            state: RecvState::Recv,
         }
     }
 
@@ -77,13 +79,29 @@ impl RecvStream {
                 data,
             } => {
                 // TODO: Handle fin bit
-                self.assembler.add(data, offset as u64);
+                if matches!(self.state, RecvState::Recv | RecvState::SizeKnown) {
+                    self.assembler.add(data, offset as u64);
+                    if fin {
+                        self.state = RecvState::SizeKnown;
+                    }
+                } else {
+                    eprint!("Received data in wrong state");
+                }
             }
             Frame::MaxStreamData { .. } => todo!(),
             Frame::StreamDataBlocked { .. } => todo!(),
             _ => (),
         };
     }
+}
+
+enum RecvState {
+    Recv,
+    SizeKnown,
+    DataRecv,
+    DataRead,
+    ResetRecvd,
+    ResetRead,
 }
 
 enum SendState {
