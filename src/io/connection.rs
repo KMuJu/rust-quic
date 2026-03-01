@@ -47,10 +47,8 @@ pub struct ConnectionInner {
 
     write_waker: AtomicWaker,
 
-    incoming_data: UnboundedReceiver<EndpointToConnection>,
-    outgoing_data: UnboundedSender<ConnectionToEndpoint>,
-
     packet_number: usize,
+    stream_number: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -66,7 +64,7 @@ impl ConnectionID {
             buf: [0u8; 20],
         };
         // TODO: Potential bug
-        buf.copy_to_slice(&mut id.buf[..buf.remaining().min(len as usize)]);
+        buf.copy_to_slice(&mut id.buf[..len as usize]);
         id
     }
 
@@ -195,9 +193,8 @@ impl ConnectionInner {
         }
 
         let last = frames.last_mut().unwrap();
-        match last {
-            Frame::Stream { fin, .. } => *fin = true,
-            _ => (),
+        if let Frame::Stream { fin, .. } = last {
+            *fin = true
         };
 
         let mut payload = BytesMut::with_capacity(orig_mtu);
@@ -269,12 +266,14 @@ impl Connection {
             pending_send: VecDeque::new(),
             pending_packets: VecDeque::new(),
             write_waker: AtomicWaker::new(),
-            incoming_data,
-            outgoing_data,
             packet_number: 0,
+            stream_number: 0,
         }));
         let driver = ConnectionDriver {
             inner: inner.clone(),
+            incoming_data,
+            outgoing_data,
+            addr,
         };
 
         tokio::spawn(driver);
@@ -300,7 +299,7 @@ impl Connection {
     pub async fn accept_uni(&self) -> RecvStreamHandle {
         poll_fn(|cx| {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(id) = inner.bidir_acceptable.pop_front() {
+            if let Some(id) = inner.unidir_acceptable.pop_front() {
                 Poll::Ready(RecvStreamHandle::new(id, self.inner.clone()))
             } else {
                 inner.bidir_accept_waker.register(cx.waker());
@@ -312,7 +311,8 @@ impl Connection {
 
     pub fn open_bidir(&self) -> (RecvStreamHandle, SendStreamHandle) {
         let mut inner = self.inner.lock().unwrap();
-        let id = StreamID::new(1, &inner.side, Dir::Bidir); // TODO: Handle :)
+        let id = StreamID::new(inner.stream_number, &inner.side, Dir::Bidir); // TODO: Handle :)
+        inner.stream_number += 1;
         let recv = RecvStream::new(id.clone());
         let send = SendStream::new(id.clone());
 
@@ -392,33 +392,56 @@ impl Future for Incoming {
 // exists
 struct ConnectionDriver {
     inner: Arc<Mutex<ConnectionInner>>,
+    incoming_data: UnboundedReceiver<EndpointToConnection>,
+    outgoing_data: UnboundedSender<ConnectionToEndpoint>,
+    addr: SocketAddr,
 }
 
 impl Future for ConnectionDriver {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut conn = self.inner.lock().unwrap();
-        conn.write_waker.register(cx.waker());
-
-        while let Poll::Ready(data) = conn.incoming_data.poll_recv(cx) {
-            let data = data.unwrap();
-            conn.handle_datagram(&data.data);
+        let this = self.get_mut();
+        let mut buffer = Vec::new();
+        let count = this
+            .incoming_data
+            .poll_recv_many(cx, &mut buffer, usize::MAX); // If it is pending
+        if count == Poll::Ready(0) {
+            // Channel is closed
+            eprint!("Connection driver channel is closed");
+            return Poll::Ready(());
         }
 
-        while !conn.pending_send.is_empty() {
-            let Some(packet) = conn.get_packet(1200) else {
-                continue;
-            };
+        if !buffer.is_empty() {
+            let mut conn = this.inner.lock().unwrap();
 
+            for data in buffer {
+                conn.handle_datagram(&data.data);
+            }
+        }
+        let packets: Vec<_> = {
+            let mut conn = this.inner.lock().unwrap();
+            conn.write_waker.register(cx.waker());
+            let mut pkts = Vec::new();
+            while !conn.pending_send.is_empty() {
+                if let Some(p) = conn.get_packet(1200) {
+                    pkts.push(p);
+                } else {
+                    break;
+                }
+            }
+            pkts
+        };
+
+        for packet in packets {
             let mut buf = BytesMut::new();
-            packet.encode(&mut buf).unwrap(); // WARN: Handle
-
-            let to_endpoint = ConnectionToEndpoint {
-                data: buf,
-                addr: conn.addr,
-            };
-            conn.outgoing_data.send(to_endpoint).unwrap(); // WARN: Handle
+            packet.encode(&mut buf).unwrap();
+            this.outgoing_data
+                .send(ConnectionToEndpoint {
+                    data: buf,
+                    addr: this.addr,
+                })
+                .unwrap();
         }
 
         Poll::Pending
