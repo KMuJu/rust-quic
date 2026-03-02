@@ -2,40 +2,36 @@ use bytes::{Buf, BufMut};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum DecodeError {
+pub enum VarIntError {
     #[error("Invalid frame for different reasons")]
     InvalidFrame,
     #[error("Not enough data in the buffer when parsing")]
     NotEnoughData,
-}
-
-#[derive(Debug, Error)]
-pub enum EncodeError {
     #[error("Variable length is too large")]
     InvalidVariableLength,
 }
 
-pub fn variable_length_decode<B: Buf>(buf: &mut B) -> Result<usize, DecodeError> {
+pub fn variable_length_decode<B: Buf>(buf: &mut B) -> Result<u64, VarIntError> {
     if !buf.has_remaining() {
-        return Err(DecodeError::NotEnoughData);
+        return Err(VarIntError::NotEnoughData);
     }
     let v = buf.get_u8();
     let prefix = v >> 6;
     let len = 1 << prefix;
     if buf.remaining() + 1 < len {
-        return Err(DecodeError::NotEnoughData);
+        return Err(VarIntError::NotEnoughData);
     }
 
-    let mut data: usize = v as usize & 0x3f;
+    let mut data: u64 = v as u64 & 0x3f;
 
     for _ in 0..len - 1 {
-        data = (data << 8) + buf.get_u8() as usize;
+        data = (data << 8) + buf.get_u8() as u64;
     }
 
     Ok(data)
 }
 
-pub fn variable_length_encode<B: BufMut>(buf: &mut B, data: usize) -> Result<(), EncodeError> {
+pub fn variable_length_encode<B: BufMut>(buf: &mut B, data: u64) -> Result<(), VarIntError> {
     if data < 63 {
         buf.put_u8(data as u8);
     } else if data < 16383 {
@@ -45,7 +41,7 @@ pub fn variable_length_encode<B: BufMut>(buf: &mut B, data: usize) -> Result<(),
     } else if data < 4611686018427387903 {
         buf.put_u64((0b11 << 62) + data as u64);
     } else {
-        return Err(EncodeError::InvalidVariableLength); // TODO: find better error
+        return Err(VarIntError::InvalidVariableLength); // TODO: find better error
     }
     Ok(())
 }
@@ -64,13 +60,28 @@ pub fn variable_length(data: u64) -> usize {
     }
 }
 
+#[derive(Debug)]
+pub struct VarInt(pub u64);
+
+impl VarInt {
+    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, VarIntError> {
+        Ok(VarInt(variable_length_decode(buf)?))
+    }
+    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), VarIntError> {
+        variable_length_encode(buf, self.0)
+    }
+    pub fn length(&self) -> usize {
+        variable_length(self.0)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::io::Cursor;
 
     use super::*;
     #[test]
-    fn test_variable_length_decode() -> Result<(), DecodeError> {
+    fn test_variable_length_decode() -> Result<(), VarIntError> {
         let data = [0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c];
         let output = variable_length_decode(&mut Cursor::new(data))?;
         assert_eq!(output, 151_288_809_941_952_652);
@@ -91,7 +102,7 @@ mod test {
     }
 
     #[test]
-    fn test_variable_length_encode() -> Result<(), EncodeError> {
+    fn test_variable_length_encode() -> Result<(), VarIntError> {
         let mut out: Vec<u8> = Vec::new();
         variable_length_encode(&mut out, 151_288_809_941_952_652)?;
         assert_eq!(out, vec![0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]);

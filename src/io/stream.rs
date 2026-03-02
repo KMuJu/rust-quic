@@ -80,7 +80,7 @@ impl RecvStream {
             } => {
                 // TODO: Handle fin bit
                 if matches!(self.state, RecvState::Recv | RecvState::SizeKnown) {
-                    self.assembler.add(data, offset as u64);
+                    self.assembler.add(data, offset.0);
                     if fin {
                         self.state = RecvState::SizeKnown;
                     }

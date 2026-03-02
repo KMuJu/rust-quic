@@ -3,9 +3,7 @@ use thiserror::Error;
 
 use crate::io::{
     connection::ConnectionID,
-    encoding::{
-        DecodeError, EncodeError, variable_length, variable_length_decode, variable_length_encode,
-    },
+    encoding::{VarInt, VarIntError, variable_length, variable_length_encode},
     packet::Token,
     stream::{Dir, StreamID},
 };
@@ -44,24 +42,24 @@ pub(super) enum Frame {
     Padding,
     Ping,
     Ack {
-        largest: usize,
-        delay: usize,
-        range_count: usize,
-        first_range: usize,
+        largest: VarInt,
+        delay: VarInt,
+        range_count: VarInt,
+        first_range: VarInt,
         ranges: Vec<AckRange>,
         ecn: Option<EcnCounts>,
     },
     ResetStream {
         id: StreamID,
-        error_code: usize, // TODO: Make spesific type?
-        final_size: usize,
+        error_code: VarInt, // TODO: Make spesific type?
+        final_size: VarInt,
     },
     StopSending {
         id: StreamID,
-        error_code: usize, // TODO: Make spesific type?
+        error_code: VarInt, // TODO: Make spesific type?
     },
     Crypto {
-        offset: usize,
+        offset: VarInt,
         data: Vec<u8>,
     },
     NewToken {
@@ -71,39 +69,39 @@ pub(super) enum Frame {
         id: StreamID,
         fin: bool,
         last: bool,
-        offset: usize,
+        offset: VarInt,
         data: Bytes,
     },
     MaxData {
-        max_data: usize,
+        max_data: VarInt,
     },
     MaxStreamData {
         id: StreamID,
-        max_stream_data: usize,
+        max_stream_data: VarInt,
     },
     MaxStreams {
         dir: Dir,
-        max_streams: usize,
+        max_streams: VarInt,
     },
     DataBlocked {
-        max_data: usize,
+        max_data: VarInt,
     },
     StreamDataBlocked {
         id: StreamID,
-        max_stream_data: usize,
+        max_stream_data: VarInt,
     },
     StreamsBlocked {
         dir: Dir,
-        max_streams: usize,
+        max_streams: VarInt,
     },
     NewConnectionId {
-        seq_num: usize,
-        retire: usize,
+        seq_num: VarInt,
+        retire: VarInt,
         cid: ConnectionID,
         stateless_reset_token: Token, // TODO: This should be fixed size. Different type?
     },
     RetireConnectionId {
-        seq_num: usize,
+        seq_num: VarInt,
     },
     PathChallenge {
         data: [u8; 8],
@@ -112,12 +110,12 @@ pub(super) enum Frame {
         data: [u8; 8],
     },
     ConnectionCloseQuic {
-        error_code: usize,
-        frame_type: usize,
+        error_code: VarInt,
+        frame_type: VarInt,
         reason_phrase: Vec<u8>,
     },
     ConnectionCloseApp {
-        error_code: usize,
+        error_code: VarInt,
         reason_phrase: Vec<u8>,
     },
     HandshakeDone,
@@ -125,31 +123,31 @@ pub(super) enum Frame {
 
 impl Frame {
     pub(crate) fn decode<B: Buf>(buf: &mut B) -> Result<Self, FrameDecodeError> {
-        let t = variable_length_decode(buf)? as u64;
+        let t = VarInt::decode(buf)?;
 
         use Frame::*;
         use frame_type::*;
-        match t {
+        match t.0 {
             PADDING => Ok(Padding),
             PING => Ok(Ping),
             ACK | ACK_ECN => {
-                let largest = variable_length_decode(buf)?;
-                let delay = variable_length_decode(buf)?;
-                let range_count = variable_length_decode(buf)?;
-                let first_range = variable_length_decode(buf)?;
-                let mut ranges = Vec::with_capacity(range_count);
+                let largest = VarInt::decode(buf)?;
+                let delay = VarInt::decode(buf)?;
+                let range_count = VarInt::decode(buf)?;
+                let first_range = VarInt::decode(buf)?;
+                let mut ranges = Vec::with_capacity(range_count.0 as usize);
 
                 // TODO: Actually handle ranges
-                for _ in 0..range_count {
-                    let gap = variable_length_decode(buf)?;
-                    let length = variable_length_decode(buf)?;
+                for _ in 0..range_count.0 {
+                    let gap = VarInt::decode(buf)?;
+                    let length = VarInt::decode(buf)?;
                     ranges.push(AckRange { gap, length });
                 }
 
-                let ecn = if t == ACK_ECN {
-                    let ect0 = variable_length_decode(buf)?;
-                    let ect1 = variable_length_decode(buf)?;
-                    let ecn = variable_length_decode(buf)?;
+                let ecn = if t.0 == ACK_ECN {
+                    let ect0 = VarInt::decode(buf)?;
+                    let ect1 = VarInt::decode(buf)?;
+                    let ecn = VarInt::decode(buf)?;
                     Some(EcnCounts { ect0, ect1, ecn })
                 } else {
                     None
@@ -165,9 +163,9 @@ impl Frame {
                 })
             }
             RESET_STREAM => {
-                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
-                let error_code = variable_length_decode(buf)?;
-                let final_size = variable_length_decode(buf)?;
+                let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
+                let error_code = VarInt::decode(buf)?;
+                let final_size = VarInt::decode(buf)?;
                 Ok(ResetStream {
                     id,
                     error_code,
@@ -175,77 +173,77 @@ impl Frame {
                 })
             }
             STOP_SENDING => {
-                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
-                let error_code = variable_length_decode(buf)?;
+                let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
+                let error_code = VarInt::decode(buf)?;
                 Ok(StopSending { id, error_code })
             }
             CRYPTO => {
-                let offset = variable_length_decode(buf)?;
-                let length = variable_length_decode(buf)?;
-                if buf.remaining() < length {
+                let offset = VarInt::decode(buf)?;
+                let length = VarInt::decode(buf)?;
+                if buf.remaining() < length.0 as usize {
                     return Err(FrameDecodeError::NotEnoughData);
                 }
-                let mut data = vec![0u8; length];
+                let mut data = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut data);
                 Ok(Crypto { offset, data })
             }
             NEW_TOKEN => {
-                let length = variable_length_decode(buf)?;
-                if buf.remaining() < length {
+                let length = VarInt::decode(buf)?;
+                if buf.remaining() < length.0 as usize {
                     return Err(FrameDecodeError::NotEnoughData);
                 }
-                let mut token = vec![0u8; length];
+                let mut token = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut token);
                 Ok(NewToken {
                     token: Token(token),
                 })
             }
             MAX_DATA => {
-                let max_data = variable_length_decode(buf)?;
+                let max_data = VarInt::decode(buf)?;
                 Ok(MaxData { max_data })
             }
             MAX_STREAM_DATA => {
-                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
-                let max_stream_data = variable_length_decode(buf)?;
+                let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
+                let max_stream_data = VarInt::decode(buf)?;
                 Ok(MaxStreamData {
                     id,
                     max_stream_data,
                 })
             }
             MAX_STREAMS_UNI | MAX_STREAMS_BIDIR => {
-                let dir = if t == MAX_STREAMS_BIDIR {
+                let dir = if t.0 == MAX_STREAMS_BIDIR {
                     Dir::Bidir
                 } else {
                     Dir::Uni
                 };
-                let max_streams = variable_length_decode(buf)?;
+                let max_streams = VarInt::decode(buf)?;
                 Ok(MaxStreams { dir, max_streams })
             }
             DATA_BLOCKED => {
-                let max_data = variable_length_decode(buf)?;
+                let max_data = VarInt::decode(buf)?;
                 Ok(DataBlocked { max_data })
             }
             STREAM_DATA_BLOCKED => {
-                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
-                let max_stream_data = variable_length_decode(buf)?;
+                let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
+                let max_stream_data = VarInt::decode(buf)?;
                 Ok(StreamDataBlocked {
                     id,
                     max_stream_data,
                 })
             }
             STREAMS_BLOCKED_UNI | STREAMS_BLOCKED_BIDIR => {
-                let dir = if t == STREAMS_BLOCKED_BIDIR {
+                let dir = if t.0 == STREAMS_BLOCKED_BIDIR {
                     Dir::Bidir
                 } else {
                     Dir::Uni
                 };
-                let max_streams = variable_length_decode(buf)?;
+                let max_streams = VarInt::decode(buf)?;
                 Ok(StreamsBlocked { dir, max_streams })
             }
             NEW_CONNECTION_ID => {
-                let seq_num = variable_length_decode(buf)?;
-                let retire = variable_length_decode(buf)?;
-                let length = buf.try_get_u8().map_err(|_| DecodeError::NotEnoughData)?;
+                let seq_num = VarInt::decode(buf)?;
+                let retire = VarInt::decode(buf)?;
+                let length = buf.try_get_u8().map_err(|_| VarIntError::NotEnoughData)?;
                 if length > 20 || length == 0 {
                     return Err(FrameDecodeError::ProtocolViolation);
                 }
@@ -264,7 +262,7 @@ impl Frame {
                 })
             }
             RETIRE_CONNECTION_ID => {
-                let seq_num = variable_length_decode(buf)?;
+                let seq_num = VarInt::decode(buf)?;
                 Ok(RetireConnectionId { seq_num })
             }
             PATH_CHALLENGE => {
@@ -278,13 +276,13 @@ impl Frame {
                 Ok(PathResponse { data })
             }
             CONNECTION_CLOSE_QUIC_LAYER => {
-                let error_code = variable_length_decode(buf)?;
-                let frame_type = variable_length_decode(buf)?;
-                let length = variable_length_decode(buf)?;
-                if buf.remaining() < length {
+                let error_code = VarInt::decode(buf)?;
+                let frame_type = VarInt::decode(buf)?;
+                let length = VarInt::decode(buf)?;
+                if buf.remaining() < length.0 as usize {
                     return Err(FrameDecodeError::NotEnoughData);
                 }
-                let mut reason_phrase = vec![0u8; length];
+                let mut reason_phrase = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut reason_phrase);
                 Ok(ConnectionCloseQuic {
                     error_code,
@@ -293,12 +291,12 @@ impl Frame {
                 })
             }
             CONNECTION_CLOSE_APP_LAYER => {
-                let error_code = variable_length_decode(buf)?;
-                let length = variable_length_decode(buf)?;
-                if buf.remaining() < length {
+                let error_code = VarInt::decode(buf)?;
+                let length = VarInt::decode(buf)?;
+                if buf.remaining() < length.0 as usize {
                     return Err(FrameDecodeError::NotEnoughData);
                 }
-                let mut reason_phrase = vec![0u8; length];
+                let mut reason_phrase = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut reason_phrase);
                 Ok(ConnectionCloseApp {
                     error_code,
@@ -307,20 +305,20 @@ impl Frame {
             }
             HANDSHAKE_DONE => Ok(HandshakeDone),
             val if STREAM.contains(&val) => {
-                let id = StreamID::new_unchecked(variable_length_decode(buf)?);
-                let fin = t & 0x1 == 0x1;
-                let offset = if t & 0x04 == 0x04 {
-                    variable_length_decode(buf)?
+                let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
+                let fin = t.0 & 0x1 == 0x1;
+                let offset = if t.0 & 0x04 == 0x04 {
+                    VarInt::decode(buf)?
                 } else {
-                    0
+                    VarInt(0)
                 };
                 // TODO: refactor?
-                let (data, last) = if t & 0x02 == 0x02 {
-                    let len = variable_length_decode(buf)?;
-                    if len > buf.remaining() {
+                let (data, last) = if t.0 & 0x02 == 0x02 {
+                    let len = VarInt::decode(buf)?;
+                    if len.0 as usize > buf.remaining() {
                         return Err(FrameDecodeError::NotEnoughData);
                     }
-                    (buf.copy_to_bytes(len), false)
+                    (buf.copy_to_bytes(len.0 as usize), false)
                 } else {
                     (buf.copy_to_bytes(buf.remaining()), false)
                 };
@@ -340,9 +338,9 @@ impl Frame {
         use frame_type::*;
         match self {
             Frame::Padding => {
-                variable_length_encode(buf, PADDING as usize)?;
+                variable_length_encode(buf, PADDING)?;
             }
-            Frame::Ping => variable_length_encode(buf, PING as usize)?,
+            Frame::Ping => variable_length_encode(buf, PING)?,
             Frame::Ack {
                 largest,
                 delay,
@@ -352,21 +350,22 @@ impl Frame {
                 ecn,
             } => {
                 let t = if ecn.is_none() { ACK } else { ACK_ECN };
-                variable_length_encode(buf, t as usize)?;
-                variable_length_encode(buf, *largest)?;
-                variable_length_encode(buf, *delay)?;
-                variable_length_encode(buf, *range_count)?;
-                variable_length_encode(buf, *first_range)?;
+                VarInt(t).encode(buf)?;
+                largest.encode(buf)?;
+                delay.encode(buf)?;
+                range_count.encode(buf)?;
+                first_range.encode(buf)?;
+                first_range.encode(buf);
 
                 for range in ranges.iter() {
-                    variable_length_encode(buf, range.gap)?;
-                    variable_length_encode(buf, range.length)?;
+                    range.gap.encode(buf);
+                    range.length.encode(buf);
                 }
 
                 if let Some(ecn) = ecn {
-                    variable_length_encode(buf, ecn.ect0)?;
-                    variable_length_encode(buf, ecn.ect1)?;
-                    variable_length_encode(buf, ecn.ecn)?;
+                    ecn.ect0.encode(buf)?;
+                    ecn.ect1.encode(buf)?;
+                    ecn.ecn.encode(buf)?;
                 }
             }
             Frame::ResetStream {
@@ -374,25 +373,25 @@ impl Frame {
                 error_code,
                 final_size,
             } => {
-                variable_length_encode(buf, RESET_STREAM as usize)?;
-                variable_length_encode(buf, id.value())?;
-                variable_length_encode(buf, *error_code)?;
-                variable_length_encode(buf, *final_size)?;
+                variable_length_encode(buf, RESET_STREAM)?;
+                VarInt(id.value() as u64).encode(buf)?;
+                error_code.encode(buf)?;
+                final_size.encode(buf)?;
             }
             Frame::StopSending { id, error_code } => {
-                variable_length_encode(buf, STOP_SENDING as usize)?;
-                variable_length_encode(buf, id.value())?;
-                variable_length_encode(buf, *error_code)?;
+                variable_length_encode(buf, STOP_SENDING)?;
+                VarInt(id.value() as u64).encode(buf)?;
+                error_code.encode(buf)?;
             }
             Frame::Crypto { offset, data } => {
-                variable_length_encode(buf, CRYPTO as usize)?;
-                variable_length_encode(buf, *offset)?;
-                variable_length_encode(buf, data.len())?;
+                variable_length_encode(buf, CRYPTO)?;
+                offset.encode(buf)?;
+                VarInt(data.len() as u64).encode(buf)?;
                 buf.put_slice(data);
             }
             Frame::NewToken { token } => {
-                variable_length_encode(buf, NEW_TOKEN as usize)?;
-                variable_length_encode(buf, token.0.len())?;
+                variable_length_encode(buf, NEW_TOKEN)?;
+                VarInt(token.0.len() as u64).encode(buf)?;
                 buf.put_slice(&token.0);
             }
             Frame::Stream {
@@ -403,17 +402,17 @@ impl Frame {
                 data,
             } => {
                 let t = 0b00001000
-                    + (if *offset > 0 { 0x4 } else { 0 })
+                    + (if offset.0 > 0 { 0x4 } else { 0 })
                     + (if !last { 0x2 } else { 0 })
                     + (if *fin { 1 } else { 0 });
 
                 variable_length_encode(buf, t)?;
-                variable_length_encode(buf, id.value())?;
-                if *offset > 0 {
-                    variable_length_encode(buf, *offset)?;
+                variable_length_encode(buf, id.value() as u64)?;
+                if offset.0 > 0 {
+                    offset.encode(buf)?;
                 }
                 if !last {
-                    variable_length_encode(buf, data.len())?;
+                    variable_length_encode(buf, data.len() as u64)?;
                 }
 
                 if buf.remaining_mut() < data.len() {
@@ -423,42 +422,42 @@ impl Frame {
                 buf.put_slice(data); // TODO: Look at clone
             }
             Frame::MaxData { max_data } => {
-                variable_length_encode(buf, MAX_DATA as usize)?;
-                variable_length_encode(buf, *max_data)?;
+                variable_length_encode(buf, MAX_DATA)?;
+                max_data.encode(buf)?;
             }
             Frame::MaxStreamData {
                 id,
                 max_stream_data,
             } => {
-                variable_length_encode(buf, MAX_STREAM_DATA as usize)?;
-                variable_length_encode(buf, id.value())?;
-                variable_length_encode(buf, *max_stream_data)?;
+                variable_length_encode(buf, MAX_STREAM_DATA)?;
+                variable_length_encode(buf, id.value() as u64)?;
+                max_stream_data.encode(buf)?;
             }
             Frame::MaxStreams { dir, max_streams } => {
                 match dir {
-                    Dir::Bidir => variable_length_encode(buf, MAX_STREAMS_BIDIR as usize)?,
-                    Dir::Uni => variable_length_encode(buf, MAX_STREAMS_UNI as usize)?,
+                    Dir::Bidir => variable_length_encode(buf, MAX_STREAMS_BIDIR)?,
+                    Dir::Uni => variable_length_encode(buf, MAX_STREAMS_UNI)?,
                 };
-                variable_length_encode(buf, *max_streams)?;
+                max_streams.encode(buf)?;
             }
             Frame::DataBlocked { max_data } => {
-                variable_length_encode(buf, DATA_BLOCKED as usize)?;
-                variable_length_encode(buf, *max_data)?;
+                variable_length_encode(buf, DATA_BLOCKED)?;
+                max_data.encode(buf)?;
             }
             Frame::StreamDataBlocked {
                 id,
                 max_stream_data,
             } => {
-                variable_length_encode(buf, STREAM_DATA_BLOCKED as usize)?;
-                variable_length_encode(buf, id.value())?;
-                variable_length_encode(buf, *max_stream_data)?;
+                variable_length_encode(buf, STREAM_DATA_BLOCKED)?;
+                variable_length_encode(buf, id.value() as u64)?;
+                max_stream_data.encode(buf)?;
             }
             Frame::StreamsBlocked { dir, max_streams } => {
                 match dir {
-                    Dir::Bidir => variable_length_encode(buf, STREAMS_BLOCKED_BIDIR as usize)?,
-                    Dir::Uni => variable_length_encode(buf, STREAMS_BLOCKED_UNI as usize)?,
+                    Dir::Bidir => variable_length_encode(buf, STREAMS_BLOCKED_BIDIR)?,
+                    Dir::Uni => variable_length_encode(buf, STREAMS_BLOCKED_UNI)?,
                 };
-                variable_length_encode(buf, *max_streams)?;
+                max_streams.encode(buf)?;
             }
             Frame::NewConnectionId {
                 seq_num,
@@ -466,23 +465,23 @@ impl Frame {
                 cid,
                 stateless_reset_token,
             } => {
-                variable_length_encode(buf, NEW_CONNECTION_ID as usize)?;
-                variable_length_encode(buf, *seq_num)?;
-                variable_length_encode(buf, *retire)?;
+                variable_length_encode(buf, NEW_CONNECTION_ID)?;
+                seq_num.encode(buf)?;
+                retire.encode(buf)?;
                 buf.put_u8(cid.len);
                 buf.put_slice(&cid.buf[..cid.len as usize]);
                 buf.put_slice(&stateless_reset_token.0);
             }
             Frame::RetireConnectionId { seq_num } => {
-                variable_length_encode(buf, RETIRE_CONNECTION_ID as usize)?;
-                variable_length_encode(buf, *seq_num)?;
+                variable_length_encode(buf, RETIRE_CONNECTION_ID)?;
+                seq_num.encode(buf)?;
             }
             Frame::PathChallenge { data } => {
-                variable_length_encode(buf, PATH_CHALLENGE as usize)?;
+                variable_length_encode(buf, PATH_CHALLENGE)?;
                 buf.put_slice(data);
             }
             Frame::PathResponse { data } => {
-                variable_length_encode(buf, PATH_RESPONSE as usize)?;
+                variable_length_encode(buf, PATH_RESPONSE)?;
                 buf.put_slice(data);
             }
             Frame::ConnectionCloseQuic {
@@ -490,23 +489,23 @@ impl Frame {
                 frame_type,
                 reason_phrase,
             } => {
-                variable_length_encode(buf, CONNECTION_CLOSE_QUIC_LAYER as usize)?;
-                variable_length_encode(buf, *error_code)?;
-                variable_length_encode(buf, *frame_type)?;
-                variable_length_encode(buf, reason_phrase.len())?;
+                variable_length_encode(buf, CONNECTION_CLOSE_QUIC_LAYER)?;
+                error_code.encode(buf)?;
+                frame_type.encode(buf)?;
+                variable_length_encode(buf, reason_phrase.len() as u64)?;
                 buf.put_slice(reason_phrase);
             }
             Frame::ConnectionCloseApp {
                 error_code,
                 reason_phrase,
             } => {
-                variable_length_encode(buf, CONNECTION_CLOSE_APP_LAYER as usize)?;
-                variable_length_encode(buf, *error_code)?;
-                variable_length_encode(buf, reason_phrase.len())?;
+                variable_length_encode(buf, CONNECTION_CLOSE_APP_LAYER)?;
+                error_code.encode(buf)?;
+                variable_length_encode(buf, reason_phrase.len() as u64)?;
                 buf.put_slice(reason_phrase);
             }
             Frame::HandshakeDone => {
-                variable_length_encode(buf, HANDSHAKE_DONE as usize)?;
+                variable_length_encode(buf, HANDSHAKE_DONE)?;
             }
         };
         Ok(())
@@ -537,19 +536,20 @@ impl Frame {
                 ranges,
                 ecn,
             } => {
-                let l = variable_length((*largest) as u64);
-                let d = variable_length((*delay) as u64);
-                let r = variable_length((*range_count) as u64);
-                let f = variable_length((*first_range) as u64);
-                let mut sum = l + d + r + f;
+                let t = variable_length(ACK);
+                let l = largest.length();
+                let d = delay.length();
+                let r = range_count.length();
+                let f = first_range.length();
+                let mut sum = t + l + d + r + f;
                 for ack_range in ranges {
-                    sum += variable_length(ack_range.gap as u64);
-                    sum += variable_length(ack_range.length as u64);
+                    sum += ack_range.gap.length();
+                    sum += ack_range.length.length();
                 }
                 if let Some(ecn) = ecn {
-                    sum += variable_length(ecn.ect0 as u64);
-                    sum += variable_length(ecn.ect1 as u64);
-                    sum += variable_length(ecn.ecn as u64);
+                    sum += ecn.ect0.length();
+                    sum += ecn.ect1.length();
+                    sum += ecn.ecn.length();
                 }
                 sum
             }
@@ -557,7 +557,14 @@ impl Frame {
                 id,
                 error_code,
                 final_size,
-            } => todo!(),
+            } => {
+                let t = variable_length(RESET_STREAM);
+                let i = variable_length((id.value()) as u64);
+                let e = error_code.length();
+                let s = final_size.length();
+
+                t + i + e + s
+            }
             StopSending { id, error_code } => todo!(),
             Crypto { offset, data } => todo!(),
             NewToken { token } => todo!(),
@@ -569,11 +576,7 @@ impl Frame {
                 data,
             } => {
                 let i = variable_length(id.value() as u64);
-                let o = if *offset != 0 {
-                    variable_length(*offset as u64)
-                } else {
-                    0
-                };
+                let o = if offset.0 != 0 { offset.length() } else { 0 };
 
                 let l = if !*last {
                     variable_length(data.len() as u64)
@@ -620,15 +623,15 @@ impl Frame {
 
 #[derive(Debug)]
 pub(super) struct AckRange {
-    gap: usize,
-    length: usize,
+    gap: VarInt,
+    length: VarInt,
 }
 
 #[derive(Debug)]
 pub(super) struct EcnCounts {
-    ect0: usize,
-    ect1: usize,
-    ecn: usize,
+    ect0: VarInt,
+    ect1: VarInt,
+    ecn: VarInt,
 }
 
 pub(super) struct FrameIterator {
@@ -657,7 +660,7 @@ pub(super) enum FrameDecodeError {
     #[error("Not enough data in the buffer when parsing")]
     NotEnoughData,
     #[error("Decode error: {0}")]
-    Decode(#[from] DecodeError),
+    Decode(#[from] VarIntError),
     #[error("PROTOCOL_VIOLATION")]
     ProtocolViolation,
 }
@@ -667,7 +670,7 @@ pub(crate) enum FrameEncodeError {
     #[error("Buffer is not big enough")]
     TooSmallBuffer,
     #[error("Encode error: {0}")]
-    Encode(#[from] EncodeError),
+    VarInt(#[from] VarIntError),
 }
 
 #[cfg(test)]
@@ -682,7 +685,7 @@ mod test {
             id: StreamID::new_unchecked(1),
             fin: false,
             last: true,
-            offset: 3,
+            offset: VarInt(3),
             data: Bytes::from_static(&[0xff, 0xff, 0xff]),
         };
 
@@ -709,7 +712,7 @@ mod test {
                 assert_eq!(id.value(), 1);
                 assert!(!fin);
                 assert!(last);
-                assert_eq!(offset, 3);
+                assert_eq!(offset.0, 3);
                 assert_eq!(data, Bytes::from_static(&[0xff, 0xff, 0xff]));
             }
             _ => panic!("Got wrong frame type"),

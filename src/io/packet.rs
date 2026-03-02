@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::io::{
     connection::ConnectionID,
-    encoding::{DecodeError, EncodeError, variable_length_decode, variable_length_encode},
+    encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub enum Header {
         dst_cid: ConnectionID,
         src_cid: ConnectionID,
         token: Option<Token>,
-        length: usize,
+        length: VarInt,
         packet_number: PacketNumber,
     },
     Long {
@@ -160,12 +160,10 @@ impl Debug for PacketNumber {
 pub enum PacketError {
     #[error("Invalid header")]
     InvalidHeader,
-    #[error("Decode error: {0}")]
-    Decode(#[from] DecodeError),
+    #[error("VarInt error: {0}")]
+    VarInt(#[from] VarIntError),
     #[error("Not enough data in buffer error: {0}")]
     NotEnoughData(#[from] TryGetError),
-    #[error("Encode error: {0}")]
-    Encode(#[from] EncodeError),
 }
 
 impl Header {
@@ -188,13 +186,13 @@ impl Header {
                 // TODO: Fix token
                 let token_len = variable_length_decode(buf)?;
                 let token = if token_len > 0 {
-                    let mut v = vec![0u8; token_len];
+                    let mut v = vec![0u8; token_len as usize];
                     buf.copy_to_slice(&mut v);
                     Some(Token(v))
                 } else {
                     None
                 };
-                let length = variable_length_decode(buf)?;
+                let length = VarInt::decode(buf)?;
                 let packet_number = PacketNumber::decode(buf, packet_number_len);
                 Ok(Self::Initial {
                     version,
@@ -266,12 +264,12 @@ impl Header {
                 // TODO: Fix token
                 match token {
                     Some(t) => {
-                        variable_length_encode(buf, t.0.len())?;
+                        variable_length_encode(buf, t.0.len() as u64)?;
                         buf.put_slice(&t.0);
                     }
                     None => variable_length_encode(buf, 0)?,
                 };
-                variable_length_encode(buf, *length)?;
+                length.encode(buf);
                 packet_number.encode(buf);
             }
             Header::Long { .. } => todo!(),
@@ -310,7 +308,7 @@ mod test {
             dst_cid: dst_cid_o,
             src_cid: src_cid_o,
             token: Some(Token(vec![1, 2])),
-            length: 0,
+            length: VarInt(0),
             packet_number: PacketNumber::U8(2),
         };
         header.encode(&mut bytes).unwrap();
@@ -328,7 +326,7 @@ mod test {
                 assert_eq!(dst_cid, dst_cid);
                 assert_eq!(src_cid, src_cid);
                 assert_eq!(token, Some(Token(vec![1, 2])));
-                assert_eq!(length, 0);
+                assert_eq!(length.0, 0);
                 assert!(matches!(packet_number, PacketNumber::U8(x) if x == 2));
             }
             _ => unreachable!(),

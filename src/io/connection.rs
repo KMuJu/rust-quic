@@ -22,6 +22,8 @@ use crate::io::{
     stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
 };
 
+use super::encoding::VarInt;
+
 pub struct ConnectionInner {
     id: ConnectionID,
     // Peer's cid
@@ -45,6 +47,7 @@ pub struct ConnectionInner {
     // Handshake stuff i guess
     pending_packets: VecDeque<Packet>,
 
+    // Wakes up when a stream has written data pending
     write_waker: AtomicWaker,
 
     packet_number: usize,
@@ -171,7 +174,7 @@ impl ConnectionInner {
                 id: id.clone(),
                 fin,
                 last: false,
-                offset: offset as usize,
+                offset: VarInt(offset),
                 data: data.freeze(),
             };
 
@@ -336,7 +339,7 @@ impl Connection {
                 dst_cid: inner.peer_cid,
                 src_cid: inner.id,
                 token: None,
-                length: 1,
+                length: VarInt(1),
                 packet_number: PacketNumber::U8(1u8),
             },
             payload: BytesMut::new(),
