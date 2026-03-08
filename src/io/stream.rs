@@ -194,7 +194,6 @@ impl SendStreamHandle {
 
         send.buffer.put_slice(buf);
         inner.mark_pending_on_send(self.id.clone());
-        println!("Marked as pending");
 
         Ok(buf.len())
     }

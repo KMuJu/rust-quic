@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use bytes::BytesMut;
 
 pub mod connection;
+pub mod crypto;
 pub mod encoding;
 pub mod endpoint;
 pub mod frame;

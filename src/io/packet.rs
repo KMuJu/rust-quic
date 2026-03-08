@@ -11,7 +11,7 @@ use crate::io::{
 #[derive(Debug, PartialEq, Eq)]
 pub struct Token(pub Vec<u8>);
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub enum Header {
     Initial {
         version: u32,
@@ -21,8 +21,11 @@ pub enum Header {
         length: VarInt,
         packet_number: PacketNumber,
     },
-    Long {
+    Handshake {
+        version: u32,
         dst_cid: ConnectionID,
+        src_cid: ConnectionID,
+        length: VarInt,
         packet_number: PacketNumber,
     },
     Short {
@@ -56,7 +59,7 @@ impl Packet {
     pub fn dst_cid(&self) -> ConnectionID {
         match self.header {
             Header::Initial { dst_cid, .. } => dst_cid,
-            Header::Long { dst_cid, .. } => dst_cid,
+            Header::Handshake { dst_cid, .. } => dst_cid,
             Header::Short { dst_cid, .. } => dst_cid,
         }
     }
@@ -64,6 +67,7 @@ impl Packet {
     pub fn src_cid(&self) -> Option<ConnectionID> {
         match self.header {
             Header::Initial { src_cid, .. } => Some(src_cid),
+            Header::Handshake { src_cid, .. } => Some(src_cid),
             _ => None,
         }
     }
@@ -71,7 +75,7 @@ impl Packet {
     pub fn packet_number(&self) -> &PacketNumber {
         match &self.header {
             Header::Initial { packet_number, .. } => packet_number,
-            Header::Long { packet_number, .. } => packet_number,
+            Header::Handshake { packet_number, .. } => packet_number,
             Header::Short { packet_number, .. } => packet_number,
         }
     }
@@ -81,10 +85,24 @@ impl Packet {
     }
 }
 
+impl Debug for Header {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "Header::{}",
+            match self {
+                Header::Initial { .. } => "Initial",
+                Header::Handshake { .. } => "Handshake",
+                Header::Short { .. } => "Short",
+            }
+        ))
+    }
+}
+
 impl Debug for Packet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Packet")
-            .field(&self.packet_number())
+        f.debug_struct("Packet")
+            .field("Header", &self.header)
+            .field("Packet Number", &self.packet_number())
             .finish()
     }
 }
@@ -209,7 +227,25 @@ impl Header {
             }
             (1, 1, 1, 0) => {
                 // TODO: Handshake
-                todo!()
+                // TODO: Handle panics
+                let packet_number_len = first & 0x3;
+                let version = buf.try_get_u32()?;
+                let dst_cid_len = buf.try_get_u8()?;
+                let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
+                let src_cid_len = buf.try_get_u8()?;
+                let src_cid = ConnectionID::from_buf(buf, src_cid_len);
+                if dst_cid_len > 20 || src_cid_len > 20 {
+                    return Err(PacketError::InvalidHeader);
+                }
+                let length = VarInt::decode(buf)?;
+                let packet_number = PacketNumber::decode(buf, packet_number_len);
+                Ok(Self::Handshake {
+                    version,
+                    dst_cid,
+                    src_cid,
+                    length,
+                    packet_number,
+                })
             }
             (1, 1, 1, 1) => {
                 // TODO: Retry
@@ -269,10 +305,26 @@ impl Header {
                     }
                     None => variable_length_encode(buf, 0)?,
                 };
-                length.encode(buf);
+                length.encode(buf)?;
                 packet_number.encode(buf);
             }
-            Header::Long { .. } => todo!(),
+            Header::Handshake {
+                version,
+                dst_cid,
+                src_cid,
+                length,
+                packet_number,
+            } => {
+                let first: u8 = 0b1110_0000 + (packet_number.len() & 0b11);
+                buf.put_u8(first);
+                buf.put_u32(*version);
+                buf.put_u8(dst_cid.len);
+                buf.put_slice(&dst_cid.buf[..dst_cid.len as usize]);
+                buf.put_u8(src_cid.len);
+                buf.put_slice(&src_cid.buf[..src_cid.len as usize]);
+                length.encode(buf)?;
+                packet_number.encode(buf);
+            }
             Header::Short {
                 spin,
                 key_phase,

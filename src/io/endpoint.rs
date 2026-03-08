@@ -13,7 +13,10 @@ use thiserror::Error;
 use tokio::{
     io::ReadBuf,
     net::UdpSocket,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
 };
 
 use crate::io::{
@@ -84,30 +87,39 @@ impl Endpoint {
     }
 
     pub async fn connect(&mut self, addr: SocketAddr) -> Connection {
-        let mut state = self.inner.state.lock().unwrap();
-        let peer_cid = ConnectionID::new(state.cid_len, &mut state.rng);
-        let cid = ConnectionID::new(state.cid_len, &mut state.rng);
+        let (conn, connected_recv) = {
+            let mut state = self.inner.state.lock().unwrap();
+            let peer_cid = ConnectionID::new(state.cid_len, &mut state.rng);
+            let cid = ConnectionID::new(state.cid_len, &mut state.rng);
 
-        let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
-        let conn = Connection::new(
-            cid,
-            peer_cid,
-            addr,
-            Side::Client,
-            incoming_rx,
-            state.outgoing_tx.clone(),
-        );
-        let handle = ConnectionHandle {
-            addr,
-            incoming_data,
+            let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (connected_send, connected_recv) = oneshot::channel();
+
+            println!("Connecting to endpoint");
+            let conn = Connection::new(
+                cid,
+                peer_cid,
+                addr,
+                Side::Client,
+                connected_send,
+                incoming_rx,
+                state.outgoing_tx.clone(),
+            );
+            let handle = ConnectionHandle {
+                addr,
+                incoming_data,
+            };
+
+            state.connection_handles.insert(cid, handle);
+            state.connections.insert(cid, conn.clone());
+
+            (conn, connected_recv)
         };
-
-        state.connection_handles.insert(cid, handle);
-        state.connections.insert(cid, conn.clone());
 
         conn.init();
 
         // TODO: Wait for handshake to finish
+        connected_recv.await.unwrap();
 
         conn
     }
@@ -121,15 +133,18 @@ impl EndpointState {
         addr: SocketAddr,
     ) {
         let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (connected_send, connected_recv) = oneshot::channel();
         // TODO: Always server??
         let connection = Connection::new(
             dst_cid,
             src_cid,
             addr,
             Side::Server,
+            connected_send,
             incoming_rx,
             self.outgoing_tx.clone(),
         );
+        println!("Received new connection: {dst_cid:?}, {src_cid:?}");
 
         let handle = ConnectionHandle {
             addr,
@@ -140,7 +155,7 @@ impl EndpointState {
         self.connections.insert(dst_cid, connection);
 
         // TODO: Handle create incomming connection
-        let incoming = IncomingInner::new(dst_cid, src_cid);
+        let incoming = IncomingInner::new(dst_cid, src_cid, connected_recv);
         self.incoming_tx.send(incoming).unwrap();
     }
 
@@ -155,7 +170,8 @@ impl EndpointState {
             }
         };
         let cid = packet.dst_cid();
-        if let Some(src_cid) = packet.src_cid() {
+        if packet.is_initial() {
+            let src_cid = packet.src_cid().unwrap();
             self.insert_new_connection(cid, src_cid, addr);
         }
 
@@ -167,6 +183,9 @@ impl EndpointState {
                     addr,
                 })
                 .unwrap();
+        } else {
+            eprintln!("Could not get connection handle to {cid:?}");
+            eprintln!("{:?}", self.connection_handles);
         }
     }
 

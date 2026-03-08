@@ -355,11 +355,11 @@ impl Frame {
                 delay.encode(buf)?;
                 range_count.encode(buf)?;
                 first_range.encode(buf)?;
-                first_range.encode(buf);
+                first_range.encode(buf)?;
 
                 for range in ranges.iter() {
-                    range.gap.encode(buf);
-                    range.length.encode(buf);
+                    range.gap.encode(buf)?;
+                    range.length.encode(buf)?;
                 }
 
                 if let Some(ecn) = ecn {
@@ -559,7 +559,7 @@ impl Frame {
                 final_size,
             } => {
                 let t = variable_length(RESET_STREAM);
-                let i = variable_length((id.value()) as u64);
+                let i = variable_length(id.value() as u64);
                 let e = error_code.length();
                 let s = final_size.length();
 

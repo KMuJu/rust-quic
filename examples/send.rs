@@ -3,6 +3,7 @@ use std::{future::poll_fn, io, task::Poll, thread, time::Duration};
 use bytes::BytesMut;
 use rust_quic::io::{
     connection::ConnectionID,
+    encoding::VarInt,
     endpoint::Endpoint,
     packet::{Header, Packet, PacketNumber},
 };
@@ -41,7 +42,7 @@ async fn send_packets(socket: &UdpSocket) -> io::Result<()> {
             dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
             src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
             token: None,
-            length: 1,
+            length: VarInt(1),
             packet_number: PacketNumber::U8(1u8),
         },
         payload: BytesMut::new(),

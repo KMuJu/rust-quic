@@ -6,16 +6,20 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::{Buf, BytesMut};
 use futures::task::AtomicWaker;
 use rand::{Rng, rngs::StdRng};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
+    crypto::CryptoFrame,
     endpoint::EndpointRef,
     frame::{Frame, FrameIterator},
     packet::{Header, Packet, PacketNumber},
@@ -28,8 +32,11 @@ pub struct ConnectionInner {
     id: ConnectionID,
     // Peer's cid
     peer_cid: ConnectionID,
-    addr: SocketAddr,
     side: Side,
+
+    connected: Option<oneshot::Sender<()>>,
+    state: ConnectionState,
+
     recv: HashMap<StreamID, RecvStream>,
     send: HashMap<StreamID, SendStream>,
 
@@ -83,7 +90,7 @@ impl ConnectionID {
 
 impl Debug for ConnectionID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("ConnectionID")
+        f.debug_tuple("CID")
             .field(&&self.buf[..self.len as usize])
             .finish()
     }
@@ -99,15 +106,109 @@ impl ConnectionInner {
             }
         };
         println!("{:?}: Got {:?}", self.id, packet);
-        let frameiter = FrameIterator::new(packet.payload.freeze());
-        for frame in frameiter {
-            self.handle_frame(frame);
+        match packet.header {
+            Header::Short { .. } => {
+                if !matches!(self.state, ConnectionState::Data) {
+                    eprintln!("Got 1-RTT header in wrong state: {:?}", self.state);
+                    return;
+                }
+                let frameiter = FrameIterator::new(packet.payload.freeze());
+                for frame in frameiter {
+                    println!("Frame");
+                    self.handle_frame(frame);
+                }
+            }
+            Header::Initial { .. } => {
+                if !matches!(self.state, ConnectionState::Initial) {
+                    eprintln!("Got initial header in wrong state: {:?}", self.state);
+                    return;
+                }
+                // TODO: Handle sending two quic packets at a time
+                // And do different stuff for client and server
+
+                match self.side {
+                    Side::Server => {
+                        self.state = ConnectionState::Handshake;
+                        let crypto_data = CryptoFrame::ServerHello;
+                        let mut c_data = Vec::new();
+                        crypto_data.encode(&mut c_data);
+                        let crypto_frame = Frame::Crypto {
+                            offset: VarInt(0),
+                            data: c_data,
+                        };
+                        let mut packet = Packet {
+                            header: Header::Handshake {
+                                version: 1,
+                                dst_cid: self.peer_cid,
+                                src_cid: self.id,
+                                length: VarInt(1), // TODO: Handle length
+                                packet_number: PacketNumber::from(self.packet_number),
+                            },
+                            payload: BytesMut::new(),
+                        };
+                        crypto_frame.encode(&mut packet.payload).unwrap();
+                        self.pending_packets.push_back(packet);
+                    }
+                    Side::Client => {
+                        panic!("Got initial as client: THIS IS WRONG");
+                    }
+                }
+            }
+            Header::Handshake { .. } => {
+                if !matches!(self.state, ConnectionState::Handshake) {
+                    eprintln!("Got Handshake header in wrong state: {:?}", self.state);
+                    return;
+                }
+                match self.side {
+                    Side::Client => {
+                        self.state = ConnectionState::Data;
+                        let crypto_data = CryptoFrame::Finished;
+                        let mut c_data = Vec::new();
+                        crypto_data.encode(&mut c_data);
+                        let crypto_frame = Frame::Crypto {
+                            offset: VarInt(0),
+                            data: c_data,
+                        };
+                        let mut packet = Packet {
+                            header: Header::Handshake {
+                                version: 1,
+                                dst_cid: self.peer_cid,
+                                src_cid: self.id,
+                                length: VarInt(1), // TODO: Handle length
+                                packet_number: PacketNumber::from(self.packet_number),
+                            },
+                            payload: BytesMut::new(),
+                        };
+                        crypto_frame.encode(&mut packet.payload).unwrap();
+                        self.pending_packets.push_back(packet);
+                    }
+                    Side::Server => {
+                        self.state = ConnectionState::Data;
+                        if let Some(connected) = self.connected.take() {
+                            connected.send(()).unwrap();
+                        } else {
+                            eprintln!("Connected already consumed. Something is wrong")
+                        }
+                        let frame = Frame::HandshakeDone;
+                        let mut packet = Packet {
+                            header: Header::Short {
+                                spin: false,
+                                key_phase: false,
+                                dst_cid: self.peer_cid,
+                                packet_number: PacketNumber::from(self.packet_number),
+                            },
+                            payload: BytesMut::new(),
+                        };
+                        frame.encode(&mut packet.payload).unwrap();
+                        self.pending_packets.push_back(packet);
+                    }
+                }
+            }
         }
     }
 
     fn handle_frame(&mut self, frame: Frame) {
         match &frame {
-            // These frames are sent by the sender
             Frame::StreamDataBlocked { id, .. }
             | Frame::ResetStream { id, .. }
             | Frame::Stream { id, .. } => {
@@ -122,7 +223,6 @@ impl ConnectionInner {
 
                 recv.handle_frame(frame);
             }
-            // These frames are sent by the receiver
             Frame::MaxStreamData { id, .. } | Frame::StopSending { id, .. } => {
                 if !self.send.contains_key(id) {
                     self.handle_new_stream(id);
@@ -132,7 +232,50 @@ impl ConnectionInner {
 
                 send.handle_frame(frame);
             }
-            _ => todo!(),
+            Frame::Crypto { offset, data } => {
+                // TODO: This is just a mock
+            }
+            Frame::Padding => todo!(),
+            Frame::Ping => todo!(),
+            Frame::Ack {
+                largest,
+                delay,
+                range_count,
+                first_range,
+                ranges,
+                ecn,
+            } => todo!(),
+            Frame::NewToken { token } => todo!(),
+            Frame::MaxData { max_data } => todo!(),
+            Frame::MaxStreams { dir, max_streams } => todo!(),
+            Frame::DataBlocked { max_data } => todo!(),
+            Frame::StreamsBlocked { dir, max_streams } => todo!(),
+            Frame::NewConnectionId {
+                seq_num,
+                retire,
+                cid,
+                stateless_reset_token,
+            } => todo!(),
+            Frame::RetireConnectionId { seq_num } => todo!(),
+            Frame::PathChallenge { data } => todo!(),
+            Frame::PathResponse { data } => todo!(),
+            Frame::ConnectionCloseQuic {
+                error_code,
+                frame_type,
+                reason_phrase,
+            } => todo!(),
+            Frame::ConnectionCloseApp {
+                error_code,
+                reason_phrase,
+            } => todo!(),
+            Frame::HandshakeDone => {
+                // TODO: This is just a mock
+                if let Some(connected) = self.connected.take() {
+                    connected.send(()).unwrap();
+                } else {
+                    eprintln!("Connected already consumed. Something is wrong")
+                }
+            }
         };
     }
 
@@ -155,9 +298,6 @@ impl ConnectionInner {
 
     pub(super) fn get_packet(&mut self, mut mtu: usize) -> Option<Packet> {
         let orig_mtu = mtu;
-        if let Some(packet) = self.pending_packets.pop_front() {
-            return Some(packet);
-        }
         let cid = self.peer_cid;
 
         let mut frames = Vec::new();
@@ -251,14 +391,16 @@ impl Connection {
         peer_cid: ConnectionID,
         addr: SocketAddr,
         side: Side,
+        connected: oneshot::Sender<()>,
         incoming_data: UnboundedReceiver<EndpointToConnection>,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     ) -> Self {
         let inner = Arc::new(Mutex::new(ConnectionInner {
             id: cid,
             peer_cid,
-            addr,
             side,
+            connected: Some(connected),
+            state: ConnectionState::Initial,
             recv: HashMap::new(),
             send: HashMap::new(),
             bidir_acceptable: VecDeque::new(),
@@ -305,7 +447,7 @@ impl Connection {
             if let Some(id) = inner.unidir_acceptable.pop_front() {
                 Poll::Ready(RecvStreamHandle::new(id, self.inner.clone()))
             } else {
-                inner.bidir_accept_waker.register(cx.waker());
+                inner.unidir_accept_waker.register(cx.waker());
                 Poll::Pending
             }
         })
@@ -345,6 +487,8 @@ impl Connection {
             payload: BytesMut::new(),
         };
         inner.pending_packets.push_back(packet);
+        inner.state = ConnectionState::Handshake;
+        inner.write_waker.wake();
     }
 }
 
@@ -358,14 +502,26 @@ impl Debug for Connection {
     }
 }
 
+#[derive(Debug)]
+enum ConnectionState {
+    Initial,
+    Handshake,
+    Data,
+}
+
 pub struct IncomingInner {
     id: ConnectionID,
     src_cid: ConnectionID,
+    connected: oneshot::Receiver<()>,
 }
 
 impl IncomingInner {
-    pub fn new(id: ConnectionID, src_cid: ConnectionID) -> Self {
-        Self { id, src_cid }
+    pub fn new(id: ConnectionID, src_cid: ConnectionID, connected: oneshot::Receiver<()>) -> Self {
+        Self {
+            id,
+            src_cid,
+            connected,
+        }
     }
 }
 
@@ -384,9 +540,13 @@ impl Future for Incoming {
     type Output = Connection;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let endpoint = self.endpoint.state.lock().unwrap();
+        let this = self.get_mut();
+        println!("Waiting for connected notification");
+        ready!(Pin::new(&mut this.inner.connected).poll(cx)).unwrap();
 
-        let connection = endpoint.connections.get(&self.inner.id).unwrap();
+        let endpoint = this.endpoint.state.lock().unwrap();
+
+        let connection = endpoint.connections.get(&this.inner.id).unwrap();
         Poll::Ready(connection.clone())
     }
 }
@@ -405,14 +565,16 @@ impl Future for ConnectionDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        this.inner.lock().unwrap().write_waker.register(cx.waker());
+
         let mut buffer = Vec::new();
-        let count = this
-            .incoming_data
-            .poll_recv_many(cx, &mut buffer, usize::MAX); // If it is pending
-        if count == Poll::Ready(0) {
-            // Channel is closed
-            eprint!("Connection driver channel is closed");
-            return Poll::Ready(());
+
+        loop {
+            match this.incoming_data.poll_recv(cx) {
+                Poll::Ready(Some(data)) => buffer.push(data),
+                Poll::Ready(None) => return Poll::Ready(()), // channel closed
+                Poll::Pending => break,
+            }
         }
 
         if !buffer.is_empty() {
@@ -422,10 +584,13 @@ impl Future for ConnectionDriver {
                 conn.handle_datagram(&data.data);
             }
         }
+
         let packets: Vec<_> = {
             let mut conn = this.inner.lock().unwrap();
-            conn.write_waker.register(cx.waker());
             let mut pkts = Vec::new();
+            while let Some(packet) = conn.pending_packets.pop_front() {
+                pkts.push(packet);
+            }
             while !conn.pending_send.is_empty() {
                 if let Some(p) = conn.get_packet(1200) {
                     pkts.push(p);
