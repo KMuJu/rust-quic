@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use bytes::BytesMut;
 
+pub mod ack_manager;
 pub mod connection;
 pub mod crypto;
 pub mod encoding;
