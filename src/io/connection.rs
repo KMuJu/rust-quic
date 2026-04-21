@@ -12,13 +12,17 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 use futures::task::AtomicWaker;
 use rand::{Rng, rngs::StdRng};
-use tokio::sync::{
-    mpsc::{UnboundedReceiver, UnboundedSender},
-    oneshot,
+use tokio::{
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
+    time::Instant,
 };
 
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
+    ack_manager::Acker,
     crypto::CryptoFrame,
     endpoint::EndpointRef,
     frame::{Frame, FrameIterator},
@@ -53,12 +57,15 @@ pub struct ConnectionInner {
     // Packets to be sent by endpoint
     // Handshake stuff i guess
     pending_packets: VecDeque<Packet>,
+    pending_frames: [VecDeque<Frame>; 3],
 
     // Wakes up when a stream has written data pending
     write_waker: AtomicWaker,
 
-    packet_number: usize,
+    packet_number: [usize; 3],
     stream_number: usize,
+
+    acker: [Acker; 3],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -106,6 +113,14 @@ impl ConnectionInner {
             }
         };
         println!("{:?}: Got {:?}", self.id, packet);
+        if !self.acker[self.state as usize].received(packet.packet_number(), packet.is_eliciting())
+        {
+            println!(
+                "ERROR: Got dulicate packet!: {}",
+                packet.packet_number().u32()
+            );
+            return;
+        }
         match packet.header {
             Header::Short { .. } => {
                 if !matches!(self.state, ConnectionState::Data) {
@@ -145,11 +160,14 @@ impl ConnectionInner {
                                 dst_cid: self.peer_cid,
                                 src_cid: self.id,
                                 length: VarInt(1), // TODO: Handle length
-                                packet_number: PacketNumber::from(self.packet_number),
+                                packet_number: PacketNumber::from(
+                                    self.packet_number[self.state as usize],
+                                ),
                             },
                             payload: payload.freeze(),
                         };
                         self.pending_packets.push_back(packet);
+                        self.packet_number[self.state as usize] += 1;
                     }
                     Side::Client => {
                         panic!("Got initial as client: THIS IS WRONG");
@@ -179,11 +197,14 @@ impl ConnectionInner {
                                 dst_cid: self.peer_cid,
                                 src_cid: self.id,
                                 length: VarInt(1), // TODO: Handle length
-                                packet_number: PacketNumber::from(self.packet_number),
+                                packet_number: PacketNumber::from(
+                                    self.packet_number[self.state as usize],
+                                ),
                             },
                             payload: payload.freeze(),
                         };
                         self.pending_packets.push_back(packet);
+                        self.packet_number[self.state as usize] += 1;
                     }
                     Side::Server => {
                         self.state = ConnectionState::Data;
@@ -200,11 +221,14 @@ impl ConnectionInner {
                                 spin: false,
                                 key_phase: false,
                                 dst_cid: self.peer_cid,
-                                packet_number: PacketNumber::from(self.packet_number),
+                                packet_number: PacketNumber::from(
+                                    self.packet_number[self.state as usize],
+                                ),
                             },
                             payload: payload.freeze(),
                         };
                         self.pending_packets.push_back(packet);
+                        self.packet_number[self.state as usize] += 1;
                     }
                 }
             }
@@ -212,6 +236,7 @@ impl ConnectionInner {
     }
 
     fn handle_frame(&mut self, frame: Frame) {
+        println!("Got frame: {frame:?}");
         match &frame {
             Frame::StreamDataBlocked { id, .. }
             | Frame::ResetStream { id, .. }
@@ -248,7 +273,9 @@ impl ConnectionInner {
                 first_range,
                 ranges,
                 ecn,
-            } => todo!(),
+            } => {
+                println!("TODO: Handle ack frame");
+            }
             Frame::NewToken { token } => todo!(),
             Frame::MaxData { max_data } => todo!(),
             Frame::MaxStreams { dir, max_streams } => todo!(),
@@ -300,38 +327,59 @@ impl ConnectionInner {
         }
     }
 
-    pub(super) fn get_packet(&mut self, mut mtu: usize) -> Option<Packet> {
+    fn next_ack_deadline(&self) -> Option<Instant> {
+        self.acker.iter().filter_map(|a| a.get_deadline()).min()
+    }
+
+    fn get_packet(&mut self, space: ConnectionState, mut mtu: usize) -> Option<Packet> {
         let orig_mtu = mtu;
-        let cid = self.peer_cid;
 
         let mut frames = Vec::new();
-        while let Some(id) = self.pending_send.pop_front() {
-            let Some(send) = self.send.get_mut(&id) else {
-                continue;
-            };
-            let offset = send.offset();
-            let mut data = BytesMut::with_capacity(mtu);
-            let _ = send.read_n(&mut data, mtu);
-            let fin = send.is_finished();
 
-            let frame = Frame::Stream {
-                id: id.clone(),
-                fin,
-                last: false,
-                offset: VarInt(offset),
-                data: data.freeze(),
-            };
-
-            if !send.empty() {
-                self.pending_send.push_back(id);
-            }
-
-            // TODO: Fix, this is stupid
-            mtu = mtu.saturating_sub(frame.size());
-
-            frames.push(frame);
-            if mtu == 0 {
+        while let Some(frame) = self.pending_frames[space as usize].front() {
+            if mtu > frame.size() {
+                let frame = self.pending_frames[space as usize].pop_front().unwrap();
+                mtu -= frame.size();
+                frames.push(frame);
+            } else {
                 break;
+            }
+        }
+
+        if let Some(ack) = self.acker[space as usize].get_ack() {
+            frames.push(ack);
+        };
+
+        if matches!(space, ConnectionState::Data) {
+            while let Some(id) = self.pending_send.pop_front() {
+                let Some(send) = self.send.get_mut(&id) else {
+                    continue;
+                };
+                let offset = send.offset();
+                let mut data = BytesMut::with_capacity(mtu);
+                let _ = send.read_n(&mut data, mtu);
+                let fin = send.is_finished();
+
+                let frame = Frame::Stream {
+                    id: id.clone(),
+                    fin,
+                    last: false,
+                    offset: VarInt(offset),
+                    data: data.freeze(),
+                };
+
+                if !send.empty() {
+                    self.pending_send.push_back(id);
+                }
+
+                let size = frame.size();
+                if mtu > size {
+                    mtu -= size;
+                    frames.push(frame);
+                } else {
+                    self.pending_frames[self.state as usize].push_back(frame);
+                    break;
+                }
             }
         }
 
@@ -344,18 +392,40 @@ impl ConnectionInner {
             *fin = true
         };
 
+        let pn = PacketNumber::from(self.packet_number[space as usize]);
+        self.packet_number[space as usize] += 1;
+
+        let header = match space {
+            ConnectionState::Initial => Header::Initial {
+                dst_cid: self.peer_cid,
+                src_cid: self.id,
+                packet_number: pn,
+                version: 0,
+                token: None,
+                length: VarInt(0),
+            },
+            ConnectionState::Handshake => Header::Handshake {
+                dst_cid: self.peer_cid,
+                src_cid: self.id,
+                packet_number: pn,
+                version: 0,
+                length: VarInt(0),
+            },
+            ConnectionState::Data => Header::Short {
+                spin: false,
+                key_phase: false,
+                dst_cid: self.peer_cid,
+                packet_number: pn,
+            },
+        };
+
         let mut payload = BytesMut::with_capacity(orig_mtu);
         frames.iter().for_each(|f| f.encode(&mut payload).unwrap());
         let packet = Packet {
-            header: Header::Short {
-                spin: false,
-                key_phase: false,
-                dst_cid: cid,
-                packet_number: PacketNumber::from(self.packet_number),
-            },
+            header,
             payload: payload.freeze(),
         };
-        self.packet_number += 1;
+        self.packet_number[self.state as usize] += 1;
         Some(packet)
     }
 
@@ -414,9 +484,11 @@ impl Connection {
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
             pending_packets: VecDeque::new(),
+            pending_frames: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
             write_waker: AtomicWaker::new(),
-            packet_number: 0,
+            packet_number: [0, 0, 0],
             stream_number: 0,
+            acker: [Acker::new(), Acker::new(), Acker::new()],
         }));
         let driver = ConnectionDriver {
             inner: inner.clone(),
@@ -506,7 +578,7 @@ impl Debug for Connection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ConnectionState {
     Initial,
     Handshake,
@@ -589,17 +661,19 @@ impl Future for ConnectionDriver {
             }
         }
 
-        let packets: Vec<_> = {
+        let packets = {
             let mut conn = this.inner.lock().unwrap();
             let mut pkts = Vec::new();
             while let Some(packet) = conn.pending_packets.pop_front() {
                 pkts.push(packet);
             }
-            while !conn.pending_send.is_empty() {
-                if let Some(p) = conn.get_packet(1200) {
+            for space in [
+                ConnectionState::Initial,
+                ConnectionState::Handshake,
+                ConnectionState::Data,
+            ] {
+                while let Some(p) = conn.get_packet(space, 1200) {
                     pkts.push(p);
-                } else {
-                    break;
                 }
             }
             pkts

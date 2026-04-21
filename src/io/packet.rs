@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::io::{
     connection::ConnectionID,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
+    frame::{Frame, FrameIterator},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,6 +84,20 @@ impl Packet {
     pub fn is_initial(&self) -> bool {
         matches!(self.header, Header::Initial { .. })
     }
+
+    /// Is not ACK, PADDING or CONNECTION_CLOSE
+    pub fn is_eliciting(&self) -> bool {
+        let mut iter = FrameIterator::new(self.payload.clone());
+        iter.any(|f| {
+            !matches!(
+                f,
+                Frame::Ack { .. }
+                    | Frame::Padding
+                    | Frame::ConnectionCloseApp { .. }
+                    | Frame::ConnectionCloseQuic { .. }
+            )
+        })
+    }
 }
 
 impl Debug for Header {
@@ -144,7 +159,7 @@ impl PacketNumber {
         }
     }
 
-    fn u32(&self) -> u32 {
+    pub(super) fn u32(&self) -> u32 {
         match self {
             PacketNumber::U8(x) => *x as u32,
             PacketNumber::U16(x) => *x as u32,
