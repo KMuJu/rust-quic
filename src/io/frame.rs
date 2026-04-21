@@ -307,21 +307,23 @@ impl Frame {
             val if STREAM.contains(&val) => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let fin = t.0 & 0x1 == 0x1;
+                let last = t.0 & 0x2 == 0x2;
                 let offset = if t.0 & 0x04 == 0x04 {
                     VarInt::decode(buf)?
                 } else {
                     VarInt(0)
                 };
-                // TODO: refactor?
-                let (data, last) = if t.0 & 0x02 == 0x02 {
+
+                let data = if t.0 & 0x02 == 0x02 {
                     let len = VarInt::decode(buf)?;
                     if len.0 as usize > buf.remaining() {
                         return Err(FrameDecodeError::NotEnoughData);
                     }
-                    (buf.copy_to_bytes(len.0 as usize), false)
+                    buf.copy_to_bytes(len.0 as usize)
                 } else {
-                    (buf.copy_to_bytes(buf.remaining()), false)
+                    buf.copy_to_bytes(buf.remaining())
                 };
+
                 Ok(Frame::Stream {
                     id,
                     fin,
@@ -353,8 +355,7 @@ impl Frame {
                 VarInt(t).encode(buf)?;
                 largest.encode(buf)?;
                 delay.encode(buf)?;
-                range_count.encode(buf)?;
-                first_range.encode(buf)?;
+                VarInt(ranges.len() as u64).encode(buf)?;
                 first_range.encode(buf)?;
 
                 for range in ranges.iter() {
@@ -403,7 +404,7 @@ impl Frame {
             } => {
                 let t = 0b00001000
                     + (if offset.0 > 0 { 0x4 } else { 0 })
-                    + (if !last { 0x2 } else { 0 })
+                    + (if *last { 0x2 } else { 0 })
                     + (if *fin { 1 } else { 0 });
 
                 variable_length_encode(buf, t)?;
@@ -411,7 +412,7 @@ impl Frame {
                 if offset.0 > 0 {
                     offset.encode(buf)?;
                 }
-                if !last {
+                if *last {
                     variable_length_encode(buf, data.len() as u64)?;
                 }
 
@@ -623,8 +624,8 @@ impl Frame {
 
 #[derive(Debug)]
 pub(super) struct AckRange {
-    gap: VarInt,
-    length: VarInt,
+    pub(super) gap: VarInt,
+    pub(super) length: VarInt,
 }
 
 #[derive(Debug)]
@@ -695,6 +696,8 @@ mod test {
             .encode(&mut encoded)
             .expect("Encoding should not fail");
 
+        println!("Encoded: {encoded:?}");
+
         let mut encoded = Cursor::new(encoded);
 
         let output_stream = Frame::decode(&mut encoded).expect("Decoding should not fail");
@@ -716,6 +719,47 @@ mod test {
                 assert_eq!(data, Bytes::from_static(&[0xff, 0xff, 0xff]));
             }
             _ => panic!("Got wrong frame type"),
+        }
+    }
+
+    #[test]
+    fn test_ack_encode_decode() {
+        let ack = Frame::Ack {
+            largest: VarInt(0),
+            delay: VarInt(0),
+            range_count: VarInt(0),
+            first_range: VarInt(0),
+            ranges: Vec::new(),
+            ecn: None,
+        };
+
+        let mut encoded = Vec::new();
+
+        ack.encode(&mut encoded).expect("Encoding should not fail");
+
+        let encoded = Bytes::from(encoded);
+
+        let iter = FrameIterator::new(encoded);
+
+        for output in iter {
+            match output {
+                Frame::Ack {
+                    largest,
+                    delay,
+                    range_count,
+                    first_range,
+                    ranges,
+                    ecn,
+                } => {
+                    assert_eq!(largest, 0);
+                    assert_eq!(delay, 0);
+                    assert_eq!(range_count, 0);
+                    assert_eq!(first_range, 0);
+                    assert_eq!(ranges.len(), 0);
+                    assert!(ecn.is_none());
+                }
+                _ => panic!("Got wrong type"),
+            }
         }
     }
 }
