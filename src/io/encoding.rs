@@ -39,7 +39,7 @@ pub fn variable_length_encode<B: BufMut>(buf: &mut B, data: u64) -> Result<(), V
     } else if data < 1073741823 {
         buf.put_u32((0b10 << 30) + data as u32);
     } else if data < 4611686018427387903 {
-        buf.put_u64((0b11 << 62) + data as u64);
+        buf.put_u64((0b11 << 62) + data);
     } else {
         return Err(VarIntError::InvalidVariableLength); // TODO: find better error
     }
@@ -72,6 +72,12 @@ impl VarInt {
     }
     pub fn length(&self) -> usize {
         variable_length(self.0)
+    }
+}
+
+impl PartialEq<u64> for VarInt {
+    fn eq(&self, other: &u64) -> bool {
+        self.0.eq(other)
     }
 }
 
