@@ -1,6 +1,6 @@
-use std::{future::poll_fn, io, task::Poll, thread, time::Duration};
+use std::{future::poll_fn, io, task::Poll};
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use rust_quic::io::{
     connection::ConnectionID,
     encoding::VarInt,
@@ -45,7 +45,7 @@ async fn send_packets(socket: &UdpSocket) -> io::Result<()> {
             length: VarInt(1),
             packet_number: PacketNumber::U8(1u8),
         },
-        payload: BytesMut::new(),
+        payload: Bytes::new(),
     };
     let mut buf: Vec<u8> = Vec::new();
     packet.encode(&mut buf).unwrap();
@@ -62,7 +62,7 @@ async fn send_packets(socket: &UdpSocket) -> io::Result<()> {
             key_phase: false,
             packet_number: PacketNumber::U8(2u8),
         },
-        payload: BytesMut::from([12, 1, 0, 255, 255, 255].as_slice()),
+        payload: Bytes::from([12, 1, 0, 255, 255, 255].as_slice()),
     };
     let mut buf: Vec<u8> = Vec::new();
     packet.encode(&mut buf).unwrap();
@@ -78,7 +78,7 @@ async fn send_packets(socket: &UdpSocket) -> io::Result<()> {
             key_phase: false,
             packet_number: PacketNumber::U8(3u8),
         },
-        payload: BytesMut::from([12, 1, 3, 255, 255, 255].as_slice()),
+        payload: Bytes::from([12, 1, 3, 255, 255, 255].as_slice()),
     };
 
     let mut buf: Vec<u8> = Vec::new();

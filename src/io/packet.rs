@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use bytes::{Buf, BufMut, BytesMut, TryGetError};
+use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
 
 use crate::io::{
@@ -38,13 +38,13 @@ pub enum Header {
 
 pub struct Packet {
     pub header: Header,
-    pub payload: BytesMut,
+    pub payload: Bytes,
 }
 
 impl Packet {
     pub fn decode<B: Buf>(buf: &mut B, cid_len: u8) -> Result<Self, PacketError> {
         let header = Header::decode(buf, cid_len)?;
-        let payload: BytesMut = buf.copy_to_bytes(buf.remaining()).into();
+        let payload: Bytes = buf.copy_to_bytes(buf.remaining());
 
         Ok(Self { header, payload })
     }

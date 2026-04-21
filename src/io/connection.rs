@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::task::AtomicWaker;
 use rand::{Rng, rngs::StdRng};
 use tokio::sync::{
@@ -112,9 +112,8 @@ impl ConnectionInner {
                     eprintln!("Got 1-RTT header in wrong state: {:?}", self.state);
                     return;
                 }
-                let frameiter = FrameIterator::new(packet.payload.freeze());
+                let frameiter = FrameIterator::new(packet.payload);
                 for frame in frameiter {
-                    println!("Frame");
                     self.handle_frame(frame);
                 }
             }
@@ -136,6 +135,10 @@ impl ConnectionInner {
                             offset: VarInt(0),
                             data: c_data,
                         };
+
+                        let mut payload = BytesMut::new();
+                        crypto_frame.encode(&mut payload).unwrap();
+
                         let mut packet = Packet {
                             header: Header::Handshake {
                                 version: 1,
@@ -144,9 +147,8 @@ impl ConnectionInner {
                                 length: VarInt(1), // TODO: Handle length
                                 packet_number: PacketNumber::from(self.packet_number),
                             },
-                            payload: BytesMut::new(),
+                            payload: payload.freeze(),
                         };
-                        crypto_frame.encode(&mut packet.payload).unwrap();
                         self.pending_packets.push_back(packet);
                     }
                     Side::Client => {
@@ -169,6 +171,8 @@ impl ConnectionInner {
                             offset: VarInt(0),
                             data: c_data,
                         };
+                        let mut payload = BytesMut::new();
+                        crypto_frame.encode(&mut payload).unwrap();
                         let mut packet = Packet {
                             header: Header::Handshake {
                                 version: 1,
@@ -177,9 +181,8 @@ impl ConnectionInner {
                                 length: VarInt(1), // TODO: Handle length
                                 packet_number: PacketNumber::from(self.packet_number),
                             },
-                            payload: BytesMut::new(),
+                            payload: payload.freeze(),
                         };
-                        crypto_frame.encode(&mut packet.payload).unwrap();
                         self.pending_packets.push_back(packet);
                     }
                     Side::Server => {
@@ -190,6 +193,8 @@ impl ConnectionInner {
                             eprintln!("Connected already consumed. Something is wrong")
                         }
                         let frame = Frame::HandshakeDone;
+                        let mut payload = BytesMut::new();
+                        frame.encode(&mut payload).unwrap();
                         let mut packet = Packet {
                             header: Header::Short {
                                 spin: false,
@@ -197,9 +202,8 @@ impl ConnectionInner {
                                 dst_cid: self.peer_cid,
                                 packet_number: PacketNumber::from(self.packet_number),
                             },
-                            payload: BytesMut::new(),
+                            payload: payload.freeze(),
                         };
-                        frame.encode(&mut packet.payload).unwrap();
                         self.pending_packets.push_back(packet);
                     }
                 }
@@ -349,7 +353,7 @@ impl ConnectionInner {
                 dst_cid: cid,
                 packet_number: PacketNumber::from(self.packet_number),
             },
-            payload,
+            payload: payload.freeze(),
         };
         self.packet_number += 1;
         Some(packet)
@@ -484,7 +488,7 @@ impl Connection {
                 length: VarInt(1),
                 packet_number: PacketNumber::U8(1u8),
             },
-            payload: BytesMut::new(),
+            payload: Bytes::new(),
         };
         inner.pending_packets.push_back(packet);
         inner.state = ConnectionState::Handshake;
