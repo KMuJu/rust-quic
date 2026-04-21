@@ -28,6 +28,8 @@ use crate::io::{
 
 pub struct EndpointState {
     socket: UdpSocket,
+    // TODO: Multiple connectionids can point to the same connection, so add a map between
+    // connectionid and internal handle
     connection_handles: HashMap<ConnectionID, ConnectionHandle>,
     pub(super) connections: HashMap<ConnectionID, Connection>,
     rng: StdRng,
