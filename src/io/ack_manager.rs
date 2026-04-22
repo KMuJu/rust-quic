@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::RangeInclusive,
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use futures::task::AtomicWaker;
+use range_set::{RangeSet, range_set};
 use tokio::time::Instant;
 
 use crate::io::{
@@ -20,7 +22,7 @@ struct SentPacket {
 }
 
 pub(super) struct Acker {
-    received: BTreeSet<u32>,
+    received: RangeSet<[RangeInclusive<u32>; 8]>,
     sent: BTreeMap<u32, SentPacket>,
     eliciting_count: u32,
     ack_deadline: Option<Instant>,
@@ -31,7 +33,7 @@ pub(super) struct Acker {
 impl Acker {
     pub(super) fn new() -> Self {
         Self {
-            received: BTreeSet::new(),
+            received: RangeSet::new(),
             sent: BTreeMap::new(),
             eliciting_count: 0,
             ack_deadline: None,
@@ -60,6 +62,7 @@ impl Acker {
                     self.ack_deadline = Some(Instant::now() + Duration::from_millis(25));
                 }
             }
+
             return true;
         }
 
@@ -82,54 +85,31 @@ impl Acker {
     }
 
     fn build_frame(&self) -> Frame {
-        let mut iter = self.received.iter().rev();
-        let largest = *iter.next().unwrap();
-        let delay = VarInt(0);
+        let mut iter = self.received.as_ref().iter().rev();
 
-        let mut last = largest;
-        let mut first_range = 0;
-        let mut gap = 0;
-
-        for &pn in iter.by_ref() {
-            if last - 1 > pn {
-                gap = (last - pn) as u64 - 1;
-                last = pn;
-                break;
-            }
-            last = pn;
-            first_range += 1;
-        }
+        let first = iter.next().unwrap();
+        let largest = *first.end();
+        let first_range = first.end() - first.start();
 
         let mut ranges = Vec::new();
-        let mut length = 0;
+        let mut prev_end = *first.start();
 
-        for &pn in iter {
-            if last - 1 > pn {
-                let range = AckRange {
-                    gap: VarInt(gap),
-                    length: VarInt(length),
-                };
-                ranges.push(range);
-                gap = (last - pn) as u64 - 1;
-                length = 0;
-            }
-            last = pn;
-            length += 1;
-        }
-
-        if length > 0 {
-            let range = AckRange {
-                gap: VarInt(gap),
-                length: VarInt(length - 1),
-            };
-            ranges.push(range);
+        for range in iter {
+            println!("Range: {range:?}");
+            let gap = prev_end - range.end() - 1;
+            let length = range.end() - range.start();
+            ranges.push(AckRange {
+                gap: VarInt(gap as u64),
+                length: VarInt(length as u64),
+            });
+            prev_end = *range.start();
         }
 
         Frame::Ack {
             largest: VarInt(largest as u64),
-            delay,
+            delay: VarInt(0),
             range_count: VarInt(ranges.len() as u64),
-            first_range: VarInt(first_range),
+            first_range: VarInt(first_range as u64),
             ranges,
             ecn: None,
         }
@@ -164,12 +144,12 @@ mod tests {
     #[test]
     fn test_build_frame() {
         let mut acker = Acker::new();
-        acker.received(&PacketNumber::U8(1), false);
-        acker.received(&PacketNumber::U8(2), false);
-        acker.received(&PacketNumber::U8(3), false);
-        acker.received(&PacketNumber::U8(5), false);
-        acker.received(&PacketNumber::U8(6), false);
-        acker.received(&PacketNumber::U8(9), false);
+        assert!(acker.received(&PacketNumber::U8(1), false));
+        assert!(acker.received(&PacketNumber::U8(2), false));
+        assert!(acker.received(&PacketNumber::U8(3), false));
+        assert!(acker.received(&PacketNumber::U8(5), false));
+        assert!(acker.received(&PacketNumber::U8(6), false));
+        assert!(acker.received(&PacketNumber::U8(9), false));
         let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
@@ -199,9 +179,9 @@ mod tests {
     #[test]
     fn test_build_frame_simple() {
         let mut acker = Acker::new();
-        acker.received(&PacketNumber::U8(1), false);
-        acker.received(&PacketNumber::U8(2), false);
-        acker.received(&PacketNumber::U8(3), false);
+        assert!(acker.received(&PacketNumber::U8(1), false));
+        assert!(acker.received(&PacketNumber::U8(2), false));
+        assert!(acker.received(&PacketNumber::U8(3), false));
         let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
@@ -227,13 +207,13 @@ mod tests {
     #[test]
     fn test_build_frame_first_range() {
         let mut acker = Acker::new();
-        acker.received(&PacketNumber::U8(1), false);
-        acker.received(&PacketNumber::U8(2), false);
-        acker.received(&PacketNumber::U8(3), false);
-        acker.received(&PacketNumber::U8(5), false);
-        acker.received(&PacketNumber::U8(6), false);
-        acker.received(&PacketNumber::U8(8), false);
-        acker.received(&PacketNumber::U8(9), false);
+        assert!(acker.received(&PacketNumber::U8(1), false));
+        assert!(acker.received(&PacketNumber::U8(2), false));
+        assert!(acker.received(&PacketNumber::U8(3), false));
+        assert!(acker.received(&PacketNumber::U8(5), false));
+        assert!(acker.received(&PacketNumber::U8(6), false));
+        assert!(acker.received(&PacketNumber::U8(8), false));
+        assert!(acker.received(&PacketNumber::U8(9), false));
         let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");

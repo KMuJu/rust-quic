@@ -23,14 +23,14 @@ Send side:
 # QUIC ACK Management Implementation Checklist
 
 ## Receive-Side Tracking
-- [ ] `RangeSet<u64>` data structure to track received packet numbers with gaps
+- [x] `RangeSet<u64>` data structure to track received packet numbers with gaps
 - [x] Per packet number space tracking (Initial, Handshake, 1-RTT)
 - [x] Record packet number on every received packet
 - [x] Duplicate detection (ignore already-seen packet numbers)
 - [x] Flag each received packet as ACK-eliciting or not
 
 ## Building ACK Frames
-- [ ] Encode `RangeSet` into ACK frame ranges (largest + gap/range pairs)
+- [x] Encode `RangeSet` into ACK frame ranges (largest + gap/range pairs)
 - [x] Only ACK within the correct packet number space
 - [x] Track count of unacknowledged ACK-eliciting packets received
 - [x] Reset ACK-eliciting counter after sending an ACK

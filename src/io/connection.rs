@@ -229,7 +229,7 @@ impl ConnectionInner {
             current -= range.length.0;
         }
 
-        println!("Acked: {acked:?}");
+        println!("Acked({space:?}): {acked:?}");
 
         let acker = &mut self.acks[space as usize];
         for ack in acked {
