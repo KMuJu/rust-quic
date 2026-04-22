@@ -554,6 +554,7 @@ impl Connection {
             incoming_data,
             outgoing_data,
             addr,
+            ack_timer: None,
         };
 
         tokio::spawn(driver);
@@ -689,6 +690,7 @@ struct ConnectionDriver {
     incoming_data: UnboundedReceiver<EndpointToConnection>,
     outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     addr: SocketAddr,
+    ack_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Future for ConnectionDriver {
@@ -756,6 +758,22 @@ impl Future for ConnectionDriver {
                     addr: this.addr,
                 })
                 .unwrap();
+        }
+
+        let deadline = this.inner.lock().unwrap().next_ack_deadline();
+        match (deadline, this.ack_timer.as_mut()) {
+            (Some(deadline), Some(timer)) => {
+                timer.as_mut().reset(deadline);
+            }
+            (Some(deadline), None) => {
+                let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
+                let _ = sleep.as_mut().poll(cx); // register waker
+                this.ack_timer = Some(sleep);
+                println!("---Started ack timer");
+            }
+            (None, _) => {
+                this.ack_timer = None;
+            }
         }
 
         Poll::Pending
