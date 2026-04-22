@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::io::{connection::ConnectionInner, frame::Frame, frame_assembler::FrameAssembler};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Dir {
     Bidir,
     Uni,

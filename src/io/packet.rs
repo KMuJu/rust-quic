@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, io::Cursor};
 
 use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
@@ -10,10 +10,10 @@ use crate::io::{
     frame::{Frame, FrameIterator},
 };
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Token(pub Vec<u8>);
 
-// #[derive(Debug)]
+#[derive(Clone)]
 pub enum Header {
     Initial {
         version: u32,
@@ -40,20 +40,22 @@ pub enum Header {
 
 pub struct Packet {
     pub header: Header,
-    pub payload: Bytes,
+    pub payload: Vec<Frame>,
 }
 
 impl Packet {
     pub fn decode<B: Buf>(buf: &mut B, cid_len: u8) -> Result<Self, PacketError> {
         let header = Header::decode(buf, cid_len)?;
-        let payload: Bytes = buf.copy_to_bytes(buf.remaining());
+        let payload_bytes: Bytes = buf.copy_to_bytes(buf.remaining());
+        let payload = FrameIterator::new(payload_bytes).collect();
 
         Ok(Self { header, payload })
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), PacketError> {
         self.header.encode(buf)?;
-        buf.put_slice(&self.payload);
+        self.payload.iter().for_each(|f| f.encode(buf).unwrap());
+        // buf.put_slice(&self.payload);
 
         Ok(())
     }
@@ -90,12 +92,11 @@ impl Packet {
         if !matches!(self.header, Header::Initial { .. }) {
             return false;
         }
-        let mut iter = FrameIterator::new(self.payload.clone());
-        iter.any(|f| {
+        self.payload.iter().any(|f| {
             let Frame::Crypto { data, .. } = f else {
                 return false;
             };
-            let mut data = Bytes::from(data);
+            let mut data = Cursor::new(data);
             let c_frame = CryptoFrame::decode(&mut data);
             matches!(c_frame, CryptoFrame::ClientHello)
         })
@@ -103,8 +104,7 @@ impl Packet {
 
     /// Is not ACK, PADDING or CONNECTION_CLOSE
     pub fn is_eliciting(&self) -> bool {
-        let mut iter = FrameIterator::new(self.payload.clone());
-        iter.any(|f| {
+        self.payload.iter().any(|f| {
             !matches!(
                 f,
                 Frame::Ack { .. }
@@ -147,6 +147,7 @@ impl Debug for Packet {
     }
 }
 
+#[derive(Clone)]
 pub enum PacketNumber {
     U8(u8),
     U16(u16),
@@ -439,10 +440,9 @@ mod test {
             data: c_data,
         };
 
-        let mut payload = BytesMut::new();
-        crypto_frame.encode(&mut payload).unwrap();
+        let payload = vec![crypto_frame];
 
-        let mut packet = Packet {
+        let packet = Packet {
             header: Header::Initial {
                 version: 1,
                 dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
@@ -451,7 +451,7 @@ mod test {
                 token: None,
                 packet_number: PacketNumber::from(1),
             },
-            payload: payload.freeze(),
+            payload,
         };
 
         assert!(packet.is_client_hello());

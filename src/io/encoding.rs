@@ -60,7 +60,7 @@ pub fn variable_length(data: u64) -> usize {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct VarInt(pub u64);
 
 impl VarInt {

@@ -37,7 +37,7 @@ mod frame_type {
     pub(super) const HANDSHAKE_DONE: u64 = 0x1e;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum Frame {
     Padding,
     Ping,
@@ -628,13 +628,13 @@ impl Frame {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct AckRange {
     pub(super) gap: VarInt,
     pub(super) length: VarInt,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct EcnCounts {
     ect0: VarInt,
     ect1: VarInt,

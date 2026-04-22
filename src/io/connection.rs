@@ -125,25 +125,23 @@ impl ConnectionInner {
             Header::Short { .. } => {
                 if !matches!(self.state, PacketSpace::Data) {
                     eprintln!("Got 1-RTT header in wrong state: {:?}", self.state);
-                    let frameiter = FrameIterator::new(packet.payload);
-                    for frame in frameiter {
+                    for frame in packet.payload.iter() {
                         println!("Frame: {frame:?}");
                     }
                     return;
                 }
-                let frameiter = FrameIterator::new(packet.payload);
-                for frame in frameiter {
+                for frame in packet.payload {
                     self.handle_data_frame(frame);
                 }
             }
             Header::Initial { .. } => {
-                let frameiter = FrameIterator::new(packet.payload.clone());
-                for frame in frameiter {
+                let is_client_hello = packet.is_client_hello();
+                for frame in packet.payload {
                     self.handle_initial_frame(frame);
                 }
                 // TODO: Handle sending two quic packets at a time
                 // And do different stuff for client and server
-                if matches!(self.state, PacketSpace::Initial) && packet.is_client_hello() {
+                if matches!(self.state, PacketSpace::Initial) && is_client_hello {
                     match self.side {
                         Side::Server => {
                             self.state = PacketSpace::Handshake;
@@ -165,8 +163,7 @@ impl ConnectionInner {
                 }
             }
             Header::Handshake { .. } => {
-                let frameiter = FrameIterator::new(packet.payload.clone());
-                for frame in frameiter {
+                for frame in packet.payload {
                     self.handle_handshake_frame(frame);
                 }
                 if matches!(self.state, PacketSpace::Handshake) {
@@ -392,11 +389,9 @@ impl ConnectionInner {
 
         // println!("Sending frames({space:?}): {frames:?}");
 
-        let mut payload = BytesMut::with_capacity(orig_mtu);
-        frames.iter().for_each(|f| f.encode(&mut payload).unwrap());
         let packet = Packet {
             header,
-            payload: payload.freeze(),
+            payload: frames,
         };
 
         Some(packet)
