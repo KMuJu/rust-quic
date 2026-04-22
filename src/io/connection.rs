@@ -642,6 +642,14 @@ impl Future for ConnectionDriver {
 
         for packet in packets {
             println!("Sending packet: {packet:?}");
+            let space = packet.packet_space();
+
+            this.inner.lock().unwrap().acks[space as usize].sent_packet(
+                packet.packet_number().clone(),
+                packet.header.clone(),
+                packet.payload.clone(),
+            );
+
             let mut buf = BytesMut::new();
             packet.encode(&mut buf).unwrap();
             this.outgoing_data

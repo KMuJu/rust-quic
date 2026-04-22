@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use futures::task::AtomicWaker;
@@ -9,10 +10,14 @@ use tokio::time::Instant;
 use crate::io::{
     encoding::VarInt,
     frame::{AckRange, Frame},
-    packet::PacketNumber,
+    packet::{Header, Packet, PacketNumber},
 };
 
-struct SentPacket;
+struct SentPacket {
+    timestamp: Instant,
+    header: Header,
+    frames: Vec<Frame>,
+}
 
 pub(super) struct Acker {
     received: BTreeSet<u32>,
@@ -21,7 +26,6 @@ pub(super) struct Acker {
     ack_deadline: Option<Instant>,
 
     waker: AtomicWaker,
-    has_received: bool, // Since last ack frame
 }
 
 impl Acker {
@@ -32,8 +36,11 @@ impl Acker {
             eliciting_count: 0,
             ack_deadline: None,
             waker: AtomicWaker::new(),
-            has_received: false,
         }
+    }
+
+    pub(super) fn register_waker(&self, waker: &Waker) {
+        self.waker.register(waker);
     }
 
     /// # Returns
@@ -43,10 +50,15 @@ impl Acker {
         let pn = pn.u32();
 
         if self.received.insert(pn) {
-            self.has_received = true;
-            self.waker.wake();
             if elicit {
                 self.eliciting_count += 1;
+                if self.eliciting_count >= 2 {
+                    self.waker.wake();
+                    println!("Eliciting packet count >= 2: NEED TO SEND ACK");
+                }
+                if self.ack_deadline.is_none() {
+                    self.ack_deadline = Some(Instant::now() + Duration::from_millis(25));
+                }
             }
             return true;
         }
@@ -58,27 +70,15 @@ impl Acker {
         self.ack_deadline
     }
 
-    pub(super) fn poll_ack(&mut self, cx: &mut Context<'_>) -> Poll<Frame> {
-        self.waker.register(cx.waker());
-        if self.has_received {
-            Poll::Ready(self.build_frame())
-        } else {
-            Poll::Pending
-        }
-    }
-
     // TODO: Refactor
     pub(super) fn get_ack(&mut self) -> Option<Frame> {
-        if self.has_received && self.eliciting_count != 0 {
+        if self.eliciting_count != 0 {
             self.eliciting_count = 0;
+            self.ack_deadline = None;
             Some(self.build_frame())
         } else {
             None
         }
-    }
-
-    pub(super) fn mark_acked(&mut self) {
-        self.has_received = false;
     }
 
     fn build_frame(&self) -> Frame {
@@ -133,6 +133,27 @@ impl Acker {
             ranges,
             ecn: None,
         }
+    }
+
+    pub(super) fn sent_packet(
+        &mut self,
+        packet_number: PacketNumber,
+        header: Header,
+        frames: Vec<Frame>,
+    ) {
+        let pn = packet_number.u32();
+
+        let sent = SentPacket {
+            timestamp: Instant::now(),
+            header,
+            frames,
+        };
+
+        self.sent.insert(pn, sent);
+    }
+
+    pub(super) fn acked(&mut self, packet_number: u32) {
+        self.sent.remove(&packet_number);
     }
 }
 
