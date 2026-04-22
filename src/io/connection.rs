@@ -25,7 +25,7 @@ use crate::io::{
     ack_manager::Acker,
     crypto::CryptoFrame,
     endpoint::EndpointRef,
-    frame::{Frame, FrameIterator},
+    frame::{AckRange, EcnCounts, Frame, FrameIterator},
     packet::{Header, Packet, PacketNumber},
     stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
 };
@@ -61,10 +61,10 @@ pub struct ConnectionInner {
     // Wakes up when a stream has written data pending
     write_waker: AtomicWaker,
 
-    packet_number: [usize; 3],
+    packet_numbers: [usize; 3],
     stream_number: usize,
 
-    acker: [Acker; 3],
+    acks: [Acker; 3],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -113,7 +113,7 @@ impl ConnectionInner {
         };
         let space = packet.packet_space();
         println!("{:?}({:?}): Got {:?}", self.id, self.state, packet);
-        if !self.acker[space as usize].received(packet.packet_number(), packet.is_eliciting()) {
+        if !self.acks[space as usize].received(packet.packet_number(), packet.is_eliciting()) {
             eprintln!(
                 "ERROR: Got dulicate packet!({:?}): {}",
                 space,
@@ -145,6 +145,7 @@ impl ConnectionInner {
                     match self.side {
                         Side::Server => {
                             self.state = PacketSpace::Handshake;
+
                             let crypto_data = CryptoFrame::ServerHello;
                             let mut c_data = Vec::new();
                             crypto_data.encode(&mut c_data);
@@ -200,8 +201,91 @@ impl ConnectionInner {
         }
     }
 
-    fn handle_initial_frame(&mut self, frame: Frame) {}
-    fn handle_handshake_frame(&mut self, frame: Frame) {}
+    fn handle_ack_frame(
+        &mut self,
+        space: PacketSpace,
+        largest: &VarInt,
+        delay: &VarInt,
+        range_count: &VarInt,
+        first_range: &VarInt,
+        ranges: &Vec<AckRange>,
+        ecn: &Option<EcnCounts>,
+    ) {
+        let mut acked = Vec::new();
+        let mut current = largest.0;
+
+        // First range: largest down to largest - first_range
+        for pn in (current - first_range.0..=current).rev() {
+            acked.push(pn as u32);
+        }
+        current -= first_range.0;
+
+        // Subsequent ranges: skip gap+2, then ack length+1
+        for range in ranges {
+            current -= range.gap.0 + 2;
+            for pn in (current - range.length.0..=current).rev() {
+                acked.push(pn as u32);
+            }
+            current -= range.length.0;
+        }
+
+        println!("Acked: {acked:?}");
+
+        let acker = &mut self.acks[space as usize];
+        for ack in acked {
+            acker.acked(ack);
+        }
+    }
+
+    fn handle_initial_frame(&mut self, frame: Frame) {
+        match &frame {
+            Frame::Ack {
+                largest,
+                delay,
+                range_count,
+                first_range,
+                ranges,
+                ecn,
+            } => {
+                self.handle_ack_frame(
+                    PacketSpace::Initial,
+                    largest,
+                    delay,
+                    range_count,
+                    first_range,
+                    ranges,
+                    ecn,
+                );
+            }
+            Frame::Crypto { .. } => {}
+            _ => todo!("Unimplemented frame: {frame:?}"),
+        }
+    }
+
+    fn handle_handshake_frame(&mut self, frame: Frame) {
+        match &frame {
+            Frame::Ack {
+                largest,
+                delay,
+                range_count,
+                first_range,
+                ranges,
+                ecn,
+            } => {
+                self.handle_ack_frame(
+                    PacketSpace::Handshake,
+                    largest,
+                    delay,
+                    range_count,
+                    first_range,
+                    ranges,
+                    ecn,
+                );
+            }
+            Frame::Crypto { .. } => {}
+            _ => todo!("Unimplemented frame: {frame:?}"),
+        }
+    }
 
     fn handle_data_frame(&mut self, frame: Frame) {
         println!("Got frame: {frame:?}");
@@ -242,7 +326,15 @@ impl ConnectionInner {
                 ranges,
                 ecn,
             } => {
-                println!("TODO: Handle ack frame");
+                self.handle_ack_frame(
+                    PacketSpace::Data,
+                    largest,
+                    delay,
+                    range_count,
+                    first_range,
+                    ranges,
+                    ecn,
+                );
             }
             Frame::NewToken { token } => todo!(),
             Frame::MaxData { max_data } => todo!(),
@@ -296,7 +388,7 @@ impl ConnectionInner {
     }
 
     fn next_ack_deadline(&self) -> Option<Instant> {
-        self.acker.iter().filter_map(|a| a.get_deadline()).min()
+        self.acks.iter().filter_map(|a| a.get_deadline()).min()
     }
 
     fn get_packet(&mut self, space: PacketSpace, mut mtu: usize) -> Option<Packet> {
@@ -314,7 +406,7 @@ impl ConnectionInner {
             }
         }
 
-        if let Some(ack) = self.acker[space as usize].get_ack() {
+        if let Some(ack) = self.acks[space as usize].get_ack() {
             frames.push(ack);
         };
 
@@ -360,8 +452,8 @@ impl ConnectionInner {
             *fin = true
         };
 
-        let pn = PacketNumber::from(self.packet_number[space as usize]);
-        self.packet_number[space as usize] += 1;
+        let pn = PacketNumber::from(self.packet_numbers[space as usize]);
+        self.packet_numbers[space as usize] += 1;
 
         let header = match space {
             PacketSpace::Initial => Header::Initial {
@@ -453,9 +545,9 @@ impl Connection {
             pending_send: VecDeque::new(),
             pending_frames: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
             write_waker: AtomicWaker::new(),
-            packet_number: [0, 0, 0],
+            packet_numbers: [0, 0, 0],
             stream_number: 0,
-            acker: [Acker::new(), Acker::new(), Acker::new()],
+            acks: [Acker::new(), Acker::new(), Acker::new()],
         }));
         let driver = ConnectionDriver {
             inner: inner.clone(),
@@ -605,6 +697,12 @@ impl Future for ConnectionDriver {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.inner.lock().unwrap().write_waker.register(cx.waker());
+        this.inner
+            .lock()
+            .unwrap()
+            .acks
+            .iter()
+            .for_each(|a| a.register_waker(cx.waker()));
 
         let mut buffer = Vec::new();
 
