@@ -22,6 +22,7 @@ use tokio::{
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
     connection::{Connection, ConnectionHandle, ConnectionID, Incoming, IncomingInner},
+    frame::{Frame, FrameIterator},
     packet::{Packet, PacketError},
     stream::Side,
 };
@@ -172,7 +173,7 @@ impl EndpointState {
             }
         };
         let cid = packet.dst_cid();
-        if packet.is_initial() {
+        if packet.is_client_hello() {
             let src_cid = packet.src_cid().unwrap();
             self.insert_new_connection(cid, src_cid, addr);
         }

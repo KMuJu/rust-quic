@@ -567,7 +567,13 @@ impl Frame {
                 t + i + e + s
             }
             StopSending { id, error_code } => todo!(),
-            Crypto { offset, data } => todo!(),
+            Crypto { offset, data } => {
+                let t = variable_length(CRYPTO);
+                let o = offset.length();
+                let l = variable_length(data.len() as u64);
+                let d = data.len();
+                t + o + l + d
+            }
             NewToken { token } => todo!(),
             Stream {
                 id,
@@ -617,7 +623,7 @@ impl Frame {
                 error_code,
                 reason_phrase,
             } => todo!(),
-            HandshakeDone => todo!(),
+            HandshakeDone => variable_length(HANDSHAKE_DONE),
         }
     }
 }

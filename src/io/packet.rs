@@ -4,7 +4,8 @@ use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
 
 use crate::io::{
-    connection::ConnectionID,
+    connection::{ConnectionID, PacketSpace},
+    crypto::CryptoFrame,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
     frame::{Frame, FrameIterator},
 };
@@ -85,6 +86,21 @@ impl Packet {
         matches!(self.header, Header::Initial { .. })
     }
 
+    pub fn is_client_hello(&self) -> bool {
+        if !matches!(self.header, Header::Initial { .. }) {
+            return false;
+        }
+        let mut iter = FrameIterator::new(self.payload.clone());
+        iter.any(|f| {
+            let Frame::Crypto { data, .. } = f else {
+                return false;
+            };
+            let mut data = Bytes::from(data);
+            let c_frame = CryptoFrame::decode(&mut data);
+            matches!(c_frame, CryptoFrame::ClientHello)
+        })
+    }
+
     /// Is not ACK, PADDING or CONNECTION_CLOSE
     pub fn is_eliciting(&self) -> bool {
         let mut iter = FrameIterator::new(self.payload.clone());
@@ -97,6 +113,14 @@ impl Packet {
                     | Frame::ConnectionCloseQuic { .. }
             )
         })
+    }
+
+    pub(super) fn packet_space(&self) -> PacketSpace {
+        match &self.header {
+            Header::Initial { .. } => PacketSpace::Initial,
+            Header::Handshake { .. } => PacketSpace::Handshake,
+            Header::Short { .. } => PacketSpace::Data,
+        }
     }
 }
 
@@ -118,6 +142,7 @@ impl Debug for Packet {
         f.debug_struct("Packet")
             .field("Header", &self.header)
             .field("Packet Number", &self.packet_number())
+            .field("Payload len", &self.payload.len())
             .finish()
     }
 }
@@ -361,7 +386,9 @@ impl Header {
 
 #[cfg(test)]
 mod test {
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
+
+    use bytes::BytesMut;
 
     use super::*;
 
@@ -400,5 +427,33 @@ mod test {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_is_client_hello() {
+        let crypto_data = CryptoFrame::ClientHello;
+        let mut c_data = Vec::new();
+        crypto_data.encode(&mut c_data);
+        let crypto_frame = Frame::Crypto {
+            offset: VarInt(0),
+            data: c_data,
+        };
+
+        let mut payload = BytesMut::new();
+        crypto_frame.encode(&mut payload).unwrap();
+
+        let mut packet = Packet {
+            header: Header::Initial {
+                version: 1,
+                dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
+                src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
+                length: VarInt(1), // TODO: Handle length
+                token: None,
+                packet_number: PacketNumber::from(1),
+            },
+            payload: payload.freeze(),
+        };
+
+        assert!(packet.is_client_hello());
     }
 }

@@ -39,7 +39,7 @@ pub struct ConnectionInner {
     side: Side,
 
     connected: Option<oneshot::Sender<()>>,
-    state: ConnectionState,
+    state: PacketSpace,
 
     recv: HashMap<StreamID, RecvStream>,
     send: HashMap<StreamID, SendStream>,
@@ -54,9 +54,8 @@ pub struct ConnectionInner {
     pending_recv: VecDeque<StreamID>,
     pending_send: VecDeque<StreamID>,
 
-    // Packets to be sent by endpoint
+    // Frames to be sent by endpoint
     // Handshake stuff i guess
-    pending_packets: VecDeque<Packet>,
     pending_frames: [VecDeque<Frame>; 3],
 
     // Wakes up when a stream has written data pending
@@ -112,130 +111,102 @@ impl ConnectionInner {
                 return;
             }
         };
-        println!("{:?}: Got {:?}", self.id, packet);
-        if !self.acker[self.state as usize].received(packet.packet_number(), packet.is_eliciting())
-        {
-            println!(
-                "ERROR: Got dulicate packet!: {}",
+        let space = packet.packet_space();
+        println!("{:?}({:?}): Got {:?}", self.id, self.state, packet);
+        if !self.acker[space as usize].received(packet.packet_number(), packet.is_eliciting()) {
+            eprintln!(
+                "ERROR: Got dulicate packet!({:?}): {}",
+                space,
                 packet.packet_number().u32()
             );
             return;
         }
         match packet.header {
             Header::Short { .. } => {
-                if !matches!(self.state, ConnectionState::Data) {
+                if !matches!(self.state, PacketSpace::Data) {
                     eprintln!("Got 1-RTT header in wrong state: {:?}", self.state);
+                    let frameiter = FrameIterator::new(packet.payload);
+                    for frame in frameiter {
+                        println!("Frame: {frame:?}");
+                    }
                     return;
                 }
                 let frameiter = FrameIterator::new(packet.payload);
                 for frame in frameiter {
-                    self.handle_frame(frame);
+                    self.handle_data_frame(frame);
                 }
             }
             Header::Initial { .. } => {
-                if !matches!(self.state, ConnectionState::Initial) {
-                    eprintln!("Got initial header in wrong state: {:?}", self.state);
-                    return;
+                let frameiter = FrameIterator::new(packet.payload.clone());
+                for frame in frameiter {
+                    self.handle_initial_frame(frame);
                 }
                 // TODO: Handle sending two quic packets at a time
                 // And do different stuff for client and server
+                if matches!(self.state, PacketSpace::Initial) && packet.is_client_hello() {
+                    match self.side {
+                        Side::Server => {
+                            self.state = PacketSpace::Handshake;
+                            let crypto_data = CryptoFrame::ServerHello;
+                            let mut c_data = Vec::new();
+                            crypto_data.encode(&mut c_data);
+                            let crypto_frame = Frame::Crypto {
+                                offset: VarInt(0),
+                                data: c_data,
+                            };
 
-                match self.side {
-                    Side::Server => {
-                        self.state = ConnectionState::Handshake;
-                        let crypto_data = CryptoFrame::ServerHello;
-                        let mut c_data = Vec::new();
-                        crypto_data.encode(&mut c_data);
-                        let crypto_frame = Frame::Crypto {
-                            offset: VarInt(0),
-                            data: c_data,
-                        };
-
-                        let mut payload = BytesMut::new();
-                        crypto_frame.encode(&mut payload).unwrap();
-
-                        let mut packet = Packet {
-                            header: Header::Handshake {
-                                version: 1,
-                                dst_cid: self.peer_cid,
-                                src_cid: self.id,
-                                length: VarInt(1), // TODO: Handle length
-                                packet_number: PacketNumber::from(
-                                    self.packet_number[self.state as usize],
-                                ),
-                            },
-                            payload: payload.freeze(),
-                        };
-                        self.pending_packets.push_back(packet);
-                        self.packet_number[self.state as usize] += 1;
-                    }
-                    Side::Client => {
-                        panic!("Got initial as client: THIS IS WRONG");
+                            self.pending_frames[PacketSpace::Handshake as usize]
+                                .push_back(crypto_frame);
+                        }
+                        Side::Client => {
+                            panic!("Got initial(ClientHello) as client: THIS IS WRONG");
+                        }
                     }
                 }
             }
             Header::Handshake { .. } => {
-                if !matches!(self.state, ConnectionState::Handshake) {
-                    eprintln!("Got Handshake header in wrong state: {:?}", self.state);
-                    return;
+                let frameiter = FrameIterator::new(packet.payload.clone());
+                for frame in frameiter {
+                    self.handle_handshake_frame(frame);
                 }
-                match self.side {
-                    Side::Client => {
-                        self.state = ConnectionState::Data;
-                        let crypto_data = CryptoFrame::Finished;
-                        let mut c_data = Vec::new();
-                        crypto_data.encode(&mut c_data);
-                        let crypto_frame = Frame::Crypto {
-                            offset: VarInt(0),
-                            data: c_data,
-                        };
-                        let mut payload = BytesMut::new();
-                        crypto_frame.encode(&mut payload).unwrap();
-                        let mut packet = Packet {
-                            header: Header::Handshake {
-                                version: 1,
-                                dst_cid: self.peer_cid,
-                                src_cid: self.id,
-                                length: VarInt(1), // TODO: Handle length
-                                packet_number: PacketNumber::from(
-                                    self.packet_number[self.state as usize],
-                                ),
-                            },
-                            payload: payload.freeze(),
-                        };
-                        self.pending_packets.push_back(packet);
-                        self.packet_number[self.state as usize] += 1;
-                    }
-                    Side::Server => {
-                        self.state = ConnectionState::Data;
-                        if let Some(connected) = self.connected.take() {
-                            connected.send(()).unwrap();
-                        } else {
-                            eprintln!("Connected already consumed. Something is wrong")
+                if matches!(self.state, PacketSpace::Handshake) {
+                    match self.side {
+                        // Send Handshake(Finished)
+                        Side::Client => {
+                            // TODO: Check if it is ServerHello Packet
+                            // Do better/stricter packet handling
+                            self.state = PacketSpace::Data;
+                            let crypto_data = CryptoFrame::Finished;
+                            let mut c_data = Vec::new();
+                            crypto_data.encode(&mut c_data);
+                            let crypto_frame = Frame::Crypto {
+                                offset: VarInt(0),
+                                data: c_data,
+                            };
+                            self.pending_frames[PacketSpace::Handshake as usize]
+                                .push_back(crypto_frame);
                         }
-                        let frame = Frame::HandshakeDone;
-                        let mut payload = BytesMut::new();
-                        frame.encode(&mut payload).unwrap();
-                        let mut packet = Packet {
-                            header: Header::Short {
-                                spin: false,
-                                key_phase: false,
-                                dst_cid: self.peer_cid,
-                                packet_number: PacketNumber::from(
-                                    self.packet_number[self.state as usize],
-                                ),
-                            },
-                            payload: payload.freeze(),
-                        };
-                        self.pending_packets.push_back(packet);
-                        self.packet_number[self.state as usize] += 1;
+                        // Send Short(HandshakeDone)
+                        Side::Server => {
+                            self.state = PacketSpace::Data;
+                            if let Some(connected) = self.connected.take() {
+                                connected.send(()).unwrap();
+                            } else {
+                                eprintln!("[ERROR]: Connected already consumed. Something is wrong")
+                            }
+                            let frame = Frame::HandshakeDone;
+                            self.pending_frames[PacketSpace::Data as usize].push_back(frame);
+                        }
                     }
                 }
             }
         }
     }
 
-    fn handle_frame(&mut self, frame: Frame) {
+    fn handle_initial_frame(&mut self, frame: Frame) {}
+    fn handle_handshake_frame(&mut self, frame: Frame) {}
+
+    fn handle_data_frame(&mut self, frame: Frame) {
         println!("Got frame: {frame:?}");
         match &frame {
             Frame::StreamDataBlocked { id, .. }
@@ -331,7 +302,7 @@ impl ConnectionInner {
         self.acker.iter().filter_map(|a| a.get_deadline()).min()
     }
 
-    fn get_packet(&mut self, space: ConnectionState, mut mtu: usize) -> Option<Packet> {
+    fn get_packet(&mut self, space: PacketSpace, mut mtu: usize) -> Option<Packet> {
         let orig_mtu = mtu;
 
         let mut frames = Vec::new();
@@ -350,7 +321,7 @@ impl ConnectionInner {
             frames.push(ack);
         };
 
-        if matches!(space, ConnectionState::Data) {
+        if matches!(space, PacketSpace::Data) {
             while let Some(id) = self.pending_send.pop_front() {
                 let Some(send) = self.send.get_mut(&id) else {
                     continue;
@@ -377,7 +348,7 @@ impl ConnectionInner {
                     mtu -= size;
                     frames.push(frame);
                 } else {
-                    self.pending_frames[self.state as usize].push_back(frame);
+                    self.pending_frames[space as usize].push_back(frame);
                     break;
                 }
             }
@@ -396,7 +367,7 @@ impl ConnectionInner {
         self.packet_number[space as usize] += 1;
 
         let header = match space {
-            ConnectionState::Initial => Header::Initial {
+            PacketSpace::Initial => Header::Initial {
                 dst_cid: self.peer_cid,
                 src_cid: self.id,
                 packet_number: pn,
@@ -404,14 +375,14 @@ impl ConnectionInner {
                 token: None,
                 length: VarInt(0),
             },
-            ConnectionState::Handshake => Header::Handshake {
+            PacketSpace::Handshake => Header::Handshake {
                 dst_cid: self.peer_cid,
                 src_cid: self.id,
                 packet_number: pn,
                 version: 0,
                 length: VarInt(0),
             },
-            ConnectionState::Data => Header::Short {
+            PacketSpace::Data => Header::Short {
                 spin: false,
                 key_phase: false,
                 dst_cid: self.peer_cid,
@@ -419,13 +390,15 @@ impl ConnectionInner {
             },
         };
 
+        // println!("Sending frames({space:?}): {frames:?}");
+
         let mut payload = BytesMut::with_capacity(orig_mtu);
         frames.iter().for_each(|f| f.encode(&mut payload).unwrap());
         let packet = Packet {
             header,
             payload: payload.freeze(),
         };
-        self.packet_number[self.state as usize] += 1;
+
         Some(packet)
     }
 
@@ -474,7 +447,7 @@ impl Connection {
             peer_cid,
             side,
             connected: Some(connected),
-            state: ConnectionState::Initial,
+            state: PacketSpace::Initial,
             recv: HashMap::new(),
             send: HashMap::new(),
             bidir_acceptable: VecDeque::new(),
@@ -483,7 +456,6 @@ impl Connection {
             unidir_accept_waker: AtomicWaker::new(),
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
-            pending_packets: VecDeque::new(),
             pending_frames: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
             write_waker: AtomicWaker::new(),
             packet_number: [0, 0, 0],
@@ -551,19 +523,15 @@ impl Connection {
     pub(super) fn init(&self) {
         let mut inner = self.inner.lock().unwrap();
         // HACK: Wtf is this ??? (I dont care for now)
-        let packet = Packet {
-            header: Header::Initial {
-                version: 1,
-                dst_cid: inner.peer_cid,
-                src_cid: inner.id,
-                token: None,
-                length: VarInt(1),
-                packet_number: PacketNumber::U8(1u8),
-            },
-            payload: Bytes::new(),
+        let crypto_data = CryptoFrame::ClientHello;
+        let mut c_data = Vec::new();
+        crypto_data.encode(&mut c_data);
+        let crypto_frame = Frame::Crypto {
+            offset: VarInt(0),
+            data: c_data,
         };
-        inner.pending_packets.push_back(packet);
-        inner.state = ConnectionState::Handshake;
+        inner.pending_frames[PacketSpace::Initial as usize].push_back(crypto_frame);
+        inner.state = PacketSpace::Handshake;
         inner.write_waker.wake();
     }
 }
@@ -579,7 +547,7 @@ impl Debug for Connection {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ConnectionState {
+pub(super) enum PacketSpace {
     Initial,
     Handshake,
     Data,
@@ -664,13 +632,11 @@ impl Future for ConnectionDriver {
         let packets = {
             let mut conn = this.inner.lock().unwrap();
             let mut pkts = Vec::new();
-            while let Some(packet) = conn.pending_packets.pop_front() {
-                pkts.push(packet);
-            }
+
             for space in [
-                ConnectionState::Initial,
-                ConnectionState::Handshake,
-                ConnectionState::Data,
+                PacketSpace::Initial,
+                PacketSpace::Handshake,
+                PacketSpace::Data,
             ] {
                 while let Some(p) = conn.get_packet(space, 1200) {
                     pkts.push(p);
@@ -680,6 +646,7 @@ impl Future for ConnectionDriver {
         };
 
         for packet in packets {
+            println!("Sending packet: {packet:?}");
             let mut buf = BytesMut::new();
             packet.encode(&mut buf).unwrap();
             this.outgoing_data
