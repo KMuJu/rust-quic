@@ -235,6 +235,16 @@ impl ConnectionInner {
         for ack in acked {
             acker.acked(ack);
         }
+
+        // TODO: Handle
+        // - declare lost: pn + 3 <= largest  (packet threshold)
+        // - declare lost: sent_at + time_threshold <= largest_sent_at  (time threshold)
+        // - re-enqueue retransmittable frames from lost packets
+        // - arm loss_timer for remaining unacked packets that might still be lost
+        // - arm PTO timer (separate, fires if no ACK arrives within ~3× RTT)
+
+        let mut lost = VecDeque::from(acker.get_lost_frames(largest.0 as u32));
+        self.pending_frames[space as usize].append(&mut lost);
     }
 
     fn handle_initial_frame(&mut self, frame: Frame) {

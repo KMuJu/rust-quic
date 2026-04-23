@@ -132,6 +132,29 @@ impl Acker {
         self.sent.insert(pn, sent);
     }
 
+    pub(super) fn get_lost_frames(&mut self, largest: u32) -> Vec<Frame> {
+        let mut lost = Vec::new();
+
+        let lost_pns: Vec<_> = self
+            .sent
+            .keys()
+            .cloned()
+            .filter(|pn| pn + 3 <= largest)
+            .collect();
+
+        for pn in lost_pns {
+            let mut sent = self.sent.remove(&pn).unwrap();
+            lost.append(&mut sent.frames);
+        }
+
+        // TODO: Handle packets lost based on time
+        // time_threshold = max(9/8 * smoothed_rtt, 1ms)
+        // packet is lost if:
+        //   largest_sent_at - packet.sent_at >= time_threshold
+
+        lost
+    }
+
     pub(super) fn acked(&mut self, packet_number: u32) {
         self.sent.remove(&packet_number);
     }
@@ -139,6 +162,10 @@ impl Acker {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use crate::io::connection::ConnectionID;
+
     use super::*;
 
     #[test]
@@ -238,5 +265,30 @@ mod tests {
             }
             _ => panic!("Can only be ack frame type"),
         }
+    }
+
+    #[test]
+    fn test_lost_frames() {
+        let mut acker = Acker::new();
+        let pn = PacketNumber::from(0);
+        let header = Header::Short {
+            spin: false,
+            key_phase: false,
+            dst_cid: ConnectionID::from_buf(&mut Cursor::new([1]), 1),
+            packet_number: pn,
+        };
+        let frames = vec![Frame::Padding, Frame::HandshakeDone];
+
+        acker.sent_packet(PacketNumber::U8(1), header.clone(), frames.clone());
+        acker.sent_packet(PacketNumber::U8(2), header.clone(), frames.clone());
+        acker.sent_packet(PacketNumber::U8(5), header.clone(), frames.clone());
+        acker.sent_packet(PacketNumber::U8(6), header.clone(), frames.clone());
+
+        let lost = acker.get_lost_frames(6);
+
+        assert!(matches!(lost[0], Frame::Padding));
+        assert!(matches!(lost[1], Frame::HandshakeDone));
+        assert!(matches!(lost[2], Frame::Padding));
+        assert!(matches!(lost[3], Frame::HandshakeDone));
     }
 }
