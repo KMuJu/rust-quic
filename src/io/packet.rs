@@ -38,24 +38,23 @@ pub enum Header {
     },
 }
 
-pub struct Packet {
+pub(super) struct Packet {
     pub header: Header,
-    pub payload: Vec<Frame>,
+    pub frames: Vec<Frame>,
 }
 
 impl Packet {
     pub fn decode<B: Buf>(buf: &mut B, cid_len: u8) -> Result<Self, PacketError> {
         let header = Header::decode(buf, cid_len)?;
-        let payload_bytes: Bytes = buf.copy_to_bytes(buf.remaining());
-        let payload = FrameIterator::new(payload_bytes).collect();
+        let payload: Bytes = buf.copy_to_bytes(buf.remaining());
+        let frames = FrameIterator::new(payload).collect();
 
-        Ok(Self { header, payload })
+        Ok(Self { header, frames })
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), PacketError> {
         self.header.encode(buf)?;
-        self.payload.iter().for_each(|f| f.encode(buf).unwrap());
-        // buf.put_slice(&self.payload);
+        self.frames.iter().for_each(|f| f.encode(buf).unwrap());
 
         Ok(())
     }
@@ -92,7 +91,7 @@ impl Packet {
         if !matches!(self.header, Header::Initial { .. }) {
             return false;
         }
-        self.payload.iter().any(|f| {
+        self.frames.iter().any(|f| {
             let Frame::Crypto { data, .. } = f else {
                 return false;
             };
@@ -104,7 +103,7 @@ impl Packet {
 
     /// Is not ACK, PADDING or CONNECTION_CLOSE
     pub fn is_eliciting(&self) -> bool {
-        self.payload.iter().any(|f| {
+        self.frames.iter().any(|f| {
             !matches!(
                 f,
                 Frame::Ack { .. }
@@ -142,7 +141,7 @@ impl Debug for Packet {
         f.debug_struct("Packet")
             .field("Header", &self.header)
             .field("Packet Number", &self.packet_number())
-            .field("Payload len", &self.payload.len())
+            .field("Frames", &self.frames)
             .finish()
     }
 }
@@ -389,8 +388,6 @@ impl Header {
 mod test {
     use std::io::{self, Cursor};
 
-    use bytes::BytesMut;
-
     use super::*;
 
     #[test]
@@ -451,7 +448,7 @@ mod test {
                 token: None,
                 packet_number: PacketNumber::from(1),
             },
-            payload,
+            frames: payload,
         };
 
         assert!(packet.is_client_hello());

@@ -125,18 +125,18 @@ impl ConnectionInner {
             Header::Short { .. } => {
                 if !matches!(self.state, PacketSpace::Data) {
                     eprintln!("Got 1-RTT header in wrong state: {:?}", self.state);
-                    for frame in packet.payload.iter() {
+                    for frame in packet.frames.iter() {
                         println!("Frame: {frame:?}");
                     }
                     return;
                 }
-                for frame in packet.payload {
+                for frame in packet.frames {
                     self.handle_data_frame(frame);
                 }
             }
             Header::Initial { .. } => {
                 let is_client_hello = packet.is_client_hello();
-                for frame in packet.payload {
+                for frame in packet.frames {
                     self.handle_initial_frame(frame);
                 }
                 // TODO: Handle sending two quic packets at a time
@@ -164,7 +164,7 @@ impl ConnectionInner {
                 }
             }
             Header::Handshake { .. } => {
-                for frame in packet.payload {
+                for frame in packet.frames {
                     self.handle_handshake_frame(frame);
                 }
                 if matches!(self.state, PacketSpace::Handshake) {
@@ -491,10 +491,7 @@ impl ConnectionInner {
 
         // println!("Sending frames({space:?}): {frames:?}");
 
-        let packet = Packet {
-            header,
-            payload: frames,
-        };
+        let packet = Packet { header, frames };
 
         Some(packet)
     }
@@ -754,11 +751,8 @@ impl Future for ConnectionDriver {
             println!("Sending packet: {packet:?}");
             let space = packet.packet_space();
 
-            this.inner.lock().unwrap().acks[space as usize].sent_packet(
-                packet.packet_number().clone(),
-                packet.header.clone(),
-                packet.payload.clone(),
-            );
+            this.inner.lock().unwrap().acks[space as usize]
+                .sent_packet(packet.packet_number().clone(), packet.frames.clone());
 
             let mut buf = BytesMut::new();
             packet.encode(&mut buf).unwrap();
