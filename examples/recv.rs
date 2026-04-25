@@ -1,4 +1,4 @@
-use std::{io, thread, time::Duration};
+use std::io;
 
 use rust_quic::io::{connection::Connection, endpoint::Endpoint};
 
@@ -11,8 +11,6 @@ async fn main() -> io::Result<()> {
         let fut = handle_conn(conn);
         tokio::spawn(fut);
     }
-
-    thread::sleep(Duration::from_secs(10));
 
     Ok(())
 }
