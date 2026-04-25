@@ -22,13 +22,13 @@ use tokio::{
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
     connection::{Connection, ConnectionHandle, ConnectionID, Incoming, IncomingInner},
-    frame::{Frame, FrameIterator},
     packet::{Packet, PacketError},
+    socket::Socket,
     stream::Side,
 };
 
-pub struct EndpointState {
-    socket: UdpSocket,
+pub struct EndpointState<S: Socket> {
+    socket: S,
     // TODO: Multiple connectionids can point to the same connection, so add a map between
     // connectionid and internal handle
     connection_handles: HashMap<ConnectionID, ConnectionHandle>,
@@ -41,21 +41,27 @@ pub struct EndpointState {
     outgoing_tx: UnboundedSender<ConnectionToEndpoint>,   // To be cloned into connections
 }
 
-pub struct EndpointInner {
-    pub state: Mutex<EndpointState>,
+pub struct EndpointInner<S: Socket> {
+    pub state: Mutex<EndpointState<S>>,
 }
 
-pub struct Endpoint {
-    inner: EndpointRef,
+pub struct Endpoint<S: Socket> {
+    inner: EndpointRef<S>,
     incoming_rx: tokio::sync::Mutex<UnboundedReceiver<IncomingInner>>,
 }
 
-impl Endpoint {
+impl Endpoint<UdpSocket> {
     pub async fn new(addr: SocketAddr) -> io::Result<Self> {
+        Ok(Self::new_generic(UdpSocket::bind(addr).await?))
+    }
+}
+
+impl<S: Socket> Endpoint<S> {
+    pub fn new_generic(socket: S) -> Self {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = EndpointState {
-            socket: UdpSocket::bind(addr).await?,
+            socket,
             connection_handles: HashMap::new(),
             connections: HashMap::new(),
             rng: rand::make_rng(),
@@ -77,10 +83,10 @@ impl Endpoint {
             }
         });
 
-        Ok(Self {
+        Self {
             inner: endpointref,
             incoming_rx: tokio::sync::Mutex::new(incoming_rx),
-        })
+        }
     }
 
     pub async fn accept(&mut self) -> Option<Connection> {
@@ -128,7 +134,7 @@ impl Endpoint {
     }
 }
 
-impl EndpointState {
+impl<S: Socket> EndpointState<S> {
     fn insert_new_connection(
         &mut self,
         dst_cid: ConnectionID,
@@ -174,6 +180,7 @@ impl EndpointState {
         };
         let cid = packet.dst_cid();
         if packet.is_client_hello() {
+            println!("Got initial hello packet: {packet:?}");
             let src_cid = packet.src_cid().unwrap();
             self.insert_new_connection(cid, src_cid, addr);
         }
@@ -242,21 +249,26 @@ impl EndpointState {
     }
 }
 
-#[derive(Clone)]
-pub struct EndpointRef(Arc<EndpointInner>);
+pub struct EndpointRef<S: Socket>(Arc<EndpointInner<S>>);
 
-impl std::ops::Deref for EndpointRef {
-    type Target = EndpointInner;
+impl<S: Socket> Clone for EndpointRef<S> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<S: Socket> std::ops::Deref for EndpointRef<S> {
+    type Target = EndpointInner<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-struct EndpointDriver(EndpointRef);
+struct EndpointDriver<S: Socket>(EndpointRef<S>);
 
 // Future that drives the IO for an endpoint
-impl Future for EndpointDriver {
+impl<S: Socket> Future for EndpointDriver<S> {
     type Output = Result<(), DriverError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

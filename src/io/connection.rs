@@ -664,18 +664,18 @@ impl IncomingInner {
     }
 }
 
-pub struct Incoming {
+pub struct Incoming<S: Socket> {
     inner: IncomingInner,
-    endpoint: EndpointRef,
+    endpoint: EndpointRef<S>,
 }
 
-impl Incoming {
-    pub fn new(inner: IncomingInner, endpoint: EndpointRef) -> Self {
+impl<S: Socket> Incoming<S> {
+    pub fn new(inner: IncomingInner, endpoint: EndpointRef<S>) -> Self {
         Self { inner, endpoint }
     }
 }
 
-impl Future for Incoming {
+impl<S: Socket> Future for Incoming<S> {
     type Output = Connection;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
