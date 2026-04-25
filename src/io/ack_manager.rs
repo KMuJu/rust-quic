@@ -17,7 +17,6 @@ use crate::io::{
 
 struct SentPacket {
     timestamp: Instant,
-    header: Header,
     frames: Vec<Frame>,
 }
 
@@ -115,17 +114,11 @@ impl Acker {
         }
     }
 
-    pub(super) fn sent_packet(
-        &mut self,
-        packet_number: PacketNumber,
-        header: Header,
-        frames: Vec<Frame>,
-    ) {
+    pub(super) fn sent_packet(&mut self, packet_number: PacketNumber, frames: Vec<Frame>) {
         let pn = packet_number.u32();
 
         let sent = SentPacket {
             timestamp: Instant::now(),
-            header,
             frames,
         };
 
