@@ -93,6 +93,10 @@ impl RecvStream {
             _ => (),
         };
     }
+
+    pub(super) fn is_reset(&self) -> bool {
+        matches!(self.state, RecvState::ResetRead | RecvState::ResetRecvd)
+    }
 }
 
 enum RecvState {
@@ -150,6 +154,10 @@ impl SendStream {
                 | SendState::ResetSent
                 | SendState::ResetRecvd
         )
+    }
+
+    pub(super) fn is_reset(&self) -> bool {
+        matches!(self.state, SendState::ResetSent | SendState::ResetRecvd)
     }
 }
 

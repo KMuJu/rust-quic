@@ -254,9 +254,21 @@ impl ConnectionInner {
         // - arm loss_timer for remaining unacked packets that might still be lost
         // - arm PTO timer (separate, fires if no ACK arrives within ~3× RTT)
 
-        let mut lost = VecDeque::from(acker.get_lost_frames(largest.0 as u32));
+        let lost = VecDeque::from(acker.get_lost_frames(largest.0 as u32));
         println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
-        self.pending_frames[space as usize].append(&mut lost);
+        for frame in lost {
+            // Only retransmitt stream frames for send streams that has not sent reset
+            if let Frame::Stream { id, .. } = &frame {
+                let stream = self.send(id);
+                let Some(stream) = stream else {
+                    continue;
+                };
+                if stream.is_reset() {
+                    continue;
+                }
+            };
+            self.pending_frames[space as usize].push_back(frame);
+        }
     }
 
     fn handle_initial_frame(&mut self, frame: Frame) {
@@ -771,6 +783,16 @@ impl Future for ConnectionDriver {
                     );
                 }
                 for frame in lost {
+                    // Only retransmitt stream frames for send streams that has not sent reset
+                    if let Frame::Stream { id, .. } = &frame {
+                        let stream = inner.send(id);
+                        let Some(stream) = stream else {
+                            continue;
+                        };
+                        if stream.is_reset() {
+                            continue;
+                        }
+                    };
                     inner.pending_frames[i].push_back(frame);
                 }
             }
