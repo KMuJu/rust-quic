@@ -1,30 +1,31 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::RangeInclusive,
-    task::{Context, Poll, Waker},
-    time::Duration,
-};
+use std::{collections::BTreeMap, ops::RangeInclusive, task::Waker, time::Duration};
 
 use futures::task::AtomicWaker;
-use range_set::{RangeSet, range_set};
+use range_set::RangeSet;
 use tokio::time::Instant;
 
 use crate::io::{
+    congestion::CongestionController,
+    connection::PacketSpace,
     encoding::VarInt,
     frame::{AckRange, Frame},
-    packet::{Header, Packet, PacketNumber},
+    packet::PacketNumber,
 };
 
 struct SentPacket {
     timestamp: Instant,
     frames: Vec<Frame>,
+    sent_bytes: usize,
+    in_flight: bool,
 }
 
 pub(super) struct Acker {
+    cleared: bool,
     received: RangeSet<[RangeInclusive<u32>; 8]>,
     sent: BTreeMap<u32, SentPacket>,
     eliciting_count: u32,
     ack_deadline: Option<Instant>,
+    congestion: CongestionController,
 
     waker: AtomicWaker,
 }
@@ -32,10 +33,12 @@ pub(super) struct Acker {
 impl Acker {
     pub(super) fn new() -> Self {
         Self {
+            cleared: false,
             received: RangeSet::new(),
             sent: BTreeMap::new(),
             eliciting_count: 0,
             ack_deadline: None,
+            congestion: CongestionController::new(),
             waker: AtomicWaker::new(),
         }
     }
@@ -48,6 +51,9 @@ impl Acker {
     /// true if not duplicate
     /// false if duplicate
     pub(super) fn received(&mut self, pn: &PacketNumber, elicit: bool) -> bool {
+        if self.cleared {
+            return true;
+        }
         let pn = pn.u32();
 
         if self.received.insert(pn) {
@@ -72,18 +78,33 @@ impl Acker {
         self.ack_deadline
     }
 
-    // TODO: Refactor
+    pub(super) fn get_next_loss(&self) -> Option<Instant> {
+        if self.cleared {
+            return None;
+        }
+        let time_threshold =
+            (self.congestion.get_smoothed_rtt() * 9 / 8).max(Duration::from_micros(1));
+        self.sent
+            .values()
+            .map(|s| s.timestamp)
+            .min()
+            .map(|t| t + time_threshold)
+    }
+
     pub(super) fn get_ack(&mut self) -> Option<Frame> {
         if self.eliciting_count != 0 {
             self.eliciting_count = 0;
             self.ack_deadline = None;
-            Some(self.build_frame())
+            self.build_frame()
         } else {
             None
         }
     }
 
-    fn build_frame(&self) -> Frame {
+    fn build_frame(&self) -> Option<Frame> {
+        if self.cleared {
+            return None;
+        }
         let mut iter = self.received.as_ref().iter().rev();
 
         let first = iter.next().unwrap();
@@ -94,8 +115,7 @@ impl Acker {
         let mut prev_end = *first.start();
 
         for range in iter {
-            println!("Range: {range:?}");
-            let gap = prev_end - range.end() - 1;
+            let gap = prev_end - range.end() - 2;
             let length = range.end() - range.start();
             ranges.push(AckRange {
                 gap: VarInt(gap as u64),
@@ -104,22 +124,32 @@ impl Acker {
             prev_end = *range.start();
         }
 
-        Frame::Ack {
+        Some(Frame::Ack {
             largest: VarInt(largest as u64),
             delay: VarInt(0),
             range_count: VarInt(ranges.len() as u64),
             first_range: VarInt(first_range as u64),
             ranges,
             ecn: None,
-        }
+        })
     }
 
-    pub(super) fn sent_packet(&mut self, packet_number: PacketNumber, frames: Vec<Frame>) {
+    pub(super) fn sent_packet(
+        &mut self,
+        packet_number: PacketNumber,
+        frames: Vec<Frame>,
+        in_flight: bool,
+    ) {
+        if self.cleared {
+            return;
+        }
         let pn = packet_number.u32();
 
         let sent = SentPacket {
             timestamp: Instant::now(),
+            sent_bytes: frames.iter().map(|f| f.size()).sum(),
             frames,
+            in_flight,
         };
 
         self.sent.insert(pn, sent);
@@ -127,23 +157,67 @@ impl Acker {
 
     pub(super) fn get_lost_frames(&mut self, largest: u32) -> Vec<Frame> {
         let mut lost = Vec::new();
+        if self.cleared {
+            return lost;
+        }
+        let largest_sent_at = self.sent.get(&largest).map(|s| s.timestamp);
 
         let lost_pns: Vec<_> = self
             .sent
             .keys()
-            .cloned()
-            .filter(|pn| pn + 3 <= largest)
+            .filter(|&pn| pn + 3 <= largest)
+            .copied()
             .collect();
 
         for pn in lost_pns {
-            let mut sent = self.sent.remove(&pn).unwrap();
-            lost.append(&mut sent.frames);
+            let sent = self.sent.remove(&pn).unwrap();
+            for frame in sent.frames {
+                if frame.is_retransmittable() {
+                    lost.push(frame);
+                }
+            }
         }
 
+        if let Some(lst) = largest_sent_at {
+            let mut time_lost = self.get_time_lost_frames(lst);
+            lost.append(&mut time_lost);
+        }
+
+        if !lost.is_empty() {
+            self.waker.wake();
+        }
+
+        lost
+    }
+
+    pub(super) fn get_time_lost_frames(&mut self, lst: Instant) -> Vec<Frame> {
         // TODO: Handle packets lost based on time
         // time_threshold = max(9/8 * smoothed_rtt, 1ms)
         // packet is lost if:
         //   largest_sent_at - packet.sent_at >= time_threshold
+
+        let mut lost = Vec::new();
+        if self.cleared {
+            return lost;
+        }
+
+        let time_threshold =
+            (self.congestion.get_smoothed_rtt() * 9 / 8).max(Duration::from_micros(1));
+        let time_lost: Vec<u32> = self
+            .sent
+            .iter()
+            .filter(|(_, s)| s.timestamp + time_threshold <= lst)
+            .map(|(pn, _)| *pn)
+            .collect();
+
+        for pn in time_lost {
+            let sent = self.sent.remove(&pn).unwrap();
+            for frame in sent.frames {
+                if frame.is_retransmittable() {
+                    lost.push(frame);
+                }
+            }
+        }
 
         lost
     }
@@ -151,14 +225,17 @@ impl Acker {
     pub(super) fn acked(&mut self, packet_number: u32) {
         self.sent.remove(&packet_number);
     }
+
+    pub(super) fn clear(&mut self) {
+        self.cleared = true;
+        self.sent.clear();
+        self.received.clear();
+        self.ack_deadline = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use crate::io::connection::ConnectionID;
-
     use super::*;
 
     #[test]
@@ -170,7 +247,7 @@ mod tests {
         assert!(acker.received(&PacketNumber::U8(5), false));
         assert!(acker.received(&PacketNumber::U8(6), false));
         assert!(acker.received(&PacketNumber::U8(9), false));
-        let frame = acker.build_frame();
+        let frame = acker.build_frame().unwrap();
 
         println!("Frame: {frame:?}");
         match frame {
@@ -187,9 +264,9 @@ mod tests {
                 assert_eq!(range_count.0, 2);
 
                 assert_eq!(ranges.len(), 2);
-                assert_eq!(ranges[0].gap, 2);
+                assert_eq!(ranges[0].gap, 1);
                 assert_eq!(ranges[0].length, 1);
-                assert_eq!(ranges[1].gap, 1);
+                assert_eq!(ranges[1].gap, 0);
                 assert_eq!(ranges[1].length, 2);
             }
             _ => panic!("Can only be ack frame type"),
@@ -202,7 +279,7 @@ mod tests {
         assert!(acker.received(&PacketNumber::U8(1), false));
         assert!(acker.received(&PacketNumber::U8(2), false));
         assert!(acker.received(&PacketNumber::U8(3), false));
-        let frame = acker.build_frame();
+        let frame = acker.build_frame().unwrap();
 
         println!("Frame: {frame:?}");
         match frame {
@@ -234,7 +311,7 @@ mod tests {
         assert!(acker.received(&PacketNumber::U8(6), false));
         assert!(acker.received(&PacketNumber::U8(8), false));
         assert!(acker.received(&PacketNumber::U8(9), false));
-        let frame = acker.build_frame();
+        let frame = acker.build_frame().unwrap();
 
         println!("Frame: {frame:?}");
         match frame {
@@ -251,9 +328,9 @@ mod tests {
                 assert_eq!(range_count.0, 2);
 
                 assert_eq!(ranges.len(), 2);
-                assert_eq!(ranges[0].gap, 1);
+                assert_eq!(ranges[0].gap, 0);
                 assert_eq!(ranges[0].length, 1);
-                assert_eq!(ranges[1].gap, 1);
+                assert_eq!(ranges[1].gap, 0);
                 assert_eq!(ranges[1].length, 2);
             }
             _ => panic!("Can only be ack frame type"),
@@ -263,25 +340,19 @@ mod tests {
     #[test]
     fn test_lost_frames() {
         let mut acker = Acker::new();
-        let pn = PacketNumber::from(0);
-        let header = Header::Short {
-            spin: false,
-            key_phase: false,
-            dst_cid: ConnectionID::from_buf(&mut Cursor::new([1]), 1),
-            packet_number: pn,
-        };
-        let frames = vec![Frame::Padding, Frame::HandshakeDone];
+        let frames = vec![Frame::Ping, Frame::HandshakeDone];
 
-        acker.sent_packet(PacketNumber::U8(1), header.clone(), frames.clone());
-        acker.sent_packet(PacketNumber::U8(2), header.clone(), frames.clone());
-        acker.sent_packet(PacketNumber::U8(5), header.clone(), frames.clone());
-        acker.sent_packet(PacketNumber::U8(6), header.clone(), frames.clone());
+        acker.sent_packet(PacketNumber::U8(1), frames.clone(), true);
+        acker.sent_packet(PacketNumber::U8(2), frames.clone(), true);
+        acker.sent_packet(PacketNumber::U8(5), frames.clone(), true);
+        acker.sent_packet(PacketNumber::U8(6), frames.clone(), true);
 
         let lost = acker.get_lost_frames(6);
+        println!("Lost: {lost:?}");
 
-        assert!(matches!(lost[0], Frame::Padding));
+        assert!(matches!(lost[0], Frame::Ping));
         assert!(matches!(lost[1], Frame::HandshakeDone));
-        assert!(matches!(lost[2], Frame::Padding));
+        assert!(matches!(lost[2], Frame::Ping));
         assert!(matches!(lost[3], Frame::HandshakeDone));
     }
 }

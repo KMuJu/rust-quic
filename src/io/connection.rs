@@ -25,8 +25,9 @@ use crate::io::{
     ack_manager::Acker,
     crypto::CryptoFrame,
     endpoint::EndpointRef,
-    frame::{AckRange, EcnCounts, Frame, FrameIterator},
+    frame::{AckRange, EcnCounts, Frame},
     packet::{Header, Packet, PacketNumber},
+    socket::Socket,
     stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
 };
 
@@ -112,8 +113,11 @@ impl ConnectionInner {
             }
         };
         let space = packet.packet_space();
-        println!("{:?}({:?}): Got {:?}", self.id, self.state, packet);
-        if !self.acks[space as usize].received(packet.packet_number(), packet.is_eliciting()) {
+        println!(
+            "{:?}({:?})[{:?}]: Got {:?}",
+            self.id, self.state, self.side, packet
+        );
+        if !self.acks[space as usize].received(packet.packet_number(), packet.is_ack_eliciting()) {
             eprintln!(
                 "ERROR: Got dulicate packet!({:?}): {}",
                 space,
@@ -132,6 +136,9 @@ impl ConnectionInner {
                 }
                 for frame in packet.frames {
                     self.handle_data_frame(frame);
+                }
+                if matches!(self.side, Side::Client) {
+                    self.acks[PacketSpace::Handshake as usize].clear();
                 }
             }
             Header::Initial { .. } => {
@@ -156,6 +163,8 @@ impl ConnectionInner {
 
                             self.pending_frames[PacketSpace::Handshake as usize]
                                 .push_back(crypto_frame);
+
+                            self.acks[PacketSpace::Initial as usize].clear();
                         }
                         Side::Client => {
                             panic!("Got initial(ClientHello) as client: THIS IS WRONG");
@@ -183,6 +192,7 @@ impl ConnectionInner {
                             };
                             self.pending_frames[PacketSpace::Handshake as usize]
                                 .push_back(crypto_frame);
+                            self.acks[PacketSpace::Initial as usize].clear();
                         }
                         // Send Short(HandshakeDone)
                         Side::Server => {
@@ -194,6 +204,7 @@ impl ConnectionInner {
                             }
                             let frame = Frame::HandshakeDone;
                             self.pending_frames[PacketSpace::Data as usize].push_back(frame);
+                            self.acks[PacketSpace::Handshake as usize].clear();
                         }
                     }
                 }
@@ -229,7 +240,7 @@ impl ConnectionInner {
             current -= range.length.0;
         }
 
-        println!("Acked({space:?}): {acked:?}");
+        println!("Acked({space:?})[{:?}]: {acked:?}", self.side);
 
         let acker = &mut self.acks[space as usize];
         for ack in acked {
@@ -244,6 +255,7 @@ impl ConnectionInner {
         // - arm PTO timer (separate, fires if no ACK arrives within ~3× RTT)
 
         let mut lost = VecDeque::from(acker.get_lost_frames(largest.0 as u32));
+        println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
         self.pending_frames[space as usize].append(&mut lost);
     }
 
@@ -298,7 +310,7 @@ impl ConnectionInner {
     }
 
     fn handle_data_frame(&mut self, frame: Frame) {
-        println!("Got frame: {frame:?}");
+        // println!("Got frame: {frame:?}");
         match &frame {
             Frame::StreamDataBlocked { id, .. }
             | Frame::ResetStream { id, .. }
@@ -401,9 +413,11 @@ impl ConnectionInner {
         self.acks.iter().filter_map(|a| a.get_deadline()).min()
     }
 
-    fn get_packet(&mut self, space: PacketSpace, mut mtu: usize) -> Option<Packet> {
-        let orig_mtu = mtu;
+    fn next_loss_deadline(&self) -> Option<Instant> {
+        self.acks.iter().filter_map(|a| a.get_next_loss()).min()
+    }
 
+    fn get_packet(&mut self, space: PacketSpace, mut mtu: usize) -> Option<Packet> {
         let mut frames = Vec::new();
 
         while let Some(frame) = self.pending_frames[space as usize].front() {
@@ -433,7 +447,7 @@ impl ConnectionInner {
                 let frame = Frame::Stream {
                     id: id.clone(),
                     fin,
-                    last: false,
+                    len: true,
                     offset: VarInt(offset),
                     data: data.freeze(),
                 };
@@ -562,6 +576,7 @@ impl Connection {
             outgoing_data,
             addr,
             ack_timer: None,
+            loss_timer: None,
         };
 
         tokio::spawn(driver);
@@ -698,6 +713,7 @@ struct ConnectionDriver {
     outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     addr: SocketAddr,
     ack_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    loss_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Future for ConnectionDriver {
@@ -712,6 +728,13 @@ impl Future for ConnectionDriver {
             .acks
             .iter()
             .for_each(|a| a.register_waker(cx.waker()));
+
+        if let Some(lost_timer) = this.loss_timer.as_mut() {
+            if lost_timer.as_mut().poll(cx).is_ready() {
+                println!("Lost timer has run");
+                this.loss_timer = None;
+            }
+        }
 
         let mut buffer = Vec::new();
 
@@ -728,6 +751,28 @@ impl Future for ConnectionDriver {
 
             for data in buffer {
                 conn.handle_datagram(&data.data);
+            }
+        }
+
+        {
+            let mut inner = this.inner.lock().unwrap();
+            for i in 0..3 {
+                let lost = inner.acks[i].get_time_lost_frames(Instant::now());
+                if !lost.is_empty() {
+                    let space = match i {
+                        0 => PacketSpace::Initial,
+                        1 => PacketSpace::Handshake,
+                        2 => PacketSpace::Data,
+                        _ => panic!(),
+                    };
+                    println!(
+                        "Found timedout packets({space:?})[{:?}]: {lost:?}!!!!!!!!!!!!!!!!!!!!!!!",
+                        inner.side
+                    );
+                }
+                for frame in lost {
+                    inner.pending_frames[i].push_back(frame);
+                }
             }
         }
 
@@ -748,11 +793,19 @@ impl Future for ConnectionDriver {
         };
 
         for packet in packets {
-            println!("Sending packet: {packet:?}");
             let space = packet.packet_space();
+            println!(
+                "Sending packet({space:?})[{:?}]: {packet:?}",
+                this.inner.lock().unwrap().side
+            );
 
-            this.inner.lock().unwrap().acks[space as usize]
-                .sent_packet(packet.packet_number().clone(), packet.frames.clone());
+            if packet.is_ack_eliciting() {
+                this.inner.lock().unwrap().acks[space as usize].sent_packet(
+                    packet.packet_number().clone(),
+                    packet.frames.clone(),
+                    packet.is_in_flight(),
+                );
+            }
 
             let mut buf = BytesMut::new();
             packet.encode(&mut buf).unwrap();
@@ -778,6 +831,17 @@ impl Future for ConnectionDriver {
             (None, _) => {
                 this.ack_timer = None;
             }
+        }
+
+        let loss_deadline = this.inner.lock().unwrap().next_loss_deadline();
+        match (loss_deadline, this.loss_timer.as_mut()) {
+            (Some(d), Some(t)) => t.as_mut().reset(d),
+            (Some(d), None) => {
+                let mut sleep = Box::pin(tokio::time::sleep_until(d));
+                let _ = sleep.as_mut().poll(cx);
+                this.loss_timer = Some(sleep);
+            }
+            (None, _) => this.loss_timer = None,
         }
 
         Poll::Pending

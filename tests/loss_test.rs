@@ -52,7 +52,7 @@ async fn test_stream_send_recv() {
 #[tokio::test]
 async fn test_stream_with_loss() {
     tokio::time::timeout(Duration::from_secs(4), async {
-        let (client_sock, server_sock) = MockSocket::pair(0.2); // 10% loss
+        let (client_sock, server_sock) = MockSocket::pair(0.2); // 20% loss
         let server_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         let mut server = Endpoint::<MockSocket>::new_generic(server_sock);
