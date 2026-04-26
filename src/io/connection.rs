@@ -212,6 +212,23 @@ impl ConnectionInner {
         }
     }
 
+    fn add_lost_to_pending(&mut self, space: PacketSpace, lost: Vec<Frame>) {
+        println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
+        for frame in lost {
+            // Only retransmitt stream frames for send streams that has not sent reset
+            if let Frame::Stream { id, .. } = &frame {
+                let stream = self.send(id);
+                let Some(stream) = stream else {
+                    continue;
+                };
+                if stream.is_reset() {
+                    continue;
+                }
+            };
+            self.pending_frames[space as usize].push_back(frame);
+        }
+    }
+
     fn handle_ack_frame(
         &mut self,
         space: PacketSpace,
@@ -254,21 +271,8 @@ impl ConnectionInner {
         // - arm loss_timer for remaining unacked packets that might still be lost
         // - arm PTO timer (separate, fires if no ACK arrives within ~3× RTT)
 
-        let lost = VecDeque::from(acker.get_lost_frames(largest.0 as u32));
-        println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
-        for frame in lost {
-            // Only retransmitt stream frames for send streams that has not sent reset
-            if let Frame::Stream { id, .. } = &frame {
-                let stream = self.send(id);
-                let Some(stream) = stream else {
-                    continue;
-                };
-                if stream.is_reset() {
-                    continue;
-                }
-            };
-            self.pending_frames[space as usize].push_back(frame);
-        }
+        let lost = acker.get_lost_frames(largest.0 as u32);
+        self.add_lost_to_pending(space, lost);
     }
 
     fn handle_initial_frame(&mut self, frame: Frame) {
@@ -675,6 +679,12 @@ pub(super) enum PacketSpace {
     Data,
 }
 
+impl PacketSpace {
+    fn iter() -> impl Iterator<Item = Self> {
+        [Self::Initial, Self::Handshake, Self::Data].into_iter()
+    }
+}
+
 pub struct IncomingInner {
     id: ConnectionID,
     src_cid: ConnectionID,
@@ -741,12 +751,17 @@ impl Future for ConnectionDriver {
             .iter()
             .for_each(|a| a.register_waker(cx.waker()));
 
-        if let Some(lost_timer) = this.loss_timer.as_mut() {
-            if lost_timer.as_mut().poll(cx).is_ready() {
-                println!("Lost timer has run");
-                this.loss_timer = None;
-            }
-        }
+        let ack_fired = this
+            .ack_timer
+            .as_mut()
+            .map(|t| t.as_mut().poll(cx).is_ready())
+            .unwrap_or(false);
+
+        let loss_fired = this
+            .loss_timer
+            .as_mut()
+            .map(|t| t.as_mut().poll(cx).is_ready())
+            .unwrap_or(false);
 
         let mut buffer = Vec::new();
 
@@ -766,35 +781,17 @@ impl Future for ConnectionDriver {
             }
         }
 
-        {
+        if loss_fired {
             let mut inner = this.inner.lock().unwrap();
-            for i in 0..3 {
-                let lost = inner.acks[i].get_time_lost_frames(Instant::now());
+            for space in PacketSpace::iter() {
+                let lost = inner.acks[space as usize].get_time_lost_frames(Instant::now());
                 if !lost.is_empty() {
-                    let space = match i {
-                        0 => PacketSpace::Initial,
-                        1 => PacketSpace::Handshake,
-                        2 => PacketSpace::Data,
-                        _ => panic!(),
-                    };
                     println!(
                         "Found timedout packets({space:?})[{:?}]: {lost:?}!!!!!!!!!!!!!!!!!!!!!!!",
                         inner.side
                     );
                 }
-                for frame in lost {
-                    // Only retransmitt stream frames for send streams that has not sent reset
-                    if let Frame::Stream { id, .. } = &frame {
-                        let stream = inner.send(id);
-                        let Some(stream) = stream else {
-                            continue;
-                        };
-                        if stream.is_reset() {
-                            continue;
-                        }
-                    };
-                    inner.pending_frames[i].push_back(frame);
-                }
+                inner.add_lost_to_pending(space, lost);
             }
         }
 
@@ -802,11 +799,7 @@ impl Future for ConnectionDriver {
             let mut conn = this.inner.lock().unwrap();
             let mut pkts = Vec::new();
 
-            for space in [
-                PacketSpace::Initial,
-                PacketSpace::Handshake,
-                PacketSpace::Data,
-            ] {
+            for space in PacketSpace::iter() {
                 while let Some(p) = conn.get_packet(space, 1200) {
                     pkts.push(p);
                 }
@@ -848,7 +841,6 @@ impl Future for ConnectionDriver {
                 let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
                 let _ = sleep.as_mut().poll(cx); // register waker
                 this.ack_timer = Some(sleep);
-                println!("---Started ack timer");
             }
             (None, _) => {
                 this.ack_timer = None;
