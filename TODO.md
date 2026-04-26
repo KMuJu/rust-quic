@@ -46,13 +46,13 @@ Send side:
 - [x] Record every sent ACK-eliciting packet: number, frames, send timestamp
 - [x] Mark packets as acknowledged when their number appears in a received ACK
 - [ ] Update RTT estimate using send timestamp and `ack_delay` field
-- [ ] Detect lost packets via packet threshold (3 packets acknowledged after it)
-- [ ] Detect lost packets via time threshold (packet sent long enough ago)
-- [ ] Re-enqueue frames from lost packets for retransmission
+- [x] Detect lost packets via packet threshold (3 packets acknowledged after it)
+- [x] Detect lost packets via time threshold (packet sent long enough ago)
+- [x] Re-enqueue frames from lost packets for retransmission
 
 ## Retransmission
 - [x] Store sent packet info in `BTreeMap<u64, SentPacketInfo>`
-- [ ] On loss, retransmit frames (not bytes) in a new packet with a new number
+- [x] On loss, retransmit frames (not bytes) in a new packet with a new number
 - [ ] PTO (Probe Timeout) timer: fire after ~3× RTT with no ACK
 - [ ] On PTO, send a probe packet (PING or retransmit unacked data)
 - [ ] Reset PTO timer whenever an ACK is received
