@@ -74,7 +74,7 @@ impl RecvStream {
             Frame::Stream {
                 id: _,
                 fin,
-                last: _,
+                len: _,
                 offset,
                 data,
             } => {

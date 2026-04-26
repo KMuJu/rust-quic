@@ -102,16 +102,12 @@ impl Packet {
     }
 
     /// Is not ACK, PADDING or CONNECTION_CLOSE
-    pub fn is_eliciting(&self) -> bool {
-        self.frames.iter().any(|f| {
-            !matches!(
-                f,
-                Frame::Ack { .. }
-                    | Frame::Padding
-                    | Frame::ConnectionCloseApp { .. }
-                    | Frame::ConnectionCloseQuic { .. }
-            )
-        })
+    pub fn is_ack_eliciting(&self) -> bool {
+        self.frames.iter().any(|f| f.is_eliciting())
+    }
+
+    pub fn is_in_flight(&self) -> bool {
+        self.frames.iter().any(|f| !matches!(f, Frame::Ack { .. }))
     }
 
     pub(super) fn packet_space(&self) -> PacketSpace {

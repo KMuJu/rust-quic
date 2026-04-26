@@ -68,7 +68,7 @@ pub(super) enum Frame {
     Stream {
         id: StreamID,
         fin: bool,
-        last: bool,
+        len: bool, // true if length field is present
         offset: VarInt,
         data: Bytes,
     },
@@ -307,14 +307,14 @@ impl Frame {
             val if STREAM.contains(&val) => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let fin = t.0 & 0x1 == 0x1;
-                let last = t.0 & 0x2 == 0x2;
+                let len = t.0 & 0x2 == 0x2;
                 let offset = if t.0 & 0x04 == 0x04 {
                     VarInt::decode(buf)?
                 } else {
                     VarInt(0)
                 };
 
-                let data = if t.0 & 0x02 == 0x02 {
+                let data = if len {
                     let len = VarInt::decode(buf)?;
                     if len.0 as usize > buf.remaining() {
                         return Err(FrameDecodeError::NotEnoughData);
@@ -327,7 +327,7 @@ impl Frame {
                 Ok(Frame::Stream {
                     id,
                     fin,
-                    last,
+                    len,
                     offset,
                     data,
                 })
@@ -398,13 +398,13 @@ impl Frame {
             Frame::Stream {
                 id,
                 fin,
-                last,
+                len,
                 offset,
                 data,
             } => {
                 let t = 0b00001000
                     + (if offset.0 > 0 { 0x4 } else { 0 })
-                    + (if *last { 0x2 } else { 0 })
+                    + (if *len { 0x2 } else { 0 })
                     + (if *fin { 1 } else { 0 });
 
                 variable_length_encode(buf, t)?;
@@ -412,7 +412,7 @@ impl Frame {
                 if offset.0 > 0 {
                     offset.encode(buf)?;
                 }
-                if *last {
+                if *len {
                     variable_length_encode(buf, data.len() as u64)?;
                 }
 
@@ -578,7 +578,7 @@ impl Frame {
             Stream {
                 id,
                 fin,
-                last,
+                len: last,
                 offset,
                 data,
             } => {
@@ -625,6 +625,27 @@ impl Frame {
             } => todo!(),
             HandshakeDone => variable_length(HANDSHAKE_DONE),
         }
+    }
+
+    pub(super) fn is_retransmittable(&self) -> bool {
+        match self {
+            Frame::Ack { .. }
+            | Frame::Padding
+            | Frame::ConnectionCloseQuic { .. }
+            | Frame::ConnectionCloseApp { .. } => false,
+            // TODO: Are all other packets true?
+            _ => true,
+        }
+    }
+
+    pub(super) fn is_eliciting(&self) -> bool {
+        !matches!(
+            self,
+            Frame::Padding
+                | Frame::Ack { .. }
+                | Frame::ConnectionCloseApp { .. }
+                | Frame::ConnectionCloseQuic { .. }
+        )
     }
 }
 
@@ -691,7 +712,7 @@ mod test {
         let stream = Frame::Stream {
             id: StreamID::new_unchecked(1),
             fin: false,
-            last: true,
+            len: true,
             offset: VarInt(3),
             data: Bytes::from_static(&[0xff, 0xff, 0xff]),
         };
@@ -714,7 +735,7 @@ mod test {
             Frame::Stream {
                 id,
                 fin,
-                last,
+                len: last,
                 offset,
                 data,
             } => {
@@ -767,5 +788,36 @@ mod test {
                 _ => panic!("Got wrong type"),
             }
         }
+    }
+
+    #[test]
+    fn test_multiple_streams() {
+        let mut frames = Vec::new();
+        let mut offset = 0;
+        for _ in 0..3 {
+            let data = Bytes::from_static(b"hello world");
+            let data_len = data.len();
+            let frame = Frame::Stream {
+                id: StreamID::new_unchecked(1),
+                fin: false,
+                len: true,
+                offset: VarInt(offset),
+                data,
+            };
+
+            offset += data_len as u64;
+
+            frames.push(frame);
+        }
+
+        let mut encoded = Vec::new();
+
+        frames.iter().for_each(|f| f.encode(&mut encoded).unwrap());
+
+        let end_frames: Vec<Frame> = FrameIterator::new(Bytes::from(encoded)).collect();
+
+        println!("Start frames: {frames:?}");
+        println!("End frames: {end_frames:?}");
+        assert_eq!(frames.len(), end_frames.len());
     }
 }
