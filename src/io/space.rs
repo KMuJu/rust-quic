@@ -67,12 +67,11 @@ impl Space {
             Frame::Ack {
                 largest,
                 delay,
-                range_count,
                 first_range,
                 ranges,
                 ecn,
             } => {
-                self.handle_ack_frame(largest, delay, range_count, first_range, ranges, ecn);
+                self.handle_ack_frame(largest, delay, first_range, ranges, ecn);
             }
             Frame::NewToken { .. } => todo!(),
             Frame::MaxData { .. } => todo!(),
@@ -95,11 +94,11 @@ impl Space {
 
         None
     }
+
     fn handle_ack_frame(
         &mut self,
         largest: &VarInt,
         delay: &VarInt,
-        range_count: &VarInt,
         first_range: &VarInt,
         ranges: &Vec<AckRange>,
         ecn: &Option<EcnCounts>,
