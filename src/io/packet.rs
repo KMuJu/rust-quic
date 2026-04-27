@@ -4,10 +4,11 @@ use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
 
 use crate::io::{
-    connection::{ConnectionID, PacketSpace},
+    connection::ConnectionID,
     crypto::CryptoFrame,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
     frame::{Frame, FrameIterator},
+    space::PacketSpace,
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]

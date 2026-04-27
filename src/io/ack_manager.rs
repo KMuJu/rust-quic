@@ -6,7 +6,6 @@ use tokio::time::Instant;
 
 use crate::io::{
     congestion::CongestionController,
-    connection::PacketSpace,
     encoding::VarInt,
     frame::{AckRange, Frame},
     packet::PacketNumber,
@@ -127,7 +126,6 @@ impl Acker {
         Some(Frame::Ack {
             largest: VarInt(largest as u64),
             delay: VarInt(0),
-            range_count: VarInt(ranges.len() as u64),
             first_range: VarInt(first_range as u64),
             ranges,
             ecn: None,
@@ -254,14 +252,13 @@ mod tests {
             Frame::Ack {
                 largest,
                 delay,
-                range_count,
                 first_range,
                 ranges,
                 ecn,
             } => {
                 assert_eq!(largest.0, 9);
                 assert_eq!(first_range.0, 0);
-                assert_eq!(range_count.0, 2);
+                assert_eq!(ranges.len(), 2);
 
                 assert_eq!(ranges.len(), 2);
                 assert_eq!(ranges[0].gap, 1);
@@ -286,14 +283,13 @@ mod tests {
             Frame::Ack {
                 largest,
                 delay,
-                range_count,
                 first_range,
                 ranges,
                 ecn,
             } => {
                 assert_eq!(largest.0, 3);
                 assert_eq!(first_range.0, 2);
-                assert_eq!(range_count.0, 0);
+                assert_eq!(ranges.len(), 0);
 
                 assert_eq!(ranges.len(), 0);
             }
@@ -318,14 +314,13 @@ mod tests {
             Frame::Ack {
                 largest,
                 delay,
-                range_count,
                 first_range,
                 ranges,
                 ecn,
             } => {
                 assert_eq!(largest.0, 9);
                 assert_eq!(first_range.0, 1);
-                assert_eq!(range_count.0, 2);
+                assert_eq!(ranges.len(), 2);
 
                 assert_eq!(ranges.len(), 2);
                 assert_eq!(ranges[0].gap, 0);

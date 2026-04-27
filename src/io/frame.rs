@@ -44,7 +44,6 @@ pub(super) enum Frame {
     Ack {
         largest: VarInt,
         delay: VarInt,
-        range_count: VarInt,
         first_range: VarInt,
         ranges: Vec<AckRange>,
         ecn: Option<EcnCounts>,
@@ -137,7 +136,6 @@ impl Frame {
                 let first_range = VarInt::decode(buf)?;
                 let mut ranges = Vec::with_capacity(range_count.0 as usize);
 
-                // TODO: Actually handle ranges
                 for _ in 0..range_count.0 {
                     let gap = VarInt::decode(buf)?;
                     let length = VarInt::decode(buf)?;
@@ -156,7 +154,6 @@ impl Frame {
                 Ok(Ack {
                     largest,
                     delay,
-                    range_count,
                     first_range,
                     ranges,
                     ecn,
@@ -346,7 +343,6 @@ impl Frame {
             Frame::Ack {
                 largest,
                 delay,
-                range_count,
                 first_range,
                 ranges,
                 ecn,
@@ -532,7 +528,6 @@ impl Frame {
             Ack {
                 largest,
                 delay,
-                range_count,
                 first_range,
                 ranges,
                 ecn,
@@ -540,7 +535,7 @@ impl Frame {
                 let t = variable_length(ACK);
                 let l = largest.length();
                 let d = delay.length();
-                let r = range_count.length();
+                let r = VarInt(ranges.len() as u64).length();
                 let f = first_range.length();
                 let mut sum = t + l + d + r + f;
                 for ack_range in ranges {
@@ -578,14 +573,14 @@ impl Frame {
             Stream {
                 id,
                 fin,
-                len: last,
+                len,
                 offset,
                 data,
             } => {
                 let i = variable_length(id.value() as u64);
                 let o = if offset.0 != 0 { offset.length() } else { 0 };
 
-                let l = if !*last {
+                let l = if *len {
                     variable_length(data.len() as u64)
                 } else {
                     0
@@ -754,7 +749,6 @@ mod test {
         let ack = Frame::Ack {
             largest: VarInt(0),
             delay: VarInt(0),
-            range_count: VarInt(0),
             first_range: VarInt(0),
             ranges: Vec::new(),
             ecn: None,
@@ -773,14 +767,13 @@ mod test {
                 Frame::Ack {
                     largest,
                     delay,
-                    range_count,
                     first_range,
                     ranges,
                     ecn,
                 } => {
                     assert_eq!(largest, 0);
                     assert_eq!(delay, 0);
-                    assert_eq!(range_count, 0);
+                    assert_eq!(ranges.len(), 0);
                     assert_eq!(first_range, 0);
                     assert_eq!(ranges.len(), 0);
                     assert!(ecn.is_none());

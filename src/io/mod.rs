@@ -12,6 +12,7 @@ pub mod frame;
 pub mod frame_assembler;
 pub mod packet;
 pub mod socket;
+pub mod space;
 pub mod stream;
 
 pub mod mock_socket;
