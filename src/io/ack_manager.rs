@@ -9,13 +9,14 @@ use crate::io::{
     encoding::VarInt,
     frame::{AckRange, Frame},
     packet::PacketNumber,
+    rtt_estimator::RttEstimator,
 };
 
 struct SentPacket {
     timestamp: Instant,
     frames: Vec<Frame>,
     sent_bytes: usize,
-    in_flight: bool,
+    in_flight: bool, // if it counts towards congestion
 }
 
 pub(super) struct Acker {
@@ -24,7 +25,7 @@ pub(super) struct Acker {
     sent: BTreeMap<u32, SentPacket>,
     eliciting_count: u32,
     ack_deadline: Option<Instant>,
-    congestion: CongestionController,
+    largest_acked: u32,
 
     waker: AtomicWaker,
 }
@@ -37,7 +38,7 @@ impl Acker {
             sent: BTreeMap::new(),
             eliciting_count: 0,
             ack_deadline: None,
-            congestion: CongestionController::new(),
+            largest_acked: 0,
             waker: AtomicWaker::new(),
         }
     }
@@ -77,12 +78,11 @@ impl Acker {
         self.ack_deadline
     }
 
-    pub(super) fn get_next_loss(&self) -> Option<Instant> {
+    pub(super) fn get_next_loss(&self, rtt: &RttEstimator) -> Option<Instant> {
         if self.cleared {
             return None;
         }
-        let time_threshold =
-            (self.congestion.get_smoothed_rtt() * 9 / 8).max(Duration::from_micros(1));
+        let time_threshold = (rtt.smoothed * 9 / 8).max(Duration::from_micros(1));
         self.sent
             .values()
             .map(|s| s.timestamp)
@@ -91,19 +91,16 @@ impl Acker {
     }
 
     pub(super) fn get_ack(&mut self) -> Option<Frame> {
-        if self.eliciting_count != 0 {
+        if !self.cleared && self.eliciting_count != 0 {
             self.eliciting_count = 0;
             self.ack_deadline = None;
-            self.build_frame()
+            Some(self.build_frame())
         } else {
             None
         }
     }
 
-    fn build_frame(&self) -> Option<Frame> {
-        if self.cleared {
-            return None;
-        }
+    fn build_frame(&self) -> Frame {
         let mut iter = self.received.as_ref().iter().rev();
 
         let first = iter.next().unwrap();
@@ -123,13 +120,13 @@ impl Acker {
             prev_end = *range.start();
         }
 
-        Some(Frame::Ack {
+        Frame::Ack {
             largest: VarInt(largest as u64),
             delay: VarInt(0),
             first_range: VarInt(first_range as u64),
             ranges,
             ecn: None,
-        })
+        }
     }
 
     pub(super) fn sent_packet(
@@ -153,7 +150,7 @@ impl Acker {
         self.sent.insert(pn, sent);
     }
 
-    pub(super) fn get_lost_frames(&mut self, largest: u32) -> Vec<Frame> {
+    pub(super) fn get_lost_frames(&mut self, largest: u32, rtt: &RttEstimator) -> Vec<Frame> {
         let mut lost = Vec::new();
         if self.cleared {
             return lost;
@@ -177,7 +174,7 @@ impl Acker {
         }
 
         if let Some(lst) = largest_sent_at {
-            let mut time_lost = self.get_time_lost_frames(lst);
+            let mut time_lost = self.get_time_lost_frames(lst, rtt);
             lost.append(&mut time_lost);
         }
 
@@ -188,7 +185,7 @@ impl Acker {
         lost
     }
 
-    pub(super) fn get_time_lost_frames(&mut self, lst: Instant) -> Vec<Frame> {
+    pub(super) fn get_time_lost_frames(&mut self, lst: Instant, rtt: &RttEstimator) -> Vec<Frame> {
         // TODO: Handle packets lost based on time
         // time_threshold = max(9/8 * smoothed_rtt, 1ms)
         // packet is lost if:
@@ -199,12 +196,11 @@ impl Acker {
             return lost;
         }
 
-        let time_threshold =
-            (self.congestion.get_smoothed_rtt() * 9 / 8).max(Duration::from_micros(1));
+        let time_threshold = (rtt.smoothed * 9 / 8).max(Duration::from_micros(1));
         let time_lost: Vec<u32> = self
             .sent
             .iter()
-            .filter(|(_, s)| s.timestamp + time_threshold <= lst)
+            .filter(|&(pn, s)| *pn < self.largest_acked && s.timestamp + time_threshold <= lst)
             .map(|(pn, _)| *pn)
             .collect();
 
@@ -220,8 +216,19 @@ impl Acker {
         lost
     }
 
-    pub(super) fn acked(&mut self, packet_number: u32) {
-        self.sent.remove(&packet_number);
+    /// Returns true if packet has been tracked,
+    /// This means that the packet is ack-eliciting and is newly acknowledged
+    pub(super) fn acked(&mut self, packet_number: u32) -> bool {
+        self.largest_acked = self.largest_acked.max(packet_number);
+        self.sent.remove(&packet_number).is_some()
+    }
+
+    pub(super) fn unacked_frame(&self) -> Option<Frame> {
+        self.sent
+            .values()
+            .filter_map(|s| s.frames.first())
+            .next()
+            .cloned()
     }
 
     pub(super) fn clear(&mut self) {
@@ -229,6 +236,14 @@ impl Acker {
         self.sent.clear();
         self.received.clear();
         self.ack_deadline = None;
+    }
+
+    pub(super) fn earliest_sent(&self) -> Option<Instant> {
+        self.sent.values().map(|s| s.timestamp).min()
+    }
+
+    pub(super) fn has_packet_in_flight(&self) -> bool {
+        !self.sent.is_empty()
     }
 }
 
@@ -245,7 +260,7 @@ mod tests {
         assert!(acker.received(&PacketNumber::U8(5), false));
         assert!(acker.received(&PacketNumber::U8(6), false));
         assert!(acker.received(&PacketNumber::U8(9), false));
-        let frame = acker.build_frame().unwrap();
+        let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
         match frame {
@@ -276,7 +291,7 @@ mod tests {
         assert!(acker.received(&PacketNumber::U8(1), false));
         assert!(acker.received(&PacketNumber::U8(2), false));
         assert!(acker.received(&PacketNumber::U8(3), false));
-        let frame = acker.build_frame().unwrap();
+        let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
         match frame {
@@ -307,7 +322,7 @@ mod tests {
         assert!(acker.received(&PacketNumber::U8(6), false));
         assert!(acker.received(&PacketNumber::U8(8), false));
         assert!(acker.received(&PacketNumber::U8(9), false));
-        let frame = acker.build_frame().unwrap();
+        let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
         match frame {
@@ -342,7 +357,7 @@ mod tests {
         acker.sent_packet(PacketNumber::U8(5), frames.clone(), true);
         acker.sent_packet(PacketNumber::U8(6), frames.clone(), true);
 
-        let lost = acker.get_lost_frames(6);
+        let lost = acker.get_lost_frames(6, &RttEstimator::new());
         println!("Lost: {lost:?}");
 
         assert!(matches!(lost[0], Frame::Ping));

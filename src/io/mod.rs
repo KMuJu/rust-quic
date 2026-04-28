@@ -11,6 +11,7 @@ pub mod endpoint;
 pub mod frame;
 pub mod frame_assembler;
 pub mod packet;
+pub mod rtt_estimator;
 pub mod socket;
 pub mod space;
 pub mod stream;

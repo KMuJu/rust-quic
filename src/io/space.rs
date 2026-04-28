@@ -4,6 +4,7 @@ use crate::io::{
     ack_manager::Acker,
     encoding::VarInt,
     frame::{AckRange, EcnCounts, Frame},
+    rtt_estimator::RttEstimator,
     stream::StreamID,
 };
 
@@ -30,6 +31,7 @@ pub(super) enum SpaceEvent {
 
 pub(super) struct Space {
     space: PacketSpace,
+    discarded: bool,
     pub(super) acker: Acker,
     pub(super) pending_frames: VecDeque<Frame>,
     packet_number: usize,
@@ -39,13 +41,17 @@ impl Space {
     pub(super) fn new(space: PacketSpace) -> Self {
         Self {
             space,
+            discarded: false,
             acker: Acker::new(),
             pending_frames: VecDeque::new(),
             packet_number: 0,
         }
     }
 
-    pub(super) fn handle_frame(&mut self, frame: Frame) -> Option<SpaceEvent> {
+    pub(super) fn handle_frame(&mut self, frame: Frame, rtt: &RttEstimator) -> Option<SpaceEvent> {
+        if self.discarded {
+            return None;
+        }
         match &frame {
             Frame::StreamDataBlocked { id, .. }
             | Frame::ResetStream { id, .. }
@@ -63,7 +69,11 @@ impl Space {
                 return Some(SpaceEvent::Crypto(*offset, data.clone()));
             }
             Frame::Padding => todo!(),
-            Frame::Ping => todo!(),
+            Frame::Ping => {
+                if let Some(ack) = self.acker.get_ack() {
+                    self.pending_frames.push_back(ack);
+                }
+            }
             Frame::Ack {
                 largest,
                 delay,
@@ -71,7 +81,7 @@ impl Space {
                 ranges,
                 ecn,
             } => {
-                self.handle_ack_frame(largest, delay, first_range, ranges, ecn);
+                self.handle_ack_frame(largest, delay, first_range, ranges, ecn, rtt);
             }
             Frame::NewToken { .. } => todo!(),
             Frame::MaxData { .. } => todo!(),
@@ -102,6 +112,7 @@ impl Space {
         first_range: &VarInt,
         ranges: &Vec<AckRange>,
         ecn: &Option<EcnCounts>,
+        rtt: &RttEstimator,
     ) {
         let mut acked = Vec::new();
         let mut current = largest.0;
@@ -134,7 +145,7 @@ impl Space {
         // - arm loss_timer for remaining unacked packets that might still be lost
         // - arm PTO timer (separate, fires if no ACK arrives within ~3× RTT)
 
-        let lost = self.acker.get_lost_frames(largest.0 as u32);
+        let lost = self.acker.get_lost_frames(largest.0 as u32, rtt);
         self.add_lost_to_pending(lost);
     }
 
@@ -145,9 +156,14 @@ impl Space {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(super) fn discard(&mut self) {
+        self.discarded = false;
         self.acker.clear();
         self.pending_frames = VecDeque::new();
+    }
+
+    pub(super) fn is_discarded(&self) -> bool {
+        self.discarded
     }
 
     pub(super) fn push_back_frame(&mut self, frame: Frame) {
