@@ -8,18 +8,16 @@ async fn main() -> io::Result<()> {
     let conn = endpoint.connect(([127, 0, 0, 1], 42069).into()).await;
     println!("Created connection: {conn:?}");
 
-    let (mut recv, mut send) = conn.open_bidir();
+    for _ in 0..5 {
+        let (mut recv, mut send) = conn.open_bidir();
+        send.write(&[1, 2, 3, 4, 5]).unwrap();
 
-    // thread::sleep(Duration::from_secs(1));
-    send.write(&[1, 2, 3, 4, 5]).unwrap();
-    // println!("Wrote to stream");
+        let mut buf = vec![0u8; 1024];
+        let n = recv.read(&mut buf).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let n = recv.read(&mut buf).await.unwrap();
-
-    println!("Read from stream");
-    println!("Data: {:?}", &buf[..n]);
-    // poll_fn(|_| -> Poll<()> { Poll::Pending }).await;
+        println!("Read from stream");
+        println!("Data: {:?}", &buf[..n]);
+    }
 
     Ok(())
 }

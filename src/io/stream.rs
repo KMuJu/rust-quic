@@ -234,7 +234,7 @@ impl StreamID {
     }
 
     pub fn new(mut value: usize, side: &Side, dir: Dir) -> Self {
-        value -= value & 0b11;
+        value <<= 2;
         value += match side {
             Side::Client => 0,
             Side::Server => 0b1,
