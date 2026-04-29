@@ -5,7 +5,6 @@ use range_set::RangeSet;
 use tokio::time::Instant;
 
 use crate::io::{
-    congestion::CongestionController,
     encoding::VarInt,
     frame::{AckRange, Frame},
     packet::PacketNumber,
@@ -19,6 +18,11 @@ struct SentPacket {
     in_flight: bool, // if it counts towards congestion
 }
 
+struct LargestReceived {
+    packet_number: u32,
+    timestamp: Instant,
+}
+
 pub(super) struct Acker {
     cleared: bool,
     received: RangeSet<[RangeInclusive<u32>; 8]>,
@@ -26,6 +30,7 @@ pub(super) struct Acker {
     eliciting_count: u32,
     ack_deadline: Option<Instant>,
     largest_acked: u32,
+    largest_received: Option<LargestReceived>,
 
     waker: AtomicWaker,
 }
@@ -39,6 +44,7 @@ impl Acker {
             eliciting_count: 0,
             ack_deadline: None,
             largest_acked: 0,
+            largest_received: None,
             waker: AtomicWaker::new(),
         }
     }
@@ -57,6 +63,19 @@ impl Acker {
         let pn = pn.u32();
 
         if self.received.insert(pn) {
+            if let Some(largest) = &self.largest_received {
+                if pn > largest.packet_number {
+                    self.largest_received = Some(LargestReceived {
+                        packet_number: pn,
+                        timestamp: Instant::now(),
+                    })
+                }
+            } else {
+                self.largest_received = Some(LargestReceived {
+                    packet_number: pn,
+                    timestamp: Instant::now(),
+                })
+            }
             if elicit {
                 self.eliciting_count += 1;
                 if self.eliciting_count >= 2 {
@@ -107,6 +126,14 @@ impl Acker {
         let largest = *first.end();
         let first_range = first.end() - first.start();
 
+        let largest_time = match &self.largest_received {
+            Some(l) => l.timestamp,
+            None => panic!("Tried to build frame before having received packets"),
+        };
+
+        let delay_micros = (Instant::now() - largest_time).as_micros();
+        let encoded_delay = delay_micros >> 3; // TODO: ack_delay_exponent
+
         let mut ranges = Vec::new();
         let mut prev_end = *first.start();
 
@@ -122,7 +149,7 @@ impl Acker {
 
         Frame::Ack {
             largest: VarInt(largest as u64),
-            delay: VarInt(0),
+            delay: VarInt(encoded_delay as u64),
             first_range: VarInt(first_range as u64),
             ranges,
             ecn: None,
@@ -132,13 +159,22 @@ impl Acker {
     pub(super) fn sent_packet(
         &mut self,
         packet_number: PacketNumber,
-        frames: Vec<Frame>,
+        in_frames: Vec<Frame>,
         in_flight: bool,
     ) {
         if self.cleared {
             return;
         }
         let pn = packet_number.u32();
+
+        // Only retransmit retransmitable frames
+        // TODO: Handle MAX_* frames
+        let mut frames = Vec::new();
+        for frame in in_frames {
+            if frame.is_retransmittable() {
+                frames.push(frame);
+            }
+        }
 
         let sent = SentPacket {
             timestamp: Instant::now(),
@@ -167,9 +203,7 @@ impl Acker {
         for pn in lost_pns {
             let sent = self.sent.remove(&pn).unwrap();
             for frame in sent.frames {
-                if frame.is_retransmittable() {
-                    lost.push(frame);
-                }
+                lost.push(frame);
             }
         }
 
@@ -207,20 +241,22 @@ impl Acker {
         for pn in time_lost {
             let sent = self.sent.remove(&pn).unwrap();
             for frame in sent.frames {
-                if frame.is_retransmittable() {
-                    lost.push(frame);
-                }
+                lost.push(frame);
             }
         }
 
         lost
     }
 
-    /// Returns true if packet has been tracked,
-    /// This means that the packet is ack-eliciting and is newly acknowledged
-    pub(super) fn acked(&mut self, packet_number: u32) -> bool {
+    pub(super) fn acked(&mut self, packet_number: u32) {
         self.largest_acked = self.largest_acked.max(packet_number);
-        self.sent.remove(&packet_number).is_some()
+        self.sent.remove(&packet_number);
+    }
+
+    /// Returns the timestamp if it is present
+    /// If it is present, then that means that it is ack-eliciting
+    pub(super) fn sent_timestamp(&self, packet_number: u32) -> Option<Instant> {
+        self.sent.get(&packet_number).map(|s| s.timestamp)
     }
 
     pub(super) fn unacked_frame(&self) -> Option<Frame> {

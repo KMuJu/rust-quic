@@ -31,7 +31,7 @@ use crate::io::{
     socket::Socket,
     space::{
         PacketSpace, Space,
-        SpaceEvent::{Crypto, HandshakeDone, RecvStreamFrame, SendStreamFrame},
+        SpaceEvent::{Crypto, HandshakeDone, RecvStreamFrame, RttSample, SendStreamFrame},
     },
     stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
 };
@@ -174,6 +174,14 @@ impl ConnectionInner {
                         HandshakeDone => {
                             self.consume_connected();
                         }
+                        RttSample(latest_rtt, ack_delay) => {
+                            self.rtt.update(
+                                latest_rtt,
+                                ack_delay,
+                                &self.max_ack_delay,
+                                self.handshake_is_done(),
+                            );
+                        }
                         Crypto(var_int, items) => todo!(),
                     }
                 }
@@ -217,6 +225,14 @@ impl ConnectionInner {
 
                                 self.initial_space.discard();
                             }
+                        }
+                        RttSample(latest_rtt, ack_delay) => {
+                            self.rtt.update(
+                                latest_rtt,
+                                ack_delay,
+                                &self.max_ack_delay,
+                                self.handshake_is_done(),
+                            );
                         }
                         RecvStreamFrame(_, _) | SendStreamFrame(_, _) | HandshakeDone => (),
                     }
@@ -264,6 +280,14 @@ impl ConnectionInner {
                                 }
                             }
                         },
+                        RttSample(latest_rtt, ack_delay) => {
+                            self.rtt.update(
+                                latest_rtt,
+                                ack_delay,
+                                &self.max_ack_delay,
+                                self.handshake_is_done(),
+                            );
+                        }
                         RecvStreamFrame(_, _) | SendStreamFrame(_, _) | HandshakeDone => (),
                     }
                 }
@@ -494,6 +518,10 @@ impl ConnectionInner {
     pub(super) fn send(&mut self, id: &StreamID) -> Option<&mut SendStream> {
         self.send.get_mut(id)
     }
+
+    fn handshake_is_done(&self) -> bool {
+        self.connected.is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -586,7 +614,9 @@ impl Connection {
 
     pub fn open_bidir(&self) -> (RecvStreamHandle, SendStreamHandle) {
         let mut inner = self.inner.lock().unwrap();
-        let id = StreamID::new(inner.stream_number, &inner.side, Dir::Bidir); // TODO: Handle :)
+        let id = StreamID::new(inner.stream_number, &inner.side, Dir::Bidir);
+        // TODO: Have seperate counters for each?
+        // Currently this will shrink the number of possible stream ids
         inner.stream_number += 1;
         let recv = RecvStream::new(id.clone());
         let send = SendStream::new(id.clone());

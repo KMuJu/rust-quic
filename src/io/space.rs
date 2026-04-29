@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Duration};
+
+use tokio::time::Instant;
 
 use crate::io::{
     ack_manager::Acker,
@@ -25,6 +27,8 @@ pub(super) enum SpaceEvent {
     RecvStreamFrame(StreamID, Frame),
     SendStreamFrame(StreamID, Frame),
     Crypto(VarInt, Vec<u8>),
+
+    RttSample(Duration, Duration),
 
     HandshakeDone,
 }
@@ -81,7 +85,7 @@ impl Space {
                 ranges,
                 ecn,
             } => {
-                self.handle_ack_frame(largest, delay, first_range, ranges, ecn, rtt);
+                return self.handle_ack_frame(largest, delay, first_range, ranges, ecn, rtt);
             }
             Frame::NewToken { .. } => todo!(),
             Frame::MaxData { .. } => todo!(),
@@ -113,7 +117,7 @@ impl Space {
         ranges: &Vec<AckRange>,
         ecn: &Option<EcnCounts>,
         rtt: &RttEstimator,
-    ) {
+    ) -> Option<SpaceEvent> {
         let mut acked = Vec::new();
         let mut current = largest.0;
 
@@ -134,19 +138,22 @@ impl Space {
 
         // println!("Acked({space:?})[{:?}]: {acked:?}", self.side);
 
+        let largest_sent_at = self.acker.sent_timestamp(largest.0 as u32);
         for ack in acked {
             self.acker.acked(ack);
         }
 
-        // TODO: Handle
-        // - declare lost: pn + 3 <= largest  (packet threshold)
-        // - declare lost: sent_at + time_threshold <= largest_sent_at  (time threshold)
-        // - re-enqueue retransmittable frames from lost packets
-        // - arm loss_timer for remaining unacked packets that might still be lost
-        // - arm PTO timer (separate, fires if no ACK arrives within ~3× RTT)
-
         let lost = self.acker.get_lost_frames(largest.0 as u32, rtt);
         self.add_lost_to_pending(lost);
+
+        if let Some(largest_sent_at) = largest_sent_at {
+            return Some(SpaceEvent::RttSample(
+                Instant::now() - largest_sent_at,
+                Duration::from_millis(delay.0 << 3),
+                // TODO: Handle transport parameter ack_delay_exponent
+            ));
+        }
+        None
     }
 
     fn add_lost_to_pending(&mut self, lost: Vec<Frame>) {
