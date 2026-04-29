@@ -1,7 +1,6 @@
 pub mod mock {
     use std::{
         collections::VecDeque,
-        future::poll_fn,
         io,
         net::SocketAddr,
         sync::{Arc, Mutex},
@@ -9,7 +8,6 @@ pub mod mock {
     };
 
     use futures::task::AtomicWaker;
-    use tokio::io::ReadBuf;
 
     use crate::io::socket::Socket;
 
@@ -82,85 +80,94 @@ pub mod mock {
         }
     }
 
-    #[tokio::test]
-    async fn test_mock_socket_send_recv() {
-        let (a, b) = MockSocket::pair(0.0); // no loss
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+    #[cfg(test)]
+    mod tests {
+        use std::future::poll_fn;
 
-        // Send from a
-        poll_fn(|cx| a.poll_send_to(cx, b"hello", addr))
-            .await
-            .unwrap();
+        use tokio::io::ReadBuf;
 
-        // Receive on b
-        let mut buf = vec![0u8; 64];
-        let mut read_buf = ReadBuf::new(&mut buf);
-        let from = poll_fn(|cx| b.poll_recv_from(cx, &mut read_buf))
-            .await
-            .unwrap();
+        use super::*;
 
-        assert_eq!(read_buf.filled(), b"hello");
-        assert_eq!(from, addr);
-    }
+        #[tokio::test]
+        async fn test_mock_socket_send_recv() {
+            let (a, b) = MockSocket::pair(0.0); // no loss
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
-    #[tokio::test]
-    async fn test_mock_socket_loss() {
-        let (a, b) = MockSocket::pair(1.0); // 100% loss
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            // Send from a
+            poll_fn(|cx| a.poll_send_to(cx, b"hello", addr))
+                .await
+                .unwrap();
 
-        poll_fn(|cx| a.poll_send_to(cx, b"hello", addr))
-            .await
-            .unwrap();
+            // Receive on b
+            let mut buf = vec![0u8; 64];
+            let mut read_buf = ReadBuf::new(&mut buf);
+            let from = poll_fn(|cx| b.poll_recv_from(cx, &mut read_buf))
+                .await
+                .unwrap();
 
-        // Nothing should be in b's queue
-        assert!(b.incoming.lock().unwrap().is_empty());
-    }
+            assert_eq!(read_buf.filled(), b"hello");
+            assert_eq!(from, addr);
+        }
 
-    #[tokio::test]
-    async fn test_mock_socket_bidirectional() {
-        let (a, b) = MockSocket::pair(0.0);
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        #[tokio::test]
+        async fn test_mock_socket_loss() {
+            let (a, b) = MockSocket::pair(1.0); // 100% loss
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
-        // a -> b
-        poll_fn(|cx| a.poll_send_to(cx, b"ping", addr))
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 64];
-        let mut read_buf = ReadBuf::new(&mut buf);
-        poll_fn(|cx| b.poll_recv_from(cx, &mut read_buf))
-            .await
-            .unwrap();
-        assert_eq!(read_buf.filled(), b"ping");
+            poll_fn(|cx| a.poll_send_to(cx, b"hello", addr))
+                .await
+                .unwrap();
 
-        // b -> a
-        poll_fn(|cx| b.poll_send_to(cx, b"pong", addr))
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 64];
-        let mut read_buf = ReadBuf::new(&mut buf);
-        poll_fn(|cx| a.poll_recv_from(cx, &mut read_buf))
-            .await
-            .unwrap();
-        assert_eq!(read_buf.filled(), b"pong");
-    }
+            // Nothing should be in b's queue
+            assert!(b.incoming.lock().unwrap().is_empty());
+        }
 
-    #[tokio::test]
-    async fn test_mock_socket_waking() {
-        let (a, b) = MockSocket::pair(0.0); // no loss
-        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        #[tokio::test]
+        async fn test_mock_socket_bidirectional() {
+            let (a, b) = MockSocket::pair(0.0);
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
-        // Send from a
-        let send_fut = poll_fn(|cx| a.poll_send_to(cx, b"hello", addr));
+            // a -> b
+            poll_fn(|cx| a.poll_send_to(cx, b"ping", addr))
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 64];
+            let mut read_buf = ReadBuf::new(&mut buf);
+            poll_fn(|cx| b.poll_recv_from(cx, &mut read_buf))
+                .await
+                .unwrap();
+            assert_eq!(read_buf.filled(), b"ping");
 
-        // Receive on b
-        let mut buf = vec![0u8; 64];
-        let mut read_buf = ReadBuf::new(&mut buf);
-        let read_fut = poll_fn(|cx| b.poll_recv_from(cx, &mut read_buf));
+            // b -> a
+            poll_fn(|cx| b.poll_send_to(cx, b"pong", addr))
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 64];
+            let mut read_buf = ReadBuf::new(&mut buf);
+            poll_fn(|cx| a.poll_recv_from(cx, &mut read_buf))
+                .await
+                .unwrap();
+            assert_eq!(read_buf.filled(), b"pong");
+        }
 
-        send_fut.await.unwrap();
-        let from = read_fut.await.unwrap();
+        #[tokio::test]
+        async fn test_mock_socket_waking() {
+            let (a, b) = MockSocket::pair(0.0); // no loss
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
-        assert_eq!(read_buf.filled(), b"hello");
-        assert_eq!(from, addr);
+            // Send from a
+            let send_fut = poll_fn(|cx| a.poll_send_to(cx, b"hello", addr));
+
+            // Receive on b
+            let mut buf = vec![0u8; 64];
+            let mut read_buf = ReadBuf::new(&mut buf);
+            let read_fut = poll_fn(|cx| b.poll_recv_from(cx, &mut read_buf));
+
+            send_fut.await.unwrap();
+            let from = read_fut.await.unwrap();
+
+            assert_eq!(read_buf.filled(), b"hello");
+            assert_eq!(from, addr);
+        }
     }
 }
