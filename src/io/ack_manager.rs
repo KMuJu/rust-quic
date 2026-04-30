@@ -11,6 +11,8 @@ use crate::io::{
     rtt_estimator::RttEstimator,
 };
 
+const PACKET_THRESHOLD: u32 = 3;
+
 struct SentPacket {
     timestamp: Instant,
     frames: Vec<Frame>,
@@ -29,8 +31,10 @@ pub(super) struct Acker {
     sent: BTreeMap<u32, SentPacket>,
     eliciting_count: u32,
     ack_deadline: Option<Instant>,
+    loss_time: Option<Instant>,
     largest_acked: u32,
     largest_received: Option<LargestReceived>,
+    last_elicit_time: Option<Instant>,
 
     waker: AtomicWaker,
 }
@@ -43,8 +47,10 @@ impl Acker {
             sent: BTreeMap::new(),
             eliciting_count: 0,
             ack_deadline: None,
-            largest_acked: 0,
+            loss_time: None,
+            largest_acked: u32::MAX,
             largest_received: None,
+            last_elicit_time: None,
             waker: AtomicWaker::new(),
         }
     }
@@ -94,19 +100,17 @@ impl Acker {
     }
 
     pub(super) fn get_deadline(&self) -> Option<Instant> {
-        self.ack_deadline
-    }
-
-    pub(super) fn get_next_loss(&self, rtt: &RttEstimator) -> Option<Instant> {
         if self.cleared {
             return None;
         }
-        let time_threshold = (rtt.smoothed * 9 / 8).max(Duration::from_micros(1));
-        self.sent
-            .values()
-            .map(|s| s.timestamp)
-            .min()
-            .map(|t| t + time_threshold)
+        self.ack_deadline
+    }
+
+    pub(super) fn get_loss_time(&self) -> Option<Instant> {
+        if self.cleared {
+            return None;
+        }
+        self.loss_time
     }
 
     pub(super) fn get_ack(&mut self) -> Option<Frame> {
@@ -166,6 +170,7 @@ impl Acker {
             return;
         }
         let pn = packet_number.u32();
+        self.last_elicit_time = Some(Instant::now());
 
         // Only retransmit retransmitable frames
         // TODO: Handle MAX_* frames
@@ -186,30 +191,39 @@ impl Acker {
         self.sent.insert(pn, sent);
     }
 
-    pub(super) fn get_lost_frames(&mut self, largest: u32, rtt: &RttEstimator) -> Vec<Frame> {
+    pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator) -> Vec<Frame> {
         let mut lost = Vec::new();
         if self.cleared {
             return lost;
         }
-        let largest_sent_at = self.sent.get(&largest).map(|s| s.timestamp);
+        assert!(
+            self.largest_acked != u32::MAX,
+            "Largest acked was not set: {}",
+            self.largest_acked
+        );
+        let loss_delay = rtt.latest_rtt.max(rtt.smoothed) * 9 / 8;
+        let loss_delay = loss_delay.max(Duration::from_millis(1));
+        let loss_send_time = Instant::now() - loss_delay;
 
-        let lost_pns: Vec<_> = self
-            .sent
-            .keys()
-            .filter(|&pn| pn + 3 <= largest)
-            .copied()
-            .collect();
+        let mut lost_pns = Vec::new();
+        for (pn, s) in self.sent.iter() {
+            if *pn > self.largest_acked {
+                continue;
+            }
+            if s.timestamp <= loss_send_time || self.largest_acked > pn + PACKET_THRESHOLD {
+                lost_pns.push(*pn);
+            } else if let Some(deadline) = self.ack_deadline {
+                self.loss_time = Some(deadline.min(s.timestamp + loss_delay));
+            } else {
+                self.loss_time = Some(s.timestamp + loss_delay);
+            }
+        }
 
         for pn in lost_pns {
             let sent = self.sent.remove(&pn).unwrap();
             for frame in sent.frames {
                 lost.push(frame);
             }
-        }
-
-        if let Some(lst) = largest_sent_at {
-            let mut time_lost = self.get_time_lost_frames(lst, rtt);
-            lost.append(&mut time_lost);
         }
 
         if !lost.is_empty() {
@@ -249,7 +263,11 @@ impl Acker {
     }
 
     pub(super) fn acked(&mut self, packet_number: u32) {
-        self.largest_acked = self.largest_acked.max(packet_number);
+        if self.largest_acked == u32::MAX {
+            self.largest_acked = packet_number;
+        } else {
+            self.largest_acked = self.largest_acked.max(packet_number);
+        }
         self.sent.remove(&packet_number);
     }
 
@@ -280,6 +298,10 @@ impl Acker {
 
     pub(super) fn has_packet_in_flight(&self) -> bool {
         !self.sent.is_empty()
+    }
+
+    pub(super) fn time_of_last_elicit(&self) -> Option<Instant> {
+        self.last_elicit_time
     }
 }
 
@@ -392,8 +414,9 @@ mod tests {
         acker.sent_packet(PacketNumber::U8(2), frames.clone(), true);
         acker.sent_packet(PacketNumber::U8(5), frames.clone(), true);
         acker.sent_packet(PacketNumber::U8(6), frames.clone(), true);
+        acker.acked(6);
 
-        let lost = acker.get_lost_frames(6, &RttEstimator::new());
+        let lost = acker.get_lost_frames(&RttEstimator::new());
         println!("Lost: {lost:?}");
 
         assert!(matches!(lost[0], Frame::Ping));

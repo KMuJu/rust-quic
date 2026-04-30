@@ -124,7 +124,7 @@ impl ConnectionInner {
             self.id, self.state, self.side, packet
         );
         if !self
-            .space(p_space)
+            .space_mut(p_space)
             .acker
             .received(packet.packet_number(), packet.is_ack_eliciting())
         {
@@ -305,11 +305,20 @@ impl ConnectionInner {
     }
 
     #[inline]
-    fn space(&mut self, p_space: PacketSpace) -> &mut Space {
+    fn space_mut(&mut self, p_space: PacketSpace) -> &mut Space {
         match p_space {
             PacketSpace::Initial => &mut self.initial_space,
             PacketSpace::Handshake => &mut self.handshake_space,
             PacketSpace::Data => &mut self.data_space,
+        }
+    }
+
+    #[inline]
+    fn space(&self, p_space: PacketSpace) -> &Space {
+        match p_space {
+            PacketSpace::Initial => &self.initial_space,
+            PacketSpace::Handshake => &self.handshake_space,
+            PacketSpace::Data => &self.data_space,
         }
     }
 
@@ -326,7 +335,7 @@ impl ConnectionInner {
                     continue;
                 }
             };
-            self.space(space).push_back_frame(frame);
+            self.space_mut(space).push_back_frame(frame);
         }
     }
 
@@ -347,6 +356,11 @@ impl ConnectionInner {
         }
     }
 
+    fn peer_completed_address_validation(&self) -> bool {
+        // TODO: Do properly
+        self.handshake_is_done()
+    }
+
     fn spaces(&self) -> impl Iterator<Item = &Space> {
         [&self.initial_space, &self.handshake_space, &self.data_space].into_iter()
     }
@@ -356,32 +370,57 @@ impl ConnectionInner {
     }
 
     fn next_loss_deadline(&self) -> Option<Instant> {
-        self.spaces()
-            .filter_map(|s| s.acker.get_next_loss(&self.rtt))
-            .min()
+        self.spaces().filter_map(|s| s.acker.get_loss_time()).min()
     }
 
     fn pto_deadline(&self) -> Option<Instant> {
-        // Find the earliest unacked packet across all non-discarded spaces
-        let latest = self
-            .spaces()
-            .filter(|s| !s.is_discarded())
-            .filter_map(|s| s.acker.earliest_sent())
-            .max()?;
+        let duration = (self.rtt.smoothed + (self.rtt.variance * 4).max(Duration::from_millis(1)))
+            * 2u32.pow(self.pto_backoff);
 
-        let pto = self.rtt.smoothed
-            + (self.rtt.variance * 4).max(Duration::from_millis(1))
-            + self.max_ack_delay;
+        let any_in_flight = self.spaces().any(|s| s.acker.has_packet_in_flight());
 
-        Some(latest + pto * 2_u32.pow(self.pto_backoff))
+        if !any_in_flight {
+            if !self.peer_completed_address_validation() {
+                return Some(Instant::now() + duration);
+            } else {
+                return None;
+            }
+        }
+
+        let mut pto_timeout: Option<Instant> = None;
+        for space in PacketSpace::iter() {
+            if !self.space(space).acker.has_packet_in_flight() {
+                continue;
+            }
+            let mut duration = duration;
+            if matches!(space, PacketSpace::Data) {
+                if !self.handshake_is_done() {
+                    return pto_timeout;
+                }
+                duration += self.max_ack_delay * 2u32.pow(self.pto_backoff);
+            }
+
+            let Some(last) = self.space(space).acker.time_of_last_elicit() else {
+                // Skip if space has sent no packet
+                continue;
+            };
+            let t = last + duration;
+
+            pto_timeout = match pto_timeout {
+                Some(pto) => Some(pto.min(t)),
+                None => Some(t),
+            };
+        }
+
+        pto_timeout
     }
 
     fn get_packet(&mut self, p_space: PacketSpace, mut mtu: usize) -> Option<Packet> {
         let mut frames = Vec::new();
 
-        while let Some(frame) = self.space(p_space).pending_frames.front() {
+        while let Some(frame) = self.space_mut(p_space).pending_frames.front() {
             if mtu > frame.size() {
-                let frame = self.space(p_space).pending_frames.pop_front().unwrap();
+                let frame = self.space_mut(p_space).pending_frames.pop_front().unwrap();
                 // Only retransmitt stream frames for send streams that has not sent reset
                 if let Frame::Stream { id, .. } = &frame {
                     let stream = self.send.get(id);
@@ -399,7 +438,7 @@ impl ConnectionInner {
             }
         }
 
-        if let Some(ack) = self.space(p_space).acker.get_ack() {
+        if let Some(ack) = self.space_mut(p_space).acker.get_ack() {
             if mtu > ack.size() {
                 mtu -= ack.size();
                 frames.push(ack);
@@ -433,7 +472,7 @@ impl ConnectionInner {
                     mtu -= size;
                     frames.push(frame);
                 } else {
-                    self.space(p_space).pending_frames.push_back(frame);
+                    self.space_mut(p_space).pending_frames.push_back(frame);
                     break;
                 }
             }
@@ -448,7 +487,7 @@ impl ConnectionInner {
             *fin = true
         };
 
-        let pn = PacketNumber::from(self.space(p_space).new_packet_num());
+        let pn = PacketNumber::from(self.space_mut(p_space).new_packet_num());
 
         let header = match p_space {
             PacketSpace::Initial => Header::Initial {
@@ -482,7 +521,7 @@ impl ConnectionInner {
     }
 
     fn build_pto_probe(&mut self, p_space: PacketSpace) -> Frame {
-        if let Some(frame) = self.space(p_space).acker.unacked_frame() {
+        if let Some(frame) = self.space_mut(p_space).acker.unacked_frame() {
             frame
         } else {
             Frame::Ping
@@ -769,12 +808,10 @@ impl Future for ConnectionDriver {
 
         if loss_fired {
             let mut inner = this.inner.lock().unwrap();
+            println!("Loss fired in: {:?}", inner.side);
             for space in PacketSpace::iter() {
                 let rtt = &inner.rtt.clone();
-                let lost = inner
-                    .space(space)
-                    .acker
-                    .get_time_lost_frames(Instant::now(), rtt);
+                let lost = inner.space_mut(space).acker.get_lost_frames(rtt);
                 if !lost.is_empty() {
                     println!(
                         "Found timedout packets({space:?})[{:?}]: {lost:?}!!!!!!!!!!!!!!!!!!!!!!!",
@@ -789,7 +826,7 @@ impl Future for ConnectionDriver {
             let mut inner = this.inner.lock().unwrap();
             let p_space = inner.pto_space();
             let pto_frame = inner.build_pto_probe(p_space);
-            inner.space(p_space).pending_frames.push_back(pto_frame);
+            inner.space_mut(p_space).pending_frames.push_back(pto_frame);
             inner.pto_backoff += 1;
         }
 
@@ -813,11 +850,16 @@ impl Future for ConnectionDriver {
             );
 
             if packet.is_ack_eliciting() {
-                this.inner.lock().unwrap().space(p_space).acker.sent_packet(
-                    packet.packet_number().clone(),
-                    packet.frames.clone(),
-                    packet.is_in_flight(),
-                );
+                this.inner
+                    .lock()
+                    .unwrap()
+                    .space_mut(p_space)
+                    .acker
+                    .sent_packet(
+                        packet.packet_number().clone(),
+                        packet.frames.clone(),
+                        packet.is_in_flight(),
+                    );
             }
 
             let mut buf = BytesMut::new();

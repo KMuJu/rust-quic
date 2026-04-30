@@ -6,6 +6,7 @@ pub(super) struct RttEstimator {
     pub(super) smoothed: Duration,
     pub(super) variance: Duration,
     pub(super) min_rtt: Duration,
+    pub(super) latest_rtt: Duration,
 }
 
 impl RttEstimator {
@@ -15,6 +16,7 @@ impl RttEstimator {
             smoothed: Duration::from_millis(333),
             variance: Duration::from_millis(166),
             min_rtt: Duration::new(0, 0),
+            latest_rtt: Duration::from_secs(0),
         }
     }
 
@@ -25,6 +27,7 @@ impl RttEstimator {
         max_ack_delay: &Duration,
         handshake_done: bool,
     ) {
+        self.latest_rtt = latest_rtt;
         if self.first {
             self.first = false;
             self.min_rtt = latest_rtt;

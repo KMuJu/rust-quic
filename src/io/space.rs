@@ -143,7 +143,7 @@ impl Space {
             self.acker.acked(ack);
         }
 
-        let lost = self.acker.get_lost_frames(largest.0 as u32, rtt);
+        let lost = self.acker.get_lost_frames(rtt);
         self.add_lost_to_pending(lost);
 
         if let Some(largest_sent_at) = largest_sent_at {
