@@ -34,6 +34,7 @@ use crate::io::{
         SpaceEvent::{Crypto, HandshakeDone, RecvStreamFrame, RttSample, SendStreamFrame},
     },
     stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
+    transport_parameters::{SharedConfig, TransportParam},
 };
 
 use super::encoding::VarInt;
@@ -69,7 +70,7 @@ pub struct ConnectionInner {
     handshake_space: Space,
     data_space: Space,
 
-    max_ack_delay: Duration,
+    transport_params: SharedConfig,
     rtt: RttEstimator,
     pto_backoff: u32,
 }
@@ -178,7 +179,7 @@ impl ConnectionInner {
                             self.rtt.update(
                                 latest_rtt,
                                 ack_delay,
-                                &self.max_ack_delay,
+                                &self.transport_params.max_ack_delay,
                                 self.handshake_is_done(),
                             );
                         }
@@ -230,7 +231,7 @@ impl ConnectionInner {
                             self.rtt.update(
                                 latest_rtt,
                                 ack_delay,
-                                &self.max_ack_delay,
+                                &self.transport_params.max_ack_delay,
                                 self.handshake_is_done(),
                             );
                         }
@@ -284,7 +285,7 @@ impl ConnectionInner {
                             self.rtt.update(
                                 latest_rtt,
                                 ack_delay,
-                                &self.max_ack_delay,
+                                &self.transport_params.max_ack_delay,
                                 self.handshake_is_done(),
                             );
                         }
@@ -397,7 +398,7 @@ impl ConnectionInner {
                 if !self.handshake_is_done() {
                     return pto_timeout;
                 }
-                duration += self.max_ack_delay * 2u32.pow(self.pto_backoff);
+                duration += self.transport_params.max_ack_delay * 2u32.pow(self.pto_backoff);
             }
 
             let Some(last) = self.space(space).acker.time_of_last_elicit() else {
@@ -584,6 +585,7 @@ impl Connection {
         incoming_data: UnboundedReceiver<EndpointToConnection>,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     ) -> Self {
+        let transport_params = Arc::new(TransportParam::new());
         let inner = Arc::new(Mutex::new(ConnectionInner {
             id: cid,
             peer_cid,
@@ -601,11 +603,11 @@ impl Connection {
             write_waker: AtomicWaker::new(),
             stream_number: 0,
 
-            initial_space: Space::new(PacketSpace::Initial),
-            handshake_space: Space::new(PacketSpace::Handshake),
-            data_space: Space::new(PacketSpace::Data),
+            initial_space: Space::new(PacketSpace::Initial, transport_params.clone()),
+            handshake_space: Space::new(PacketSpace::Handshake, transport_params.clone()),
+            data_space: Space::new(PacketSpace::Data, transport_params.clone()),
             pto_backoff: 0,
-            max_ack_delay: Duration::from_micros(1),
+            transport_params: transport_params.clone(),
             rtt: RttEstimator::new(),
         }));
         let driver = ConnectionDriver {

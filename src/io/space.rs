@@ -8,6 +8,7 @@ use crate::io::{
     frame::{AckRange, EcnCounts, Frame},
     rtt_estimator::RttEstimator,
     stream::StreamID,
+    transport_parameters::SharedConfig,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -39,16 +40,18 @@ pub(super) struct Space {
     pub(super) acker: Acker,
     pub(super) pending_frames: VecDeque<Frame>,
     packet_number: usize,
+    transport_params: SharedConfig,
 }
 
 impl Space {
-    pub(super) fn new(space: PacketSpace) -> Self {
+    pub(super) fn new(space: PacketSpace, transport_params: SharedConfig) -> Self {
         Self {
             space,
             discarded: false,
-            acker: Acker::new(),
+            acker: Acker::new(transport_params.clone()),
             pending_frames: VecDeque::new(),
             packet_number: 0,
+            transport_params,
         }
     }
 
@@ -149,8 +152,7 @@ impl Space {
         if let Some(largest_sent_at) = largest_sent_at {
             return Some(SpaceEvent::RttSample(
                 Instant::now() - largest_sent_at,
-                Duration::from_millis(delay.0 << 3),
-                // TODO: Handle transport parameter ack_delay_exponent
+                Duration::from_millis(delay.0 << self.transport_params.ack_delay_exponent),
             ));
         }
         None

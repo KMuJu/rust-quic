@@ -9,6 +9,7 @@ use crate::io::{
     frame::{AckRange, Frame},
     packet::PacketNumber,
     rtt_estimator::RttEstimator,
+    transport_parameters::SharedConfig,
 };
 
 const PACKET_THRESHOLD: u32 = 3;
@@ -27,6 +28,7 @@ struct LargestReceived {
 
 pub(super) struct Acker {
     cleared: bool,
+    transport_params: SharedConfig,
     received: RangeSet<[RangeInclusive<u32>; 8]>,
     sent: BTreeMap<u32, SentPacket>,
     eliciting_count: u32,
@@ -40,9 +42,10 @@ pub(super) struct Acker {
 }
 
 impl Acker {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(transport_params: SharedConfig) -> Self {
         Self {
             cleared: false,
+            transport_params,
             received: RangeSet::new(),
             sent: BTreeMap::new(),
             eliciting_count: 0,
@@ -136,7 +139,7 @@ impl Acker {
         };
 
         let delay_micros = (Instant::now() - largest_time).as_micros();
-        let encoded_delay = delay_micros >> 3; // TODO: ack_delay_exponent
+        let encoded_delay = delay_micros >> self.transport_params.ack_delay_exponent;
 
         let mut ranges = Vec::new();
         let mut prev_end = *first.start();
@@ -307,11 +310,15 @@ impl Acker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::io::transport_parameters::TransportParam;
+
     use super::*;
 
     #[test]
     fn test_build_frame() {
-        let mut acker = Acker::new();
+        let mut acker = Acker::new(Arc::new(TransportParam::new()));
         assert!(acker.received(&PacketNumber::U8(1), false));
         assert!(acker.received(&PacketNumber::U8(2), false));
         assert!(acker.received(&PacketNumber::U8(3), false));
@@ -345,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_build_frame_simple() {
-        let mut acker = Acker::new();
+        let mut acker = Acker::new(Arc::new(TransportParam::new()));
         assert!(acker.received(&PacketNumber::U8(1), false));
         assert!(acker.received(&PacketNumber::U8(2), false));
         assert!(acker.received(&PacketNumber::U8(3), false));
@@ -372,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_build_frame_first_range() {
-        let mut acker = Acker::new();
+        let mut acker = Acker::new(Arc::new(TransportParam::new()));
         assert!(acker.received(&PacketNumber::U8(1), false));
         assert!(acker.received(&PacketNumber::U8(2), false));
         assert!(acker.received(&PacketNumber::U8(3), false));
@@ -407,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_lost_frames() {
-        let mut acker = Acker::new();
+        let mut acker = Acker::new(Arc::new(TransportParam::new()));
         let frames = vec![Frame::Ping, Frame::HandshakeDone];
 
         acker.sent_packet(PacketNumber::U8(1), frames.clone(), true);
