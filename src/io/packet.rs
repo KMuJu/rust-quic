@@ -379,6 +379,51 @@ impl Header {
         };
         Ok(())
     }
+
+    pub(super) fn size(&self) -> usize {
+        match self {
+            Header::Initial {
+                dst_cid,
+                src_cid,
+                token,
+                length,
+                packet_number,
+                ..
+            } => {
+                1 + 4
+                    + 1
+                    + dst_cid.len as usize
+                    + 1
+                    + src_cid.len as usize
+                    + match token {
+                        Some(t) => VarInt(t.0.len() as u64).length() + t.0.len(),
+                        None => 1,
+                    }
+                    + length.length()
+                    + packet_number.len() as usize
+            }
+            Header::Handshake {
+                dst_cid,
+                src_cid,
+                length,
+                packet_number,
+                ..
+            } => {
+                1 + 4
+                    + 1
+                    + dst_cid.len as usize
+                    + 1
+                    + src_cid.len as usize
+                    + length.length()
+                    + packet_number.len() as usize
+            }
+            Header::Short {
+                dst_cid,
+                packet_number,
+                ..
+            } => 1 + dst_cid.len as usize + packet_number.len() as usize,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +494,59 @@ mod test {
         };
 
         assert!(packet.is_client_hello());
+    }
+
+    #[test]
+    fn test_initial_size() {
+        let header = Header::Initial {
+            version: 1,
+            dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
+            src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
+            length: VarInt(1), // TODO: Handle length
+            token: None,
+            packet_number: PacketNumber::from(1),
+        };
+
+        let mut encoded = Vec::new();
+        header
+            .encode(&mut encoded)
+            .expect("Encoding should not fail");
+
+        assert_eq!(header.size(), encoded.len());
+    }
+
+    #[test]
+    fn test_handshake_size() {
+        let header = Header::Handshake {
+            version: 1,
+            dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
+            src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
+            length: VarInt(1), // TODO: Handle length
+            packet_number: PacketNumber::from(1),
+        };
+
+        let mut encoded = Vec::new();
+        header
+            .encode(&mut encoded)
+            .expect("Encoding should not fail");
+
+        assert_eq!(header.size(), encoded.len());
+    }
+
+    #[test]
+    fn test_data_size() {
+        let header = Header::Short {
+            spin: false,
+            key_phase: false,
+            dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
+            packet_number: PacketNumber::from(1),
+        };
+
+        let mut encoded = Vec::new();
+        header
+            .encode(&mut encoded)
+            .expect("Encoding should not fail");
+
+        assert_eq!(header.size(), encoded.len());
     }
 }
