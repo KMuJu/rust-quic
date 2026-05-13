@@ -60,6 +60,10 @@ impl Packet {
         Ok(())
     }
 
+    pub fn size(&self) -> usize {
+        self.header.size() + self.frames.iter().map(|f| f.size()).sum::<usize>()
+    }
+
     pub fn dst_cid(&self) -> ConnectionID {
         match self.header {
             Header::Initial { dst_cid, .. } => dst_cid,
@@ -430,6 +434,8 @@ impl Header {
 mod test {
     use std::io::{self, Cursor};
 
+    use crate::io::stream::{Dir, StreamID};
+
     use super::*;
 
     #[test]
@@ -548,5 +554,54 @@ mod test {
             .expect("Encoding should not fail");
 
         assert_eq!(header.size(), encoded.len());
+    }
+
+    #[test]
+    fn test_packet_size() {
+        let crypto_data = CryptoFrame::ClientHello;
+        let mut c_data = Vec::new();
+        crypto_data.encode(&mut c_data);
+        let crypto_frame = Frame::Crypto {
+            offset: VarInt(0),
+            data: c_data,
+        };
+
+        let stream_frame = Frame::Stream {
+            id: StreamID::new_unchecked(1),
+            fin: false,
+            len: false,
+            offset: VarInt(0),
+            data: Bytes::new(),
+        };
+
+        let payload = vec![
+            crypto_frame,
+            stream_frame,
+            Frame::Padding,
+            Frame::Ping,
+            Frame::MaxStreams {
+                dir: Dir::Uni,
+                max_streams: VarInt(3),
+            },
+        ];
+
+        let packet = Packet {
+            header: Header::Initial {
+                version: 1,
+                dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
+                src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
+                length: VarInt(1), // TODO: Handle length
+                token: None,
+                packet_number: PacketNumber::from(1),
+            },
+            frames: payload,
+        };
+
+        let mut encoded = Vec::new();
+        packet
+            .encode(&mut encoded)
+            .expect("Encoding should not fail");
+
+        assert_eq!(packet.size(), encoded.len());
     }
 }

@@ -583,17 +583,23 @@ impl Frame {
                 let l = if *len {
                     variable_length(data.len() as u64)
                 } else {
-                    0
+                    1
                 };
 
                 i + o + l + data.len()
             }
-            MaxData { max_data } => todo!(),
+            MaxData { max_data } => variable_length(MAX_DATA) + max_data.length(),
             MaxStreamData {
                 id,
                 max_stream_data,
-            } => todo!(),
-            MaxStreams { dir, max_streams } => todo!(),
+            } => {
+                variable_length(MAX_STREAM_DATA)
+                    + variable_length(id.value() as u64)
+                    + max_stream_data.length()
+            }
+            MaxStreams { max_streams, .. } => {
+                variable_length(MAX_STREAMS_UNI) + max_streams.length()
+            }
             DataBlocked { max_data } => todo!(),
             StreamDataBlocked {
                 id,
@@ -812,5 +818,22 @@ mod test {
         println!("Start frames: {frames:?}");
         println!("End frames: {end_frames:?}");
         assert_eq!(frames.len(), end_frames.len());
+    }
+
+    #[test]
+    fn test_stream_size() {
+        let frame = Frame::Stream {
+            id: StreamID::new_unchecked(1),
+            fin: false,
+            len: false,
+            offset: VarInt(0),
+            data: Bytes::new(),
+        };
+        let mut encoded = Vec::new();
+        frame
+            .encode(&mut encoded)
+            .expect("Encoding should not fail");
+
+        assert_eq!(frame.size(), encoded.len());
     }
 }
