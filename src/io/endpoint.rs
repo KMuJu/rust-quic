@@ -127,7 +127,7 @@ impl<S: Socket> Endpoint<S> {
 
         conn.init();
 
-        // TODO: Wait for handshake to finish
+        // Wait for handshake to finish
         connected_recv.await.unwrap();
 
         conn

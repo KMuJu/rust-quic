@@ -492,7 +492,7 @@ mod test {
                 version: 1,
                 dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
                 src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
-                length: VarInt(1), // TODO: Handle length
+                length: VarInt(1),
                 token: None,
                 packet_number: PacketNumber::from(1),
             },
@@ -508,7 +508,7 @@ mod test {
             version: 1,
             dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
             src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
-            length: VarInt(1), // TODO: Handle length
+            length: VarInt(1),
             token: None,
             packet_number: PacketNumber::from(1),
         };
@@ -527,7 +527,7 @@ mod test {
             version: 1,
             dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
             src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
-            length: VarInt(1), // TODO: Handle length
+            length: VarInt(1),
             packet_number: PacketNumber::from(1),
         };
 
@@ -590,7 +590,7 @@ mod test {
                 version: 1,
                 dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
                 src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
-                length: VarInt(1), // TODO: Handle length
+                length: VarInt(1),
                 token: None,
                 packet_number: PacketNumber::from(1),
             },

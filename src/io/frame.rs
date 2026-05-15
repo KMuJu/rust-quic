@@ -416,7 +416,7 @@ impl Frame {
                     return Err(FrameEncodeError::TooSmallBuffer);
                 }
 
-                buf.put_slice(data); // TODO: Look at clone
+                buf.put_slice(data);
             }
             Frame::MaxData { max_data } => {
                 variable_length_encode(buf, MAX_DATA)?;

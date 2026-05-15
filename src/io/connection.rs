@@ -672,10 +672,8 @@ impl Connection {
     }
 
     // Send initial packet to peer
-    // TODO: Start handshake
     pub(super) fn init(&self) {
         let mut inner = self.inner.lock().unwrap();
-        // HACK: Wtf is this ??? (I dont care for now)
         let crypto_data = CryptoFrame::ClientHello;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
