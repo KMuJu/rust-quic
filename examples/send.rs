@@ -17,6 +17,7 @@ async fn main() -> io::Result<()> {
 
         println!("Read from stream");
         println!("Data: {:?}", &buf[..n]);
+        println!();
     }
 
     Ok(())

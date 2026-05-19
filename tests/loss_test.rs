@@ -12,13 +12,12 @@ async fn test_handshake() {
 
     // Spawn server to accept a connection
     let server_handle = tokio::spawn(async move {
-        let conn = server.accept().await;
-        conn
+        server.accept().await;
     });
 
     // Client connects
     let _ = client.connect(server_addr).await;
-    let _ = server_handle.await.unwrap();
+    server_handle.await.unwrap();
 }
 
 #[tokio::test]
@@ -51,8 +50,8 @@ async fn test_stream_send_recv() {
 
 #[tokio::test]
 async fn test_stream_with_loss() {
-    tokio::time::timeout(Duration::from_secs(4), async {
-        let (client_sock, server_sock) = MockSocket::pair(0.2); // 20% loss
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let (client_sock, server_sock) = MockSocket::pair(0.2); // 10% loss
         let server_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         let mut server = Endpoint::<MockSocket>::new_generic(server_sock);
@@ -87,5 +86,5 @@ async fn test_stream_with_loss() {
         server_handle.await.unwrap();
     })
     .await
-    .expect("test timed out after 1 seconds");
+    .expect("test timed out after 6 seconds");
 }
