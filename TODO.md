@@ -1,10 +1,10 @@
 # ACKING
 
-- [ ] Handle receiving packets and acking them
+- [x] Handle receiving packets and acking them
   - [x] Store ack packets
     - Done in ack_manager.rs
   - [x] Include ack frames in packets
-  - [ ] Handle ack timers
+  - [x] Handle ack timers
 
 From Claude:
 Receive side (per packet number space):
@@ -45,7 +45,7 @@ Send side:
 ## Processing Received ACKs (send-side)
 - [x] Record every sent ACK-eliciting packet: number, frames, send timestamp
 - [x] Mark packets as acknowledged when their number appears in a received ACK
-- [ ] Update RTT estimate using send timestamp and `ack_delay` field
+- [x] Update RTT estimate using send timestamp and `ack_delay` field
 - [x] Detect lost packets via packet threshold (3 packets acknowledged after it)
 - [x] Detect lost packets via time threshold (packet sent long enough ago)
 - [x] Re-enqueue frames from lost packets for retransmission
@@ -53,14 +53,14 @@ Send side:
 ## Retransmission
 - [x] Store sent packet info in `BTreeMap<u64, SentPacketInfo>`
 - [x] On loss, retransmit frames (not bytes) in a new packet with a new number
-- [ ] PTO (Probe Timeout) timer: fire after ~3× RTT with no ACK
-- [ ] On PTO, send a probe packet (PING or retransmit unacked data)
-- [ ] Reset PTO timer whenever an ACK is received
+- [x] PTO (Probe Timeout) timer: fire after ~3× RTT with no ACK
+- [x] On PTO, send a probe packet (PING or retransmit unacked data)
+- [x] Reset PTO timer whenever an ACK is received
 
 ## Congestion Control
-- [ ] Track congestion window (`cwnd`)
-- [ ] Track bytes in flight
-- [ ] Slow start: increase `cwnd` on each ACK
-- [ ] Congestion avoidance (AIMD): increase `cwnd` more slowly after threshold
-- [ ] Reduce `cwnd` on loss detection
-- [ ] Block `get_packet` from sending if bytes in flight would exceed `cwnd`
+- [x] Track congestion window (`cwnd`)
+- [x] Track bytes in flight
+- [x] Slow start: increase `cwnd` on each ACK
+- [x] Congestion avoidance (AIMD): increase `cwnd` more slowly after threshold
+- [x] Reduce `cwnd` on loss detection
+- [x] Block `get_packet` from sending if bytes in flight would exceed `cwnd`
