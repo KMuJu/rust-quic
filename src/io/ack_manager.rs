@@ -14,11 +14,16 @@ use crate::io::{
 
 const PACKET_THRESHOLD: u32 = 3;
 
-struct SentPacket {
-    timestamp: Instant,
+pub(super) struct SentPacket {
     frames: Vec<Frame>,
-    sent_bytes: usize,
     in_flight: bool, // if it counts towards congestion
+    pub(super) info: SentPacketInfo,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SentPacketInfo {
+    pub(super) timestamp: Instant,
+    pub(super) sent_bytes: usize,
 }
 
 struct LargestReceived {
@@ -185,13 +190,32 @@ impl Acker {
         }
 
         let sent = SentPacket {
-            timestamp: Instant::now(),
-            sent_bytes: frames.iter().map(|f| f.size()).sum(),
+            info: SentPacketInfo {
+                timestamp: Instant::now(),
+                sent_bytes: frames.iter().map(|f| f.size()).sum(),
+            },
             frames,
             in_flight,
         };
 
         self.sent.insert(pn, sent);
+    }
+
+    pub(super) fn get_lost_in_flight(&self, rtt: &RttEstimator) -> Vec<SentPacketInfo> {
+        let loss_delay = rtt.latest_rtt.max(rtt.smoothed) * 9 / 8;
+        let loss_delay = loss_delay.max(Duration::from_millis(1));
+        let loss_send_time = Instant::now() - loss_delay;
+        let lost: Vec<_> = self
+            .sent
+            .iter()
+            .filter(|&(pn, s)| {
+                s.in_flight && *pn <= self.largest_acked && s.info.timestamp <= loss_send_time
+                    || self.largest_acked > pn + PACKET_THRESHOLD
+            })
+            .map(|(_, s)| s.info)
+            .collect();
+
+        lost
     }
 
     pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator) -> Vec<Frame> {
@@ -213,12 +237,12 @@ impl Acker {
             if *pn > self.largest_acked {
                 continue;
             }
-            if s.timestamp <= loss_send_time || self.largest_acked > pn + PACKET_THRESHOLD {
+            if s.info.timestamp <= loss_send_time || self.largest_acked > pn + PACKET_THRESHOLD {
                 lost_pns.push(*pn);
             } else if let Some(deadline) = self.ack_deadline {
-                self.loss_time = Some(deadline.min(s.timestamp + loss_delay));
+                self.loss_time = Some(deadline.min(s.info.timestamp + loss_delay));
             } else {
-                self.loss_time = Some(s.timestamp + loss_delay);
+                self.loss_time = Some(s.info.timestamp + loss_delay);
             }
         }
 
@@ -236,48 +260,19 @@ impl Acker {
         lost
     }
 
-    pub(super) fn get_time_lost_frames(&mut self, lst: Instant, rtt: &RttEstimator) -> Vec<Frame> {
-        // TODO: Handle packets lost based on time
-        // time_threshold = max(9/8 * smoothed_rtt, 1ms)
-        // packet is lost if:
-        //   largest_sent_at - packet.sent_at >= time_threshold
-
-        let mut lost = Vec::new();
-        if self.cleared {
-            return lost;
-        }
-
-        let time_threshold = (rtt.smoothed * 9 / 8).max(Duration::from_micros(1));
-        let time_lost: Vec<u32> = self
-            .sent
-            .iter()
-            .filter(|&(pn, s)| *pn < self.largest_acked && s.timestamp + time_threshold <= lst)
-            .map(|(pn, _)| *pn)
-            .collect();
-
-        for pn in time_lost {
-            let sent = self.sent.remove(&pn).unwrap();
-            for frame in sent.frames {
-                lost.push(frame);
-            }
-        }
-
-        lost
-    }
-
-    pub(super) fn acked(&mut self, packet_number: u32) {
+    pub(super) fn acked(&mut self, packet_number: u32) -> Option<SentPacketInfo> {
         if self.largest_acked == u32::MAX {
             self.largest_acked = packet_number;
         } else {
             self.largest_acked = self.largest_acked.max(packet_number);
         }
-        self.sent.remove(&packet_number);
+        self.sent.remove(&packet_number).map(|s| s.info)
     }
 
     /// Returns the timestamp if it is present
     /// If it is present, then that means that it is ack-eliciting
     pub(super) fn sent_timestamp(&self, packet_number: u32) -> Option<Instant> {
-        self.sent.get(&packet_number).map(|s| s.timestamp)
+        self.sent.get(&packet_number).map(|s| s.info.timestamp)
     }
 
     pub(super) fn unacked_frame(&self) -> Option<Frame> {
@@ -296,7 +291,7 @@ impl Acker {
     }
 
     pub(super) fn earliest_sent(&self) -> Option<Instant> {
-        self.sent.values().map(|s| s.timestamp).min()
+        self.sent.values().map(|s| s.info.timestamp).min()
     }
 
     pub(super) fn has_packet_in_flight(&self) -> bool {

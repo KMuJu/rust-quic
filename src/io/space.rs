@@ -4,6 +4,7 @@ use tokio::time::Instant;
 
 use crate::io::{
     ack_manager::Acker,
+    congestion::CongestionController,
     encoding::VarInt,
     frame::{AckRange, EcnCounts, Frame},
     rtt_estimator::RttEstimator,
@@ -39,7 +40,7 @@ pub(super) struct Space {
     discarded: bool,
     pub(super) acker: Acker,
     pub(super) pending_frames: VecDeque<Frame>,
-    packet_number: usize,
+    pub(super) packet_number: usize,
     transport_params: SharedConfig,
 }
 
@@ -55,7 +56,12 @@ impl Space {
         }
     }
 
-    pub(super) fn handle_frame(&mut self, frame: Frame, rtt: &RttEstimator) -> Option<SpaceEvent> {
+    pub(super) fn handle_frame(
+        &mut self,
+        frame: Frame,
+        rtt: &RttEstimator,
+        congestion: &mut CongestionController,
+    ) -> Option<SpaceEvent> {
         if self.discarded {
             return None;
         }
@@ -88,7 +94,15 @@ impl Space {
                 ranges,
                 ecn,
             } => {
-                return self.handle_ack_frame(largest, delay, first_range, ranges, ecn, rtt);
+                return self.handle_ack_frame(
+                    largest,
+                    delay,
+                    first_range,
+                    ranges,
+                    ecn,
+                    rtt,
+                    congestion,
+                );
             }
             Frame::NewToken { .. } => todo!(),
             Frame::MaxData { .. } => todo!(),
@@ -120,6 +134,7 @@ impl Space {
         ranges: &Vec<AckRange>,
         ecn: &Option<EcnCounts>,
         rtt: &RttEstimator,
+        congestion: &mut CongestionController,
     ) -> Option<SpaceEvent> {
         let mut acked = Vec::new();
         let mut current = largest.0;
@@ -143,8 +158,13 @@ impl Space {
 
         let largest_sent_at = self.acker.sent_timestamp(largest.0 as u32);
         for ack in acked {
-            self.acker.acked(ack);
+            if let Some(sent) = self.acker.acked(ack) {
+                congestion.on_ack(sent.sent_bytes as u64, sent.timestamp);
+            }
         }
+
+        let lost_sent = self.acker.get_lost_in_flight(rtt);
+        congestion.on_loss(&lost_sent, rtt);
 
         let lost = self.acker.get_lost_frames(rtt);
         self.add_lost_to_pending(lost);
@@ -166,7 +186,7 @@ impl Space {
     }
 
     pub(super) fn discard(&mut self) {
-        self.discarded = false;
+        self.discarded = true;
         self.acker.clear();
         self.pending_frames = VecDeque::new();
     }

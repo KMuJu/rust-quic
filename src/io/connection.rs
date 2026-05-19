@@ -23,6 +23,7 @@ use tokio::{
 
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
+    congestion::CongestionController,
     crypto::CryptoFrame,
     endpoint::EndpointRef,
     frame::Frame,
@@ -73,6 +74,8 @@ pub struct ConnectionInner {
     transport_params: SharedConfig,
     rtt: RttEstimator,
     pto_backoff: u32,
+
+    congestion: CongestionController,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -148,7 +151,10 @@ impl ConnectionInner {
                 }
                 let mut events = Vec::new();
                 for frame in packet.frames {
-                    if let Some(event) = self.data_space.handle_frame(frame, &self.rtt) {
+                    if let Some(event) =
+                        self.data_space
+                            .handle_frame(frame, &self.rtt, &mut self.congestion)
+                    {
                         events.push(event);
                     }
                 }
@@ -191,11 +197,13 @@ impl ConnectionInner {
                 }
             }
             Header::Initial { .. } => {
-                let is_client_hello = packet.is_client_hello();
                 let mut events = Vec::new();
                 // Handle initial frames in order to do acks
                 for frame in packet.frames {
-                    if let Some(event) = self.initial_space.handle_frame(frame, &self.rtt) {
+                    if let Some(event) =
+                        self.initial_space
+                            .handle_frame(frame, &self.rtt, &mut self.congestion)
+                    {
                         events.push(event);
                     }
                 }
@@ -242,7 +250,10 @@ impl ConnectionInner {
             Header::Handshake { .. } => {
                 let mut events = Vec::new();
                 for frame in packet.frames {
-                    if let Some(event) = self.handshake_space.handle_frame(frame, &self.rtt) {
+                    if let Some(event) =
+                        self.handshake_space
+                            .handle_frame(frame, &self.rtt, &mut self.congestion)
+                    {
                         events.push(event);
                     }
                 }
@@ -324,7 +335,7 @@ impl ConnectionInner {
     }
 
     fn add_lost_to_pending(&mut self, space: PacketSpace, lost: Vec<Frame>) {
-        println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
+        // println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
         for frame in lost {
             // Only retransmitt stream frames for send streams that has not sent reset
             if let Frame::Stream { id, .. } = &frame {
@@ -417,6 +428,39 @@ impl ConnectionInner {
     }
 
     fn get_packet(&mut self, p_space: PacketSpace, mut mtu: usize) -> Option<Packet> {
+        // println!("[ACK]: Getting packet for {p_space:?}");
+        let pn = PacketNumber::from(self.space(p_space).packet_number);
+
+        let header = match p_space {
+            PacketSpace::Initial => Header::Initial {
+                dst_cid: self.peer_cid,
+                src_cid: self.id,
+                packet_number: pn,
+                version: 0,
+                token: None,
+                length: VarInt(0),
+            },
+            PacketSpace::Handshake => Header::Handshake {
+                dst_cid: self.peer_cid,
+                src_cid: self.id,
+                packet_number: pn,
+                version: 0,
+                length: VarInt(0),
+            },
+            PacketSpace::Data => Header::Short {
+                spin: false,
+                key_phase: false,
+                dst_cid: self.peer_cid,
+                packet_number: pn,
+            },
+        };
+
+        let size = header.size();
+        if mtu < size {
+            return None;
+        }
+        mtu -= size;
+
         let mut frames = Vec::new();
 
         while let Some(frame) = self.space_mut(p_space).pending_frames.front() {
@@ -480,6 +524,7 @@ impl ConnectionInner {
         }
 
         if frames.is_empty() {
+            // println!("[ACK]({p_space:?}) no frames to send");
             return None;
         }
 
@@ -488,36 +533,11 @@ impl ConnectionInner {
             *fin = true
         };
 
-        let pn = PacketNumber::from(self.space_mut(p_space).new_packet_num());
-
-        let header = match p_space {
-            PacketSpace::Initial => Header::Initial {
-                dst_cid: self.peer_cid,
-                src_cid: self.id,
-                packet_number: pn,
-                version: 0,
-                token: None,
-                length: VarInt(0),
-            },
-            PacketSpace::Handshake => Header::Handshake {
-                dst_cid: self.peer_cid,
-                src_cid: self.id,
-                packet_number: pn,
-                version: 0,
-                length: VarInt(0),
-            },
-            PacketSpace::Data => Header::Short {
-                spin: false,
-                key_phase: false,
-                dst_cid: self.peer_cid,
-                packet_number: pn,
-            },
-        };
-
         // println!("Sending frames({space:?}): {frames:?}");
 
         let packet = Packet { header, frames };
 
+        self.space_mut(p_space).packet_number += 1;
         Some(packet)
     }
 
@@ -609,6 +629,7 @@ impl Connection {
             pto_backoff: 0,
             transport_params: transport_params.clone(),
             rtt: RttEstimator::new(),
+            congestion: CongestionController::new(transport_params.clone()),
         }));
         let driver = ConnectionDriver {
             inner: inner.clone(),
@@ -811,6 +832,11 @@ impl Future for ConnectionDriver {
             println!("Loss fired in: {:?}", inner.side);
             for space in PacketSpace::iter() {
                 let rtt = &inner.rtt.clone();
+
+                // Handle congestion
+                let lost_in_flight = inner.space(space).acker.get_lost_in_flight(rtt);
+                inner.congestion.on_loss(lost_in_flight.as_slice(), rtt);
+
                 let lost = inner.space_mut(space).acker.get_lost_frames(rtt);
                 if !lost.is_empty() {
                     println!(
@@ -818,6 +844,7 @@ impl Future for ConnectionDriver {
                         inner.side
                     );
                 }
+
                 inner.add_lost_to_pending(space, lost);
             }
         }
@@ -825,6 +852,7 @@ impl Future for ConnectionDriver {
         if pto_fired {
             let mut inner = this.inner.lock().unwrap();
             let p_space = inner.pto_space();
+            println!("PTO fired in: {:?}", p_space);
             let pto_frame = inner.build_pto_probe(p_space);
             inner.space_mut(p_space).pending_frames.push_back(pto_frame);
             inner.pto_backoff += 1;
@@ -834,9 +862,19 @@ impl Future for ConnectionDriver {
             let mut conn = this.inner.lock().unwrap();
             let mut pkts = Vec::new();
 
-            for space in PacketSpace::iter() {
-                while let Some(p) = conn.get_packet(space, 1200) {
-                    pkts.push(p);
+            let mtu = 1200;
+            for p_space in PacketSpace::iter() {
+                if conn.space(p_space).is_discarded() {
+                    continue;
+                }
+                while let Some(packet) = {
+                    let available = conn.congestion.available_space();
+                    // println!("[ACK]({p_space:?}) Available: {available:?}");
+                    conn.get_packet(p_space, mtu.min(available))
+                } {
+                    // println!("[ACK]({p_space:?}) got packet");
+                    conn.congestion.on_packet_sent(packet.size() as u64);
+                    pkts.push(packet);
                 }
             }
             pkts
@@ -870,6 +908,12 @@ impl Future for ConnectionDriver {
                     addr: this.addr,
                 })
                 .unwrap();
+
+            // this.inner
+            //     .lock()
+            //     .unwrap()
+            //     .congestion
+            //     .on_packet_sent(size as u64);
         }
 
         let deadline = this.inner.lock().unwrap().next_ack_deadline();

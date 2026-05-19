@@ -1,22 +1,38 @@
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 #[derive(Clone)]
 pub(super) struct RttEstimator {
-    first: bool,
     pub(super) smoothed: Duration,
     pub(super) variance: Duration,
     pub(super) min_rtt: Duration,
     pub(super) latest_rtt: Duration,
+    pub(super) first_rtt: Option<Instant>,
 }
 
 impl RttEstimator {
     pub(super) fn new() -> Self {
         Self {
-            first: true,
             smoothed: Duration::from_millis(333),
             variance: Duration::from_millis(166),
-            min_rtt: Duration::new(0, 0),
-            latest_rtt: Duration::from_secs(0),
+            min_rtt: Duration::ZERO,
+            latest_rtt: Duration::ZERO,
+            first_rtt: None,
+        }
+    }
+
+    pub(super) fn new_params(
+        smoothed: Duration,
+        variance: Duration,
+        first_rtt: Option<Instant>,
+    ) -> Self {
+        Self {
+            smoothed,
+            variance,
+            min_rtt: Duration::ZERO,
+            latest_rtt: Duration::ZERO,
+            first_rtt,
         }
     }
 
@@ -28,8 +44,8 @@ impl RttEstimator {
         handshake_done: bool,
     ) {
         self.latest_rtt = latest_rtt;
-        if self.first {
-            self.first = false;
+        if self.first_rtt.is_none() {
+            self.first_rtt = Some(Instant::now());
             self.min_rtt = latest_rtt;
             self.smoothed = latest_rtt;
             self.variance = latest_rtt / 2;
