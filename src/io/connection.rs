@@ -383,7 +383,7 @@ impl ConnectionInner {
         self.spaces().filter_map(|s| s.acker.get_deadline()).min()
     }
 
-    fn get_earliest_loss_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
+    fn get_loss_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
         self.spaces()
             .filter_map(|s| Some((s.acker.get_loss_time()?, s.space)))
             .min_by_key(|(time, _)| *time)
@@ -410,7 +410,7 @@ impl ConnectionInner {
     /// - Received ack
     /// - Packet sent
     fn set_loss_timer(&mut self) {
-        let earliest = self.get_earliest_loss_time_and_space();
+        let earliest = self.get_loss_time_and_space();
 
         if let Some((deadline, _)) = earliest {
             println!("[TIMER] Set loss detection timer");
@@ -494,7 +494,7 @@ impl ConnectionInner {
                 Timer::LossDetection => {
                     println!("[TIMER] Loss detection timer fired");
                     let rtt = &self.rtt.clone();
-                    if let Some((_, p_space)) = self.get_earliest_loss_time_and_space() {
+                    if let Some((_, p_space)) = self.get_loss_time_and_space() {
                         let lost = self.space_mut(p_space).acker.get_lost_frames(rtt);
                         self.congestion.on_loss(lost.as_slice(), rtt);
                         let lost_frames: Vec<_> =
@@ -519,7 +519,9 @@ impl ConnectionInner {
                         let p_space = self.pto_space();
                         println!("[TIMER] PTO fired in: {:?}", p_space);
                         let pto_frames = self.build_pto_probe(p_space);
-                        self.space_mut(p_space).pending_frames.push_back(pto_frames);
+                        self.space_mut(p_space)
+                            .pending_frames
+                            .extend(pto_frames.into_iter());
                     }
                     self.pto_count += 1;
                     self.set_loss_timer();
@@ -626,7 +628,6 @@ impl ConnectionInner {
         }
 
         if frames.is_empty() {
-            // println!("[ACK]({p_space:?}) no frames to send");
             return None;
         }
 
@@ -635,22 +636,18 @@ impl ConnectionInner {
             *fin = true
         };
 
-        // println!("Sending frames({space:?}): {frames:?}");
-
         let packet = Packet { header, frames };
 
         self.space_mut(p_space).packet_number += 1;
         Some(packet)
     }
 
-    fn build_pto_probe(&mut self, p_space: PacketSpace) -> Frame {
-        let unacked = self.space_mut(p_space).acker.unacked_frame();
-        // if unacked.is_empty() {
-        //     unacked
-        if let Some(unacked) = unacked {
+    fn build_pto_probe(&mut self, p_space: PacketSpace) -> Vec<Frame> {
+        let unacked = self.space_mut(p_space).acker.unacked_frames();
+        if !unacked.is_empty() {
             unacked
         } else {
-            Frame::Ping
+            vec![Frame::Ping]
         }
     }
 
@@ -975,7 +972,9 @@ impl Future for ConnectionDriver {
                     is_ack_eliciting,
                 );
 
-            this.inner.lock().unwrap().set_loss_timer();
+            if is_in_flight {
+                this.inner.lock().unwrap().set_loss_timer();
+            }
         }
 
         // Rearm timer

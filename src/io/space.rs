@@ -88,7 +88,7 @@ impl Space {
                     data: data.clone(),
                 });
             }
-            Frame::Padding => todo!(),
+            Frame::Padding => {}
             Frame::Ping => {
                 if let Some(ack) = self.acker.get_ack() {
                     self.pending_frames.push_back(ack);
@@ -102,11 +102,11 @@ impl Space {
                 ecn,
             } => {
                 return self.handle_ack_frame(
-                    &largest,
-                    &delay,
-                    &first_range,
-                    &ranges,
-                    &ecn,
+                    largest,
+                    delay,
+                    first_range,
+                    ranges,
+                    ecn,
                     rtt,
                     congestion,
                 );

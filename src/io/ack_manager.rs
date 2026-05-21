@@ -94,7 +94,7 @@ impl Acker {
                     println!("Eliciting packet count >= 2: NEED TO SEND ACK");
                 }
                 if self.ack_deadline.is_none() {
-                    self.ack_deadline = Some(Instant::now() + Duration::from_millis(25));
+                    self.ack_deadline = Some(Instant::now() + self.transport_params.max_ack_delay);
                 }
             }
 
@@ -255,11 +255,12 @@ impl Acker {
         self.sent.remove(&packet_number)
     }
 
-    pub(super) fn unacked_frame(&self) -> Option<Frame> {
+    pub(super) fn unacked_frames(&self) -> Vec<Frame> {
         self.sent
             .values()
             .find(|&s| s.in_flight && s.ack_eliciting)
-            .and_then(|s| s.frames.first().cloned())
+            .map(|s| s.frames.clone())
+            .unwrap_or(Vec::new())
     }
 
     pub(super) fn clear(&mut self) {
