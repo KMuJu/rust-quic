@@ -9,7 +9,11 @@ use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::io::{connection::ConnectionInner, frame::Frame, frame_assembler::FrameAssembler};
+use crate::io::{
+    connection::ConnectionInner,
+    frame::{Frame, StreamData},
+    frame_assembler::FrameAssembler,
+};
 
 #[derive(Debug, Clone)]
 pub enum Dir {
@@ -71,13 +75,13 @@ impl RecvStream {
         match frame {
             Frame::ResetStream { .. } => todo!(),
             Frame::StopSending { .. } => todo!(),
-            Frame::Stream {
+            Frame::Stream(StreamData {
                 id: _,
                 fin,
                 len: _,
                 offset,
                 data,
-            } => {
+            }) => {
                 // TODO: Handle fin bit
                 if matches!(self.state, RecvState::Recv | RecvState::SizeKnown) {
                     self.assembler.add(data, offset.0);

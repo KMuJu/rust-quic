@@ -64,13 +64,7 @@ pub(super) enum Frame {
     NewToken {
         token: Token,
     },
-    Stream {
-        id: StreamID,
-        fin: bool,
-        len: bool, // true if length field is present
-        offset: VarInt,
-        data: Bytes,
-    },
+    Stream(StreamData),
     MaxData {
         max_data: VarInt,
     },
@@ -321,13 +315,13 @@ impl Frame {
                     buf.copy_to_bytes(buf.remaining())
                 };
 
-                Ok(Frame::Stream {
+                Ok(Frame::Stream(StreamData {
                     id,
                     fin,
                     len,
                     offset,
                     data,
-                })
+                }))
             }
             _ => Err(FrameDecodeError::InvalidFrameType),
         }
@@ -391,13 +385,13 @@ impl Frame {
                 VarInt(token.0.len() as u64).encode(buf)?;
                 buf.put_slice(&token.0);
             }
-            Frame::Stream {
+            Frame::Stream(StreamData {
                 id,
                 fin,
                 len,
                 offset,
                 data,
-            } => {
+            }) => {
                 let t = 0b00001000
                     + (if offset.0 > 0 { 0x4 } else { 0 })
                     + (if *len { 0x2 } else { 0 })
@@ -511,7 +505,7 @@ impl Frame {
     pub(super) fn stream_id(&self) -> Option<StreamID> {
         match self {
             Self::ResetStream { id, .. }
-            | Self::Stream { id, .. }
+            | Self::Stream(StreamData { id, .. })
             | Self::StopSending { id, .. }
             | Self::MaxStreamData { id, .. }
             | Self::StreamDataBlocked { id, .. } => Some(id.clone()),
@@ -570,13 +564,13 @@ impl Frame {
                 t + o + l + d
             }
             NewToken { token } => todo!(),
-            Stream {
+            Stream(StreamData {
                 id,
                 fin,
                 len,
                 offset,
                 data,
-            } => {
+            }) => {
                 let i = variable_length(id.value() as u64);
                 let o = if offset.0 != 0 { offset.length() } else { 0 };
 
@@ -650,6 +644,15 @@ impl Frame {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct StreamData {
+    pub(super) id: StreamID,
+    pub(super) fin: bool,
+    pub(super) len: bool, // true if length field is present
+    pub(super) offset: VarInt,
+    pub(super) data: Bytes,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct AckRange {
     pub(super) gap: VarInt,
@@ -710,13 +713,13 @@ mod test {
 
     #[test]
     fn encode_decode_stream_frame() {
-        let stream = Frame::Stream {
+        let stream = Frame::Stream(StreamData {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: true,
             offset: VarInt(3),
             data: Bytes::from_static(&[0xff, 0xff, 0xff]),
-        };
+        });
 
         let mut encoded = Vec::new();
 
@@ -733,18 +736,12 @@ mod test {
         println!("Start: {:?}", stream);
         println!("Final: {:?}", output_stream);
         match output_stream {
-            Frame::Stream {
-                id,
-                fin,
-                len: last,
-                offset,
-                data,
-            } => {
-                assert_eq!(id.value(), 1);
-                assert!(!fin);
-                assert!(last);
-                assert_eq!(offset.0, 3);
-                assert_eq!(data, Bytes::from_static(&[0xff, 0xff, 0xff]));
+            Frame::Stream(stream) => {
+                assert_eq!(stream.id.value(), 1);
+                assert!(!stream.fin);
+                assert!(stream.len);
+                assert_eq!(stream.offset.0, 3);
+                assert_eq!(stream.data, Bytes::from_static(&[0xff, 0xff, 0xff]));
             }
             _ => panic!("Got wrong frame type"),
         }
@@ -796,13 +793,13 @@ mod test {
         for _ in 0..3 {
             let data = Bytes::from_static(b"hello world");
             let data_len = data.len();
-            let frame = Frame::Stream {
+            let frame = Frame::Stream(StreamData {
                 id: StreamID::new_unchecked(1),
                 fin: false,
                 len: true,
                 offset: VarInt(offset),
                 data,
-            };
+            });
 
             offset += data_len as u64;
 
@@ -822,13 +819,13 @@ mod test {
 
     #[test]
     fn test_stream_size() {
-        let frame = Frame::Stream {
+        let frame = Frame::Stream(StreamData {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: false,
             offset: VarInt(0),
             data: Bytes::new(),
-        };
+        });
         let mut encoded = Vec::new();
         frame
             .encode(&mut encoded)

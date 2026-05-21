@@ -3,7 +3,7 @@ use std::{f64, time::Duration};
 use tokio::time::Instant;
 
 use crate::io::{
-    ack_manager::SentPacketInfo, rtt_estimator::RttEstimator, transport_parameters::SharedConfig,
+    ack_manager::SentPacket, rtt_estimator::RttEstimator, transport_parameters::SharedConfig,
 };
 
 const MAXIMUM_DATAGRAM_SIZE: u64 = 1200;
@@ -52,7 +52,7 @@ impl CongestionController {
         }
     }
 
-    pub(super) fn on_loss(&mut self, packets: &[SentPacketInfo], rtt: &RttEstimator) {
+    pub(super) fn on_loss(&mut self, packets: &[SentPacket], rtt: &RttEstimator) {
         if packets.is_empty() {
             return;
         }
@@ -100,7 +100,7 @@ impl CongestionController {
         false
     }
 
-    fn in_persistent_congestion(&self, lost: &[&SentPacketInfo], rtt: &RttEstimator) -> bool {
+    fn in_persistent_congestion(&self, lost: &[&SentPacket], rtt: &RttEstimator) -> bool {
         if lost.len() < 2 {
             return false;
         }
@@ -151,10 +151,14 @@ mod tests {
         RttEstimator::new_params(smoothed, variance, first_rtt)
     }
 
-    fn make_packet(timestamp: Instant, sent_bytes: usize) -> SentPacketInfo {
-        SentPacketInfo {
+    fn make_packet(timestamp: Instant, sent_bytes: usize) -> SentPacket {
+        SentPacket {
+            frames: Vec::new(),
+            pn: 0,
             timestamp,
             sent_bytes,
+            ack_eliciting: true,
+            in_flight: true,
         }
     }
 

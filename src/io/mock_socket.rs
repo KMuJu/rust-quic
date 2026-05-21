@@ -1,5 +1,6 @@
 pub mod mock {
     use std::{
+        cell::RefCell,
         collections::VecDeque,
         io,
         net::SocketAddr,
@@ -8,6 +9,7 @@ pub mod mock {
     };
 
     use futures::task::AtomicWaker;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use crate::io::socket::Socket;
 
@@ -19,10 +21,11 @@ pub mod mock {
         recv_waker: Arc<AtomicWaker>,
         send_waker: Arc<AtomicWaker>,
         loss_rate: f64,
+        rng: RefCell<StdRng>,
     }
 
     impl MockSocket {
-        pub fn pair(loss_rate: f64) -> (MockSocket, MockSocket) {
+        pub fn pair(loss_rate: f64, seed: u64) -> (MockSocket, MockSocket) {
             let a_to_b = Arc::new(Mutex::new(VecDeque::new()));
             let b_to_a = Arc::new(Mutex::new(VecDeque::new()));
             let waker_a = Arc::new(AtomicWaker::new());
@@ -34,6 +37,7 @@ pub mod mock {
                 recv_waker: waker_a.clone(),
                 send_waker: waker_b.clone(),
                 loss_rate,
+                rng: RefCell::new(StdRng::seed_from_u64(seed)),
             };
             let b = MockSocket {
                 incoming: a_to_b.clone(),
@@ -41,6 +45,7 @@ pub mod mock {
                 recv_waker: waker_b.clone(),
                 send_waker: waker_a.clone(),
                 loss_rate,
+                rng: RefCell::new(StdRng::seed_from_u64(seed)),
             };
             (a, b)
         }
@@ -67,7 +72,9 @@ pub mod mock {
             buf: &[u8],
             addr: SocketAddr,
         ) -> Poll<io::Result<usize>> {
-            if rand::random::<f64>() >= self.loss_rate {
+            let mut rng = self.rng.borrow_mut();
+            let roll = rng.random::<f64>();
+            if roll >= self.loss_rate {
                 self.outgoing
                     .lock()
                     .unwrap()
@@ -90,7 +97,7 @@ pub mod mock {
 
         #[tokio::test]
         async fn test_mock_socket_send_recv() {
-            let (a, b) = MockSocket::pair(0.0); // no loss
+            let (a, b) = MockSocket::pair(0.0, 42); // no loss
             let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
             // Send from a
@@ -111,7 +118,7 @@ pub mod mock {
 
         #[tokio::test]
         async fn test_mock_socket_loss() {
-            let (a, b) = MockSocket::pair(1.0); // 100% loss
+            let (a, b) = MockSocket::pair(1.0, 42); // 100% loss
             let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
             poll_fn(|cx| a.poll_send_to(cx, b"hello", addr))
@@ -124,7 +131,7 @@ pub mod mock {
 
         #[tokio::test]
         async fn test_mock_socket_bidirectional() {
-            let (a, b) = MockSocket::pair(0.0);
+            let (a, b) = MockSocket::pair(0.0, 42);
             let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
             // a -> b
@@ -152,7 +159,7 @@ pub mod mock {
 
         #[tokio::test]
         async fn test_mock_socket_waking() {
-            let (a, b) = MockSocket::pair(0.0); // no loss
+            let (a, b) = MockSocket::pair(0.0, 42); // no loss
             let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
             // Send from a
