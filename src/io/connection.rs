@@ -424,12 +424,12 @@ impl ConnectionInner {
             return;
         }
 
-        let (pto, _) = self.pto_deadline().unwrap();
+        let (pto, _) = self.get_pto_time_and_space().unwrap();
         // println!("[TIMER] Set PTO detection timer: {pto:?}");
         self.timers.set(Timer::LossDetection, pto);
     }
 
-    fn pto_deadline(&self) -> Option<(Instant, PacketSpace)> {
+    fn get_pto_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
         let duration = (self.rtt.smoothed + (self.rtt.variance * 4).max(Duration::from_millis(1)))
             * 2u32.pow(self.pto_count);
 
@@ -994,5 +994,353 @@ impl Future for ConnectionDriver {
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use bytes::{BufMut, Bytes};
+    use futures::task::noop_waker_ref;
+
+    use crate::io::ack_manager::Acker;
+
+    use super::*;
+
+    fn create_connection(
+        sender: oneshot::Sender<()>,
+        transport_params: SharedConfig,
+    ) -> ConnectionInner {
+        ConnectionInner {
+            id: ConnectionID {
+                len: 1,
+                buf: [0; 20],
+            },
+            peer_cid: ConnectionID {
+                len: 1,
+                buf: [0; 20],
+            },
+            side: Side::Server,
+            connected: Some(sender),
+            state: PacketSpace::Initial,
+            recv: HashMap::new(),
+            send: HashMap::new(),
+            bidir_acceptable: VecDeque::new(),
+            bidir_accept_waker: AtomicWaker::new(),
+            unidir_acceptable: VecDeque::new(),
+            unidir_accept_waker: AtomicWaker::new(),
+            pending_recv: VecDeque::new(),
+            pending_send: VecDeque::new(),
+            write_waker: AtomicWaker::new(),
+            stream_number: 0,
+            initial_space: Space::new(PacketSpace::Initial, transport_params.clone()),
+            handshake_space: Space::new(PacketSpace::Handshake, transport_params.clone()),
+            data_space: Space::new(PacketSpace::Data, transport_params.clone()),
+            transport_params: transport_params.clone(),
+            rtt: RttEstimator::new(),
+            pto_count: 0,
+            congestion: CongestionController::new(transport_params),
+            timers: TimerTable::new(),
+        }
+    }
+
+    fn create_packet(
+        p_space: PacketSpace,
+        dst_cid: ConnectionID,
+        src_cid: ConnectionID,
+        pn: PacketNumber,
+        frames: Vec<Frame>,
+    ) -> Bytes {
+        let header = match p_space {
+            PacketSpace::Initial => Header::Initial {
+                dst_cid,
+                src_cid,
+                packet_number: pn,
+                version: 0,
+                token: None,
+                length: VarInt(0),
+            },
+            PacketSpace::Handshake => Header::Handshake {
+                dst_cid,
+                src_cid,
+                packet_number: pn,
+                version: 0,
+                length: VarInt(0),
+            },
+            PacketSpace::Data => Header::Short {
+                spin: false,
+                key_phase: false,
+                dst_cid,
+                packet_number: pn,
+            },
+        };
+
+        let packet = Packet { header, frames };
+        let mut buf = BytesMut::new();
+        packet.encode(&mut buf).unwrap();
+        buf.freeze()
+    }
+
+    fn get_packet(conn: &mut ConnectionInner, p_space: PacketSpace, mtu: usize) -> Packet {
+        let Some(resp) = conn.get_packet(p_space, mtu) else {
+            panic!("Could not get packet from {p_space:?} of mtu={mtu:?}");
+        };
+        resp
+    }
+
+    // TODO: Will have to update when the handshake updates
+    fn server_initial_state(conn: &mut ConnectionInner) {
+        let crypto_data = CryptoFrame::ClientHello;
+        let mut c_data = Vec::new();
+        crypto_data.encode(&mut c_data);
+        let crypto_frame = Frame::Crypto {
+            offset: VarInt(0),
+            data: c_data,
+        };
+
+        let packet = create_packet(
+            PacketSpace::Initial,
+            conn.peer_cid,
+            conn.id,
+            PacketNumber::U8(0),
+            vec![crypto_frame],
+        );
+
+        conn.handle_datagram(&packet);
+
+        let Some(resp) = conn.get_packet(PacketSpace::Handshake, 1200) else {
+            panic!("Could not get handshake packet after ClientHello");
+        };
+
+        assert!(matches!(resp.header, Header::Handshake { .. }));
+        assert!(matches!(conn.state, PacketSpace::Handshake));
+    }
+
+    // TODO: Will have to update when the handshake updates
+    fn server_handshake_state(conn: &mut ConnectionInner) {
+        let crypto_data = CryptoFrame::Finished;
+        let mut c_data = Vec::new();
+        crypto_data.encode(&mut c_data);
+        let crypto_frame = Frame::Crypto {
+            offset: VarInt(0),
+            data: c_data,
+        };
+        let packet = create_packet(
+            PacketSpace::Handshake,
+            conn.peer_cid,
+            conn.id,
+            PacketNumber::U8(0),
+            vec![crypto_frame],
+        );
+
+        conn.handle_datagram(&packet);
+
+        let Some(resp) = conn.get_packet(PacketSpace::Data, 1200) else {
+            panic!("Could not get Handshake packet after Finished frame");
+        };
+
+        assert!(matches!(resp.header, Header::Short { .. }));
+        assert!(matches!(conn.state, PacketSpace::Data));
+        assert!(conn.handshake_is_done());
+    }
+
+    fn open_bidir(conn: &mut ConnectionInner) -> StreamID {
+        let id = StreamID::new(conn.stream_number, &conn.side, Dir::Bidir);
+        conn.stream_number += 1;
+        let recv = RecvStream::new(id.clone());
+        let send = SendStream::new(id.clone());
+
+        conn.recv.insert(id.clone(), recv);
+        conn.send.insert(id.clone(), send);
+
+        id
+    }
+
+    fn send_stream_data_to(conn: &mut ConnectionInner, id: StreamID, data: Bytes, pn: &mut u8) {
+        let frame = Frame::Stream(StreamData {
+            id,
+            fin: false,
+            len: false,
+            offset: VarInt(0),
+            data,
+        });
+
+        let packet = create_packet(
+            PacketSpace::Data,
+            conn.peer_cid,
+            conn.id,
+            PacketNumber::U8(*pn),
+            vec![frame],
+        );
+        *pn += 1;
+
+        conn.handle_datagram(&packet);
+    }
+
+    fn send_stream_data_from(conn: &mut ConnectionInner, id: StreamID, data: Bytes) -> Packet {
+        let Some(send) = conn.send(&id) else {
+            panic!("Could not find send stream with id={id:?}");
+        };
+
+        send.set_buffer(&data);
+        println!("Wrote to send buffer");
+        conn.pending_send.push_back(id);
+
+        let packet = get_packet(conn, PacketSpace::Data, 1200);
+
+        conn.space_mut(PacketSpace::Data).acker.sent_packet(
+            packet.packet_number().clone(),
+            packet.frames.clone(),
+            packet.is_in_flight(),
+            packet.is_ack_eliciting(),
+        );
+
+        if packet.is_in_flight() {
+            conn.set_loss_timer();
+        }
+
+        conn.congestion.on_packet_sent(packet.size() as u64);
+
+        packet
+    }
+
+    fn send_ack_to(conn: &mut ConnectionInner, acker: &mut Acker, pn: &mut u8) {
+        let frame = acker.get_ack().expect("Acker should not be cleared");
+
+        let packet = create_packet(
+            PacketSpace::Data,
+            conn.peer_cid,
+            conn.id,
+            PacketNumber::U8(*pn),
+            vec![frame],
+        );
+
+        *pn += 1;
+
+        conn.handle_datagram(&packet);
+    }
+
+    #[test]
+    fn test_handshake() {
+        let (sender, mut receiver) = oneshot::channel();
+        let transport_params = Arc::new(TransportParam::new());
+        let mut connection = create_connection(sender, transport_params);
+
+        server_initial_state(&mut connection);
+        server_handshake_state(&mut connection);
+
+        {
+            // Checking if it notified the oneshot channel
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(Pin::new(&mut receiver).poll(&mut cx).is_ready());
+            assert!(connection.handshake_is_done());
+        }
+    }
+
+    #[test]
+    fn test_maxackdelay_timer() {
+        let (sender, _receiver) = oneshot::channel();
+        let transport_params = Arc::new(TransportParam::new());
+        let mut connection = create_connection(sender, transport_params.clone());
+        let mut pn = 0u8;
+        server_initial_state(&mut connection);
+        server_handshake_state(&mut connection);
+
+        let id = open_bidir(&mut connection);
+        send_stream_data_to(
+            &mut connection,
+            id.clone(),
+            Bytes::from_static(&[1, 2, 3, 4, 5]),
+            &mut pn,
+        );
+
+        // MaxAckDelay
+        let next = connection.next_deadline();
+        assert_eq!(next, connection.next_ack_deadline());
+
+        let resp = get_packet(&mut connection, PacketSpace::Data, 1200);
+
+        // Should only respond with an ack
+        assert!(resp.frames.iter().all(|f| matches!(f, Frame::Ack { .. })));
+
+        // Sent ack, so should be no MaxAckDelay deadline
+        // No ack eliciting or in flight packets, so loss deadline should be None
+        let next = connection.next_deadline();
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn test_loss_timer() {
+        let (sender, _receiver) = oneshot::channel();
+        let transport_params = Arc::new(TransportParam::new());
+        let mut connection = create_connection(sender, transport_params.clone());
+        let mut acker = Acker::new(transport_params);
+        let mut pn = 0u8;
+        server_initial_state(&mut connection);
+        server_handshake_state(&mut connection);
+
+        let id = open_bidir(&mut connection);
+        // Sending one stream packets and acking
+        let sending_bytes = Bytes::from_static(&[1, 2, 3, 4, 5]);
+        let sent_packet = send_stream_data_from(&mut connection, id.clone(), sending_bytes.clone());
+        acker.received(sent_packet.packet_number(), sent_packet.is_ack_eliciting());
+
+        // Testing loss
+        let next = connection.next_deadline();
+        assert!(next.is_some());
+
+        // The loss should be pto since only no ack has been received
+        let (pto, p_space) = connection.get_pto_time_and_space().unwrap();
+        assert_eq!(next.unwrap(), pto);
+        assert!(matches!(p_space, PacketSpace::Data));
+
+        // Conn sends two packets
+        let sending_bytes = Bytes::from_static(&[1, 2, 3, 4, 5]);
+        let unacked = send_stream_data_from(&mut connection, id.clone(), sending_bytes.clone());
+        let sent_packet = send_stream_data_from(&mut connection, id.clone(), sending_bytes.clone());
+        // Only last packet is acked -> first should set loss timer when conn receives ack frame
+        acker.received(sent_packet.packet_number(), sent_packet.is_ack_eliciting());
+
+        // Sending ack
+        // Should set loss time
+        send_ack_to(&mut connection, &mut acker, &mut pn);
+        let next = connection.next_deadline();
+
+        // The loss should be packet loss time since a packet before the acked packet is unacked
+        assert!(next.is_some());
+        let (loss, p_space) = connection.get_loss_time_and_space().unwrap();
+        assert_eq!(next.unwrap(), loss);
+        assert!(matches!(p_space, PacketSpace::Data));
+
+        // Now the unacked packet is acked, so it should reset the loss timer
+        acker.received(unacked.packet_number(), unacked.is_ack_eliciting());
+        send_ack_to(&mut connection, &mut acker, &mut pn);
+        let next = connection.next_deadline();
+        assert!(next.is_none());
+        assert_eq!(connection.pto_count, 0);
+    }
+
+    #[test]
+    fn test_send_data_from() {
+        let (sender, _receiver) = oneshot::channel();
+        let transport_params = Arc::new(TransportParam::new());
+        let mut connection = create_connection(sender, transport_params.clone());
+        let mut acker = Acker::new(transport_params);
+        server_initial_state(&mut connection);
+        server_handshake_state(&mut connection);
+
+        let id = open_bidir(&mut connection);
+        // Sending one stream packets and acking
+        let sending_bytes = Bytes::from_static(&[1, 2, 3, 4, 5]);
+        let sent_packet = send_stream_data_from(&mut connection, id.clone(), sending_bytes.clone());
+        acker.received(sent_packet.packet_number(), sent_packet.is_ack_eliciting());
+
+        let Some(Frame::Stream(frame)) = sent_packet
+            .frames
+            .iter()
+            .find(|f| matches!(f, Frame::Stream(_)))
+        else {
+            panic!("No stream frame after sending data");
+        };
+        assert_eq!(frame.data, sending_bytes);
     }
 }

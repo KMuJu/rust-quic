@@ -12,6 +12,7 @@ impl Timer {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct TimerTable {
     deadlines: [Option<Instant>; 2],
 }

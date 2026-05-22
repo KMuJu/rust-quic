@@ -163,6 +163,11 @@ impl SendStream {
     pub(super) fn is_reset(&self) -> bool {
         matches!(self.state, SendState::ResetSent | SendState::ResetRecvd)
     }
+
+    #[cfg(test)]
+    pub(super) fn set_buffer(&mut self, buf: &[u8]) {
+        self.buffer.put_slice(buf);
+    }
 }
 
 impl RecvStreamHandle {
