@@ -36,6 +36,7 @@ impl RttEstimator {
         }
     }
 
+    /// Follows RFC 9002 A.8
     pub(super) fn update(
         &mut self,
         latest_rtt: Duration,

@@ -3,10 +3,10 @@ use std::{collections::VecDeque, time::Duration};
 use tokio::time::Instant;
 
 use crate::io::{
-    ack_manager::Acker,
+    ack_manager::{Acker, SentPacket},
     congestion::CongestionController,
     encoding::VarInt,
-    frame::{AckRange, EcnCounts, Frame},
+    frame::{AckRange, EcnCounts, Frame, StreamData},
     rtt_estimator::RttEstimator,
     stream::StreamID,
     transport_parameters::SharedConfig,
@@ -24,19 +24,29 @@ impl PacketSpace {
         [Self::Initial, Self::Handshake, Self::Data].into_iter()
     }
 }
+pub(super) struct RttSample {
+    pub(super) latest_rtt: Duration,
+    pub(super) ack_delay: Duration,
+}
 
 pub(super) enum SpaceEvent {
     RecvStreamFrame(StreamID, Frame),
     SendStreamFrame(StreamID, Frame),
-    Crypto(VarInt, Vec<u8>),
+    Crypto {
+        offset: VarInt,
+        data: Vec<u8>,
+    },
 
-    RttSample(Duration, Duration),
+    Ack {
+        sample: Option<RttSample>,
+        lost: Vec<SentPacket>,
+    },
 
     HandshakeDone,
 }
 
 pub(super) struct Space {
-    space: PacketSpace,
+    pub(super) space: PacketSpace,
     discarded: bool,
     pub(super) acker: Acker,
     pub(super) pending_frames: VecDeque<Frame>,
@@ -68,7 +78,7 @@ impl Space {
         match &frame {
             Frame::StreamDataBlocked { id, .. }
             | Frame::ResetStream { id, .. }
-            | Frame::Stream { id, .. } => {
+            | Frame::Stream(StreamData { id, .. }) => {
                 if matches!(self.space, PacketSpace::Data) {
                     return Some(SpaceEvent::RecvStreamFrame(id.clone(), frame));
                 }
@@ -79,9 +89,12 @@ impl Space {
                 }
             }
             Frame::Crypto { offset, data } => {
-                return Some(SpaceEvent::Crypto(*offset, data.clone()));
+                return Some(SpaceEvent::Crypto {
+                    offset: *offset,
+                    data: data.clone(),
+                });
             }
-            Frame::Padding => todo!(),
+            Frame::Padding => {}
             Frame::Ping => {
                 if let Some(ack) = self.acker.get_ack() {
                     self.pending_frames.push_back(ack);
@@ -126,6 +139,9 @@ impl Space {
         None
     }
 
+    /// Roughly follow RFC 9002 A.7
+    /// Returns a SpaceEvent that contains the possibly lost frames and an optional rtt sample to be
+    /// processed by the connection
     fn handle_ack_frame(
         &mut self,
         largest: &VarInt,
@@ -154,28 +170,39 @@ impl Space {
             current -= range.length.0;
         }
 
-        // println!("Acked({space:?})[{:?}]: {acked:?}", self.side);
+        let newly_acked: Vec<_> = acked
+            .iter()
+            .filter_map(|&pn| self.acker.acked(pn))
+            .collect();
 
-        let largest_sent_at = self.acker.sent_timestamp(largest.0 as u32);
-        for ack in acked {
-            if let Some(sent) = self.acker.acked(ack) {
-                congestion.on_ack(sent.sent_bytes as u64, sent.timestamp);
-            }
+        if newly_acked.is_empty() {
+            return None;
         }
 
-        let lost_sent = self.acker.get_lost_in_flight(rtt);
-        congestion.on_loss(&lost_sent, rtt);
+        let mut sample = None;
+        let largest_acked = newly_acked.iter().max_by_key(|acked| acked.pn).unwrap();
+        if largest_acked.pn == (largest.0 as u32)
+            && newly_acked.iter().any(|acked| acked.ack_eliciting)
+        {
+            sample = Some(RttSample {
+                latest_rtt: Instant::now() - largest_acked.timestamp,
+                ack_delay: Duration::from_millis(
+                    delay.0 << self.transport_params.ack_delay_exponent,
+                ),
+            })
+        }
 
         let lost = self.acker.get_lost_frames(rtt);
-        self.add_lost_to_pending(lost);
-
-        if let Some(largest_sent_at) = largest_sent_at {
-            return Some(SpaceEvent::RttSample(
-                Instant::now() - largest_sent_at,
-                Duration::from_millis(delay.0 << self.transport_params.ack_delay_exponent),
-            ));
+        if !lost.is_empty() {
+            congestion.on_loss(lost.as_slice(), rtt);
         }
-        None
+
+        newly_acked
+            .iter()
+            .filter(|acked| acked.in_flight)
+            .for_each(|acked| congestion.on_ack(acked.sent_bytes as u64, acked.timestamp));
+
+        Some(SpaceEvent::Ack { sample, lost })
     }
 
     fn add_lost_to_pending(&mut self, lost: Vec<Frame>) {

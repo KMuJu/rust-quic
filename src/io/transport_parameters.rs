@@ -12,7 +12,7 @@ pub(super) type SharedConfig = Arc<TransportParam>;
 impl TransportParam {
     pub(super) fn new() -> Self {
         Self {
-            max_ack_delay: Duration::from_micros(1),
+            max_ack_delay: Duration::from_millis(25),
             ack_delay_exponent: 3,
         }
     }

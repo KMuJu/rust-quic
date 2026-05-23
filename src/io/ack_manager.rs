@@ -15,15 +15,12 @@ use crate::io::{
 const PACKET_THRESHOLD: u32 = 3;
 
 pub(super) struct SentPacket {
-    frames: Vec<Frame>,
-    in_flight: bool, // if it counts towards congestion
-    pub(super) info: SentPacketInfo,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct SentPacketInfo {
+    pub(super) frames: Vec<Frame>,
+    pub(super) pn: u32,
     pub(super) timestamp: Instant,
     pub(super) sent_bytes: usize,
+    pub(super) ack_eliciting: bool,
+    pub(super) in_flight: bool, // if it counts towards congestion
 }
 
 struct LargestReceived {
@@ -97,7 +94,7 @@ impl Acker {
                     println!("Eliciting packet count >= 2: NEED TO SEND ACK");
                 }
                 if self.ack_deadline.is_none() {
-                    self.ack_deadline = Some(Instant::now() + Duration::from_millis(25));
+                    self.ack_deadline = Some(Instant::now() + self.transport_params.max_ack_delay);
                 }
             }
 
@@ -173,12 +170,15 @@ impl Acker {
         packet_number: PacketNumber,
         in_frames: Vec<Frame>,
         in_flight: bool,
+        ack_eliciting: bool,
     ) {
         if self.cleared {
             return;
         }
         let pn = packet_number.u32();
-        self.last_elicit_time = Some(Instant::now());
+        if ack_eliciting {
+            self.last_elicit_time = Some(Instant::now());
+        }
 
         // Only retransmit retransmitable frames
         // TODO: Handle MAX_* frames
@@ -188,41 +188,29 @@ impl Acker {
                 frames.push(frame);
             }
         }
+        if frames.is_empty() {
+            return;
+        }
 
         let sent = SentPacket {
-            info: SentPacketInfo {
-                timestamp: Instant::now(),
-                sent_bytes: frames.iter().map(|f| f.size()).sum(),
-            },
-            frames,
+            pn,
+            timestamp: Instant::now(),
+            sent_bytes: frames.iter().map(|f| f.size()).sum(),
+            ack_eliciting,
             in_flight,
+            frames,
         };
 
         self.sent.insert(pn, sent);
     }
 
-    pub(super) fn get_lost_in_flight(&self, rtt: &RttEstimator) -> Vec<SentPacketInfo> {
-        let loss_delay = rtt.latest_rtt.max(rtt.smoothed) * 9 / 8;
-        let loss_delay = loss_delay.max(Duration::from_millis(1));
-        let loss_send_time = Instant::now() - loss_delay;
-        let lost: Vec<_> = self
-            .sent
-            .iter()
-            .filter(|&(pn, s)| {
-                s.in_flight && *pn <= self.largest_acked && s.info.timestamp <= loss_send_time
-                    || self.largest_acked > pn + PACKET_THRESHOLD
-            })
-            .map(|(_, s)| s.info)
-            .collect();
-
-        lost
-    }
-
-    pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator) -> Vec<Frame> {
+    /// Roughly follows RFC 9002 A.10
+    pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator) -> Vec<SentPacket> {
         let mut lost = Vec::new();
         if self.cleared {
             return lost;
         }
+        self.loss_time = None;
         assert!(
             self.largest_acked != u32::MAX,
             "Largest acked was not set: {}",
@@ -237,20 +225,19 @@ impl Acker {
             if *pn > self.largest_acked {
                 continue;
             }
-            if s.info.timestamp <= loss_send_time || self.largest_acked > pn + PACKET_THRESHOLD {
+
+            if s.timestamp <= loss_send_time || self.largest_acked > pn + PACKET_THRESHOLD {
                 lost_pns.push(*pn);
-            } else if let Some(deadline) = self.ack_deadline {
-                self.loss_time = Some(deadline.min(s.info.timestamp + loss_delay));
+            } else if let Some(deadline) = self.loss_time {
+                self.loss_time = Some(deadline.min(s.timestamp + loss_delay));
             } else {
-                self.loss_time = Some(s.info.timestamp + loss_delay);
+                self.loss_time = Some(s.timestamp + loss_delay);
             }
         }
 
         for pn in lost_pns {
             let sent = self.sent.remove(&pn).unwrap();
-            for frame in sent.frames {
-                lost.push(frame);
-            }
+            lost.push(sent);
         }
 
         if !lost.is_empty() {
@@ -260,27 +247,21 @@ impl Acker {
         lost
     }
 
-    pub(super) fn acked(&mut self, packet_number: u32) -> Option<SentPacketInfo> {
+    pub(super) fn acked(&mut self, packet_number: u32) -> Option<SentPacket> {
         if self.largest_acked == u32::MAX {
             self.largest_acked = packet_number;
         } else {
             self.largest_acked = self.largest_acked.max(packet_number);
         }
-        self.sent.remove(&packet_number).map(|s| s.info)
+        self.sent.remove(&packet_number)
     }
 
-    /// Returns the timestamp if it is present
-    /// If it is present, then that means that it is ack-eliciting
-    pub(super) fn sent_timestamp(&self, packet_number: u32) -> Option<Instant> {
-        self.sent.get(&packet_number).map(|s| s.info.timestamp)
-    }
-
-    pub(super) fn unacked_frame(&self) -> Option<Frame> {
+    pub(super) fn unacked_frames(&self) -> Vec<Frame> {
         self.sent
             .values()
-            .filter_map(|s| s.frames.first())
-            .next()
-            .cloned()
+            .find(|&s| s.in_flight && s.ack_eliciting)
+            .map(|s| s.frames.clone())
+            .unwrap_or(Vec::new())
     }
 
     pub(super) fn clear(&mut self) {
@@ -290,12 +271,10 @@ impl Acker {
         self.ack_deadline = None;
     }
 
-    pub(super) fn earliest_sent(&self) -> Option<Instant> {
-        self.sent.values().map(|s| s.info.timestamp).min()
-    }
-
-    pub(super) fn has_packet_in_flight(&self) -> bool {
-        !self.sent.is_empty()
+    pub(super) fn has_ack_eliciting_packet_in_flight(&self) -> bool {
+        self.sent
+            .iter()
+            .any(|(_, sent)| sent.ack_eliciting && sent.in_flight)
     }
 
     pub(super) fn time_of_last_elicit(&self) -> Option<Instant> {
@@ -412,13 +391,17 @@ mod tests {
         let mut acker = Acker::new(Arc::new(TransportParam::new()));
         let frames = vec![Frame::Ping, Frame::HandshakeDone];
 
-        acker.sent_packet(PacketNumber::U8(1), frames.clone(), true);
-        acker.sent_packet(PacketNumber::U8(2), frames.clone(), true);
-        acker.sent_packet(PacketNumber::U8(5), frames.clone(), true);
-        acker.sent_packet(PacketNumber::U8(6), frames.clone(), true);
+        acker.sent_packet(PacketNumber::U8(1), frames.clone(), true, true);
+        acker.sent_packet(PacketNumber::U8(2), frames.clone(), true, true);
+        acker.sent_packet(PacketNumber::U8(5), frames.clone(), true, true);
+        acker.sent_packet(PacketNumber::U8(6), frames.clone(), true, true);
         acker.acked(6);
 
-        let lost = acker.get_lost_frames(&RttEstimator::new());
+        let lost: Vec<_> = acker
+            .get_lost_frames(&RttEstimator::new())
+            .iter()
+            .flat_map(|lost| lost.frames.clone())
+            .collect();
         println!("Lost: {lost:?}");
 
         assert!(matches!(lost[0], Frame::Ping));

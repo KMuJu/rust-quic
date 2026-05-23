@@ -4,7 +4,7 @@ use rust_quic::io::{endpoint::Endpoint, mock_socket::mock::MockSocket};
 
 #[tokio::test]
 async fn test_handshake() {
-    let (client_sock, server_sock) = MockSocket::pair(0.0);
+    let (client_sock, server_sock) = MockSocket::pair(0.0, 42);
     let server_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
     let mut server = Endpoint::<MockSocket>::new_generic(server_sock);
@@ -22,7 +22,7 @@ async fn test_handshake() {
 
 #[tokio::test]
 async fn test_stream_send_recv() {
-    let (client_sock, server_sock) = MockSocket::pair(0.0);
+    let (client_sock, server_sock) = MockSocket::pair(0.0, 42);
     let server_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
     let mut server = Endpoint::<MockSocket>::new_generic(server_sock);
@@ -51,7 +51,7 @@ async fn test_stream_send_recv() {
 #[tokio::test]
 async fn test_stream_with_loss() {
     tokio::time::timeout(Duration::from_secs(6), async {
-        let (client_sock, server_sock) = MockSocket::pair(0.2); // 10% loss
+        let (client_sock, server_sock) = MockSocket::pair(0.2, 42); // 10% loss
         let server_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
         let mut server = Endpoint::<MockSocket>::new_generic(server_sock);
@@ -80,7 +80,7 @@ async fn test_stream_with_loss() {
             let mut buf = vec![0u8; 1024];
             let n = recv.read(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], b"hello world");
-            println!("[TEST] Read hello world");
+            println!("[TEST] Read hello world\n");
         }
 
         server_handle.await.unwrap();

@@ -434,7 +434,10 @@ impl Header {
 mod test {
     use std::io::{self, Cursor};
 
-    use crate::io::stream::{Dir, StreamID};
+    use crate::io::{
+        frame::StreamData,
+        stream::{Dir, StreamID},
+    };
 
     use super::*;
 
@@ -566,13 +569,13 @@ mod test {
             data: c_data,
         };
 
-        let stream_frame = Frame::Stream {
+        let stream_frame = Frame::Stream(StreamData {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: false,
             offset: VarInt(0),
             data: Bytes::new(),
-        };
+        });
 
         let payload = vec![
             crypto_frame,
