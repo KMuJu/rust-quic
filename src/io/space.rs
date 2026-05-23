@@ -3,7 +3,7 @@ use std::{collections::VecDeque, time::Duration};
 use tokio::time::Instant;
 
 use crate::io::{
-    ack_manager::Acker,
+    ack_manager::{Acker, SentPacket},
     congestion::CongestionController,
     encoding::VarInt,
     frame::{AckRange, EcnCounts, Frame, StreamData},
@@ -32,9 +32,15 @@ pub(super) struct RttSample {
 pub(super) enum SpaceEvent {
     RecvStreamFrame(StreamID, Frame),
     SendStreamFrame(StreamID, Frame),
-    Crypto { offset: VarInt, data: Vec<u8> },
+    Crypto {
+        offset: VarInt,
+        data: Vec<u8>,
+    },
 
-    Ack(Option<RttSample>),
+    Ack {
+        sample: Option<RttSample>,
+        lost: Vec<SentPacket>,
+    },
 
     HandshakeDone,
 }
@@ -183,9 +189,9 @@ impl Space {
             })
         }
 
-        let lost_packets = self.acker.get_lost_frames(rtt);
-        if !lost_packets.is_empty() {
-            congestion.on_loss(lost_packets.as_slice(), rtt);
+        let lost = self.acker.get_lost_frames(rtt);
+        if !lost.is_empty() {
+            congestion.on_loss(lost.as_slice(), rtt);
         }
 
         newly_acked
@@ -193,7 +199,7 @@ impl Space {
             .filter(|acked| acked.in_flight)
             .for_each(|acked| congestion.on_ack(acked.sent_bytes as u64, acked.timestamp));
 
-        Some(SpaceEvent::Ack(sample))
+        Some(SpaceEvent::Ack { sample, lost })
     }
 
     fn add_lost_to_pending(&mut self, lost: Vec<Frame>) {

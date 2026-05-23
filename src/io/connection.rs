@@ -23,6 +23,7 @@ use tokio::{
 
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
+    ack_manager::SentPacket,
     congestion::CongestionController,
     crypto::CryptoFrame,
     endpoint::EndpointRef,
@@ -183,8 +184,8 @@ impl ConnectionInner {
                         HandshakeDone => {
                             self.consume_connected();
                         }
-                        Ack(sample) => {
-                            self.on_ack_event(sample);
+                        Ack { sample, lost } => {
+                            self.on_ack_event(PacketSpace::Data, sample, lost);
                         }
                         Crypto { offset, data } => todo!(),
                     }
@@ -232,8 +233,8 @@ impl ConnectionInner {
                                 self.initial_space.discard();
                             }
                         }
-                        Ack(sample) => {
-                            self.on_ack_event(sample);
+                        Ack { sample, lost } => {
+                            self.on_ack_event(PacketSpace::Initial, sample, lost);
                         }
                         RecvStreamFrame(_, _) | SendStreamFrame(_, _) | HandshakeDone => (),
                     }
@@ -284,8 +285,8 @@ impl ConnectionInner {
                                 }
                             }
                         },
-                        Ack(sample) => {
-                            self.on_ack_event(sample);
+                        Ack { sample, lost } => {
+                            self.on_ack_event(PacketSpace::Handshake, sample, lost);
                         }
                         RecvStreamFrame(_, _) | SendStreamFrame(_, _) | HandshakeDone => (),
                     }
@@ -294,7 +295,16 @@ impl ConnectionInner {
         }
     }
 
-    fn on_ack_event(&mut self, sample: Option<RttSample>) {
+    fn on_ack_event(
+        &mut self,
+        p_space: PacketSpace,
+        sample: Option<RttSample>,
+        lost: Vec<SentPacket>,
+    ) {
+        if !lost.is_empty() {
+            let lost_frames: Vec<_> = lost.into_iter().flat_map(|lost| lost.frames).collect();
+            self.add_lost_to_pending(p_space, lost_frames);
+        }
         if let Some(sample) = sample {
             self.rtt.update(
                 sample.latest_rtt,
