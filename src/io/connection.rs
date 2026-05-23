@@ -295,6 +295,11 @@ impl ConnectionInner {
         }
     }
 
+    /// Missing part of RFC 9002 A.7
+    /// Does what can't be done in `Space::handle_ack_frame` which is
+    /// - Queue pending frames
+    /// - Update RTT
+    /// - Set loss timer
     fn on_ack_event(
         &mut self,
         p_space: PacketSpace,
@@ -393,6 +398,7 @@ impl ConnectionInner {
         self.spaces().filter_map(|s| s.acker.get_deadline()).min()
     }
 
+    /// Follows RFC 9002 A.8
     fn get_loss_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
         self.spaces()
             .filter_map(|s| Some((s.acker.get_loss_time()?, s.space)))
@@ -415,6 +421,8 @@ impl ConnectionInner {
         self.timers.next()
     }
 
+    /// Follows RFC 9002 A.8
+    ///
     /// Should be called after:
     /// - Loss detection timeout
     /// - Received ack
@@ -439,7 +447,9 @@ impl ConnectionInner {
         self.timers.set(Timer::LossDetection, pto);
     }
 
+    /// Follows pseudocode described in RFC 9002 A.8
     fn get_pto_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
+        // RFC 9002 section 6.2.1
         let duration = (self.rtt.smoothed + (self.rtt.variance * 4).max(Duration::from_millis(1)))
             * 2u32.pow(self.pto_count);
 
@@ -502,7 +512,7 @@ impl ConnectionInner {
                     // Don't need to do anything since the timer already wakes up connection driver
                 }
                 Timer::LossDetection => {
-                    println!("[TIMER] Loss detection timer fired");
+                    // Follows RFC 9002 A.9
                     let rtt = &self.rtt.clone();
                     if let Some((_, p_space)) = self.get_loss_time_and_space() {
                         let lost = self.space_mut(p_space).acker.get_lost_frames(rtt);
@@ -527,7 +537,6 @@ impl ConnectionInner {
                         unimplemented!("Have not implemented anti-deadlock")
                     } else {
                         let p_space = self.pto_space();
-                        println!("[TIMER] PTO fired in: {:?}", p_space);
                         let pto_frames = self.build_pto_probe(p_space);
                         self.space_mut(p_space)
                             .pending_frames

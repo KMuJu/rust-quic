@@ -139,6 +139,9 @@ impl Space {
         None
     }
 
+    /// Roughly follow RFC 9002 A.7
+    /// Returns a SpaceEvent that contains the possibly lost frames and an optional rtt sample to be
+    /// processed by the connection
     fn handle_ack_frame(
         &mut self,
         largest: &VarInt,

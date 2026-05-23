@@ -204,6 +204,7 @@ impl Acker {
         self.sent.insert(pn, sent);
     }
 
+    /// Roughly follows RFC 9002 A.10
     pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator) -> Vec<SentPacket> {
         let mut lost = Vec::new();
         if self.cleared {
