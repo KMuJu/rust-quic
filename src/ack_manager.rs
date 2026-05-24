@@ -4,7 +4,7 @@ use futures::task::AtomicWaker;
 use range_set::RangeSet;
 use tokio::time::Instant;
 
-use crate::io::{
+use crate::{
     encoding::VarInt,
     frame::{Ack, AckRange, Frame},
     packet::PacketNumber,
@@ -286,7 +286,7 @@ impl Acker {
 mod tests {
     use std::sync::Arc;
 
-    use crate::io::transport_parameters::TransportParam;
+    use crate::transport_parameters::TransportParam;
 
     use super::*;
 

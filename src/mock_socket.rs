@@ -11,7 +11,7 @@ pub mod mock {
     use futures::task::AtomicWaker;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-    use crate::io::socket::Socket;
+    use crate::socket::Socket;
 
     type MockChannel = Arc<Mutex<VecDeque<(Vec<u8>, SocketAddr)>>>;
 

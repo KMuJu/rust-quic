@@ -19,7 +19,7 @@ use tokio::{
     },
 };
 
-use crate::io::{
+use crate::{
     ConnectionToEndpoint, EndpointToConnection,
     connection::{Connection, ConnectionHandle, ConnectionID, Incoming, IncomingInner},
     packet::{Packet, PacketError},

@@ -3,7 +3,7 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use crate::io::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
+use crate::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PacketSpace {

@@ -9,7 +9,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::io::{
+use crate::{
     connection::ConnectionInner,
     frame::{Frame, Stream},
     frame_assembler::FrameAssembler,

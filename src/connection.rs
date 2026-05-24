@@ -21,7 +21,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::io::{
+use crate::{
     ConnectionToEndpoint, EndpointToConnection,
     congestion::CongestionController,
     crypto::CryptoFrame,
@@ -1071,7 +1071,7 @@ mod test {
     use bytes::Bytes;
     use futures::task::noop_waker_ref;
 
-    use crate::io::ack_manager::Acker;
+    use crate::ack_manager::Acker;
 
     use super::*;
 

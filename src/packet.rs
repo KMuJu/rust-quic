@@ -3,7 +3,7 @@ use std::{fmt::Debug, io::Cursor};
 use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
 
-use crate::io::{
+use crate::{
     connection::ConnectionID,
     crypto::CryptoFrame,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
@@ -442,7 +442,7 @@ impl Header {
 mod test {
     use std::io::{self, Cursor};
 
-    use crate::io::{
+    use crate::{
         frame::Stream,
         stream::{Dir, StreamID},
     };
