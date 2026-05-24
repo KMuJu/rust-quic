@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::io::{
     connection::ConnectionInner,
-    frame::{Frame, StreamData},
+    frame::{Frame, Stream},
     frame_assembler::FrameAssembler,
 };
 
@@ -84,7 +84,7 @@ impl RecvStream {
         };
     }
 
-    pub(super) fn handle_stream_frame(&mut self, frame: StreamData) {
+    pub(super) fn handle_stream_frame(&mut self, frame: Stream) {
         // TODO: Handle fin bit
         if matches!(self.state, RecvState::Recv | RecvState::SizeKnown) {
             self.assembler.add(frame.data, frame.offset.0);

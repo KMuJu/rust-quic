@@ -41,13 +41,7 @@ mod frame_type {
 pub(super) enum Frame {
     Padding,
     Ping,
-    Ack {
-        largest: VarInt,
-        delay: VarInt,
-        first_range: VarInt,
-        ranges: Vec<AckRange>,
-        ecn: Option<EcnCounts>,
-    },
+    Ack(Ack),
     ResetStream {
         id: StreamID,
         error_code: VarInt, // TODO: Make spesific type?
@@ -64,7 +58,7 @@ pub(super) enum Frame {
     NewToken {
         token: Token,
     },
-    Stream(StreamData),
+    Stream(Stream),
     MaxData {
         max_data: VarInt,
     },
@@ -118,11 +112,10 @@ impl Frame {
     pub(crate) fn decode<B: Buf>(buf: &mut B) -> Result<Self, FrameDecodeError> {
         let t = VarInt::decode(buf)?;
 
-        use Frame::*;
         use frame_type::*;
         match t.0 {
-            PADDING => Ok(Padding),
-            PING => Ok(Ping),
+            PADDING => Ok(Frame::Padding),
+            PING => Ok(Frame::Ping),
             ACK | ACK_ECN => {
                 let largest = VarInt::decode(buf)?;
                 let delay = VarInt::decode(buf)?;
@@ -145,19 +138,19 @@ impl Frame {
                     None
                 };
 
-                Ok(Ack {
+                Ok(Frame::Ack(Ack {
                     largest,
                     delay,
                     first_range,
                     ranges,
                     ecn,
-                })
+                }))
             }
             RESET_STREAM => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let error_code = VarInt::decode(buf)?;
                 let final_size = VarInt::decode(buf)?;
-                Ok(ResetStream {
+                Ok(Frame::ResetStream {
                     id,
                     error_code,
                     final_size,
@@ -166,7 +159,7 @@ impl Frame {
             STOP_SENDING => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let error_code = VarInt::decode(buf)?;
-                Ok(StopSending { id, error_code })
+                Ok(Frame::StopSending { id, error_code })
             }
             CRYPTO => {
                 let offset = VarInt::decode(buf)?;
@@ -176,7 +169,7 @@ impl Frame {
                 }
                 let mut data = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut data);
-                Ok(Crypto { offset, data })
+                Ok(Frame::Crypto { offset, data })
             }
             NEW_TOKEN => {
                 let length = VarInt::decode(buf)?;
@@ -185,18 +178,18 @@ impl Frame {
                 }
                 let mut token = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut token);
-                Ok(NewToken {
+                Ok(Frame::NewToken {
                     token: Token(token),
                 })
             }
             MAX_DATA => {
                 let max_data = VarInt::decode(buf)?;
-                Ok(MaxData { max_data })
+                Ok(Frame::MaxData { max_data })
             }
             MAX_STREAM_DATA => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let max_stream_data = VarInt::decode(buf)?;
-                Ok(MaxStreamData {
+                Ok(Frame::MaxStreamData {
                     id,
                     max_stream_data,
                 })
@@ -208,16 +201,16 @@ impl Frame {
                     Dir::Uni
                 };
                 let max_streams = VarInt::decode(buf)?;
-                Ok(MaxStreams { dir, max_streams })
+                Ok(Frame::MaxStreams { dir, max_streams })
             }
             DATA_BLOCKED => {
                 let max_data = VarInt::decode(buf)?;
-                Ok(DataBlocked { max_data })
+                Ok(Frame::DataBlocked { max_data })
             }
             STREAM_DATA_BLOCKED => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let max_stream_data = VarInt::decode(buf)?;
-                Ok(StreamDataBlocked {
+                Ok(Frame::StreamDataBlocked {
                     id,
                     max_stream_data,
                 })
@@ -229,7 +222,7 @@ impl Frame {
                     Dir::Uni
                 };
                 let max_streams = VarInt::decode(buf)?;
-                Ok(StreamsBlocked { dir, max_streams })
+                Ok(Frame::StreamsBlocked { dir, max_streams })
             }
             NEW_CONNECTION_ID => {
                 let seq_num = VarInt::decode(buf)?;
@@ -245,7 +238,7 @@ impl Frame {
                 let mut token = vec![0u8; 16]; // 128 bits
                 buf.copy_to_slice(&mut token);
 
-                Ok(NewConnectionId {
+                Ok(Frame::NewConnectionId {
                     seq_num,
                     retire,
                     cid,
@@ -254,17 +247,17 @@ impl Frame {
             }
             RETIRE_CONNECTION_ID => {
                 let seq_num = VarInt::decode(buf)?;
-                Ok(RetireConnectionId { seq_num })
+                Ok(Frame::RetireConnectionId { seq_num })
             }
             PATH_CHALLENGE => {
                 let mut data = [0u8; 8];
                 buf.copy_to_slice(&mut data);
-                Ok(PathChallenge { data })
+                Ok(Frame::PathChallenge { data })
             }
             PATH_RESPONSE => {
                 let mut data = [0u8; 8];
                 buf.copy_to_slice(&mut data);
-                Ok(PathResponse { data })
+                Ok(Frame::PathResponse { data })
             }
             CONNECTION_CLOSE_QUIC_LAYER => {
                 let error_code = VarInt::decode(buf)?;
@@ -275,7 +268,7 @@ impl Frame {
                 }
                 let mut reason_phrase = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut reason_phrase);
-                Ok(ConnectionCloseQuic {
+                Ok(Frame::ConnectionCloseQuic {
                     error_code,
                     frame_type,
                     reason_phrase,
@@ -289,12 +282,12 @@ impl Frame {
                 }
                 let mut reason_phrase = vec![0u8; length.0 as usize];
                 buf.copy_to_slice(&mut reason_phrase);
-                Ok(ConnectionCloseApp {
+                Ok(Frame::ConnectionCloseApp {
                     error_code,
                     reason_phrase,
                 })
             }
-            HANDSHAKE_DONE => Ok(HandshakeDone),
+            HANDSHAKE_DONE => Ok(Frame::HandshakeDone),
             val if STREAM.contains(&val) => {
                 let id = StreamID::new_unchecked(VarInt::decode(buf)?.0 as usize);
                 let fin = t.0 & 0x1 == 0x1;
@@ -315,7 +308,7 @@ impl Frame {
                     buf.copy_to_bytes(buf.remaining())
                 };
 
-                Ok(Frame::Stream(StreamData {
+                Ok(Frame::Stream(Stream {
                     id,
                     fin,
                     len,
@@ -334,13 +327,13 @@ impl Frame {
                 variable_length_encode(buf, PADDING)?;
             }
             Frame::Ping => variable_length_encode(buf, PING)?,
-            Frame::Ack {
+            Frame::Ack(Ack {
                 largest,
                 delay,
                 first_range,
                 ranges,
                 ecn,
-            } => {
+            }) => {
                 let t = if ecn.is_none() { ACK } else { ACK_ECN };
                 VarInt(t).encode(buf)?;
                 largest.encode(buf)?;
@@ -385,7 +378,7 @@ impl Frame {
                 VarInt(token.0.len() as u64).encode(buf)?;
                 buf.put_slice(&token.0);
             }
-            Frame::Stream(StreamData {
+            Frame::Stream(Stream {
                 id,
                 fin,
                 len,
@@ -505,7 +498,7 @@ impl Frame {
     pub(super) fn stream_id(&self) -> Option<StreamID> {
         match self {
             Self::ResetStream { id, .. }
-            | Self::Stream(StreamData { id, .. })
+            | Self::Stream(Stream { id, .. })
             | Self::StopSending { id, .. }
             | Self::MaxStreamData { id, .. }
             | Self::StreamDataBlocked { id, .. } => Some(id.clone()),
@@ -514,18 +507,17 @@ impl Frame {
     }
 
     pub(super) fn size(&self) -> usize {
-        use Frame::*;
         use frame_type::*;
         match self {
-            Padding => variable_length(PADDING),
-            Ping => variable_length(PING),
-            Ack {
+            Frame::Padding => variable_length(PADDING),
+            Frame::Ping => variable_length(PING),
+            Frame::Ack(Ack {
                 largest,
                 delay,
                 first_range,
                 ranges,
                 ecn,
-            } => {
+            }) => {
                 let t = variable_length(ACK);
                 let l = largest.length();
                 let d = delay.length();
@@ -543,7 +535,7 @@ impl Frame {
                 }
                 sum
             }
-            ResetStream {
+            Frame::ResetStream {
                 id,
                 error_code,
                 final_size,
@@ -555,16 +547,16 @@ impl Frame {
 
                 t + i + e + s
             }
-            StopSending { id, error_code } => todo!(),
-            Crypto { offset, data } => {
+            Frame::StopSending { id, error_code } => todo!(),
+            Frame::Crypto { offset, data } => {
                 let t = variable_length(CRYPTO);
                 let o = offset.length();
                 let l = variable_length(data.len() as u64);
                 let d = data.len();
                 t + o + l + d
             }
-            NewToken { token } => todo!(),
-            Stream(StreamData {
+            Frame::NewToken { token } => todo!(),
+            Frame::Stream(Stream {
                 id,
                 fin,
                 len,
@@ -582,8 +574,8 @@ impl Frame {
 
                 i + o + l + data.len()
             }
-            MaxData { max_data } => variable_length(MAX_DATA) + max_data.length(),
-            MaxStreamData {
+            Frame::MaxData { max_data } => variable_length(MAX_DATA) + max_data.length(),
+            Frame::MaxStreamData {
                 id,
                 max_stream_data,
             } => {
@@ -591,34 +583,34 @@ impl Frame {
                     + variable_length(id.value() as u64)
                     + max_stream_data.length()
             }
-            MaxStreams { max_streams, .. } => {
+            Frame::MaxStreams { max_streams, .. } => {
                 variable_length(MAX_STREAMS_UNI) + max_streams.length()
             }
-            DataBlocked { max_data } => todo!(),
-            StreamDataBlocked {
+            Frame::DataBlocked { max_data } => todo!(),
+            Frame::StreamDataBlocked {
                 id,
                 max_stream_data,
             } => todo!(),
-            StreamsBlocked { dir, max_streams } => todo!(),
-            NewConnectionId {
+            Frame::StreamsBlocked { dir, max_streams } => todo!(),
+            Frame::NewConnectionId {
                 seq_num,
                 retire,
                 cid,
                 stateless_reset_token,
             } => todo!(),
-            RetireConnectionId { seq_num } => todo!(),
-            PathChallenge { data } => todo!(),
-            PathResponse { data } => todo!(),
-            ConnectionCloseQuic {
+            Frame::RetireConnectionId { seq_num } => todo!(),
+            Frame::PathChallenge { data } => todo!(),
+            Frame::PathResponse { data } => todo!(),
+            Frame::ConnectionCloseQuic {
                 error_code,
                 frame_type,
                 reason_phrase,
             } => todo!(),
-            ConnectionCloseApp {
+            Frame::ConnectionCloseApp {
                 error_code,
                 reason_phrase,
             } => todo!(),
-            HandshakeDone => variable_length(HANDSHAKE_DONE),
+            Frame::HandshakeDone => variable_length(HANDSHAKE_DONE),
         }
     }
 
@@ -645,12 +637,21 @@ impl Frame {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct StreamData {
+pub(super) struct Stream {
     pub(super) id: StreamID,
     pub(super) fin: bool,
     pub(super) len: bool, // true if length field is present
     pub(super) offset: VarInt,
     pub(super) data: Bytes,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct Ack {
+    pub(super) largest: VarInt,
+    pub(super) delay: VarInt,
+    pub(super) first_range: VarInt,
+    pub(super) ranges: Vec<AckRange>,
+    pub(super) ecn: Option<EcnCounts>,
 }
 
 #[derive(Debug, Clone)]
@@ -713,7 +714,7 @@ mod test {
 
     #[test]
     fn encode_decode_stream_frame() {
-        let stream = Frame::Stream(StreamData {
+        let stream = Frame::Stream(Stream {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: true,
@@ -749,13 +750,13 @@ mod test {
 
     #[test]
     fn test_ack_encode_decode() {
-        let ack = Frame::Ack {
+        let ack = Frame::Ack(Ack {
             largest: VarInt(0),
             delay: VarInt(0),
             first_range: VarInt(0),
             ranges: Vec::new(),
             ecn: None,
-        };
+        });
 
         let mut encoded = Vec::new();
 
@@ -767,13 +768,13 @@ mod test {
 
         for output in iter {
             match output {
-                Frame::Ack {
+                Frame::Ack(Ack {
                     largest,
                     delay,
                     first_range,
                     ranges,
                     ecn,
-                } => {
+                }) => {
                     assert_eq!(largest, 0);
                     assert_eq!(delay, 0);
                     assert_eq!(ranges.len(), 0);
@@ -793,7 +794,7 @@ mod test {
         for _ in 0..3 {
             let data = Bytes::from_static(b"hello world");
             let data_len = data.len();
-            let frame = Frame::Stream(StreamData {
+            let frame = Frame::Stream(Stream {
                 id: StreamID::new_unchecked(1),
                 fin: false,
                 len: true,
@@ -819,7 +820,7 @@ mod test {
 
     #[test]
     fn test_stream_size() {
-        let frame = Frame::Stream(StreamData {
+        let frame = Frame::Stream(Stream {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: false,

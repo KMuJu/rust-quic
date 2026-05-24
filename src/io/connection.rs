@@ -27,7 +27,7 @@ use crate::io::{
     crypto::CryptoFrame,
     encoding::VarInt,
     endpoint::EndpointRef,
-    frame::{AckRange, Frame, StreamData},
+    frame::{Ack, AckRange, Frame, Stream},
     packet::{Header, Packet, PacketNumber},
     rtt_estimator::RttEstimator,
     socket::Socket,
@@ -176,14 +176,8 @@ impl ConnectionInner {
                         self.spaces[p_space].pending_frames.push_back(ack);
                     }
                 }
-                Frame::Ack {
-                    largest,
-                    delay,
-                    first_range,
-                    ranges,
-                    ecn,
-                } => {
-                    self.on_ack_received(p_space, largest, delay, first_range, &ranges);
+                Frame::Ack(ack) => {
+                    self.on_ack_received(p_space, ack);
                 }
                 Frame::ResetStream {
                     id,
@@ -247,13 +241,7 @@ impl ConnectionInner {
         for frame in packet.frames {
             match frame {
                 Frame::Padding | Frame::Ping => {}
-                Frame::Ack {
-                    largest,
-                    delay,
-                    first_range,
-                    ranges,
-                    ecn,
-                } => self.on_ack_received(p_space, largest, delay, first_range, &ranges),
+                Frame::Ack(ack) => self.on_ack_received(p_space, ack),
                 Frame::Crypto { offset, data } => self.handle_crypto(p_space, offset, data),
                 Frame::ConnectionCloseQuic {
                     error_code,
@@ -337,25 +325,18 @@ impl ConnectionInner {
     }
 
     /// Follows RFC 9002 A.7
-    fn on_ack_received(
-        &mut self,
-        p_space: PacketSpace,
-        largest: VarInt,
-        delay: VarInt,
-        first_range: VarInt,
-        ranges: &Vec<AckRange>,
-    ) {
+    fn on_ack_received(&mut self, p_space: PacketSpace, ack: Ack) {
         let mut acked = Vec::new();
-        let mut current = largest.0;
+        let mut current = ack.largest.0;
 
         // First range: largest down to largest - first_range
-        for pn in (current - first_range.0..=current).rev() {
+        for pn in (current - ack.first_range.0..=current).rev() {
             acked.push(pn as u32);
         }
-        current -= first_range.0;
+        current -= ack.first_range.0;
 
         // Subsequent ranges: skip gap+2, then ack length+1
-        for range in ranges {
+        for range in ack.ranges {
             current -= range.gap.0 + 2;
             for pn in (current - range.length.0..=current).rev() {
                 acked.push(pn as u32);
@@ -373,12 +354,12 @@ impl ConnectionInner {
         }
 
         let largest_acked = newly_acked.iter().max_by_key(|acked| acked.pn).unwrap();
-        if largest_acked.pn == (largest.0 as u32)
+        if largest_acked.pn == (ack.largest.0 as u32)
             && newly_acked.iter().any(|acked| acked.ack_eliciting)
         {
             let latest_rtt = Instant::now() - largest_acked.timestamp;
             let ack_delay =
-                Duration::from_millis(delay.0 << self.transport_params.ack_delay_exponent);
+                Duration::from_millis(ack.delay.0 << self.transport_params.ack_delay_exponent);
             self.rtt.update(
                 latest_rtt,
                 ack_delay,
@@ -424,7 +405,7 @@ impl ConnectionInner {
         // println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
         for frame in lost {
             // Only retransmitt stream frames for send streams that has not sent reset
-            if let Frame::Stream(StreamData { id, .. }) = &frame {
+            if let Frame::Stream(Stream { id, .. }) = &frame {
                 let stream = self.send(id);
                 let Some(stream) = stream else {
                     continue;
@@ -657,7 +638,7 @@ impl ConnectionInner {
             if mtu > frame.size() {
                 let frame = self.spaces[p_space].pending_frames.pop_front().unwrap();
                 // Only retransmitt stream frames for send streams that has not sent reset
-                if let Frame::Stream(StreamData { id, .. }) = &frame {
+                if let Frame::Stream(Stream { id, .. }) = &frame {
                     let stream = self.send.get(id);
                     let Some(stream) = stream else {
                         continue;
@@ -691,7 +672,7 @@ impl ConnectionInner {
                 let _ = send.read_n(&mut data, mtu);
                 let fin = send.is_finished();
 
-                let frame = Frame::Stream(StreamData {
+                let frame = Frame::Stream(Stream {
                     id: id.clone(),
                     fin,
                     len: true,
@@ -719,7 +700,7 @@ impl ConnectionInner {
         }
 
         let last = frames.last_mut().unwrap();
-        if let Frame::Stream(StreamData { fin, .. }) = last {
+        if let Frame::Stream(Stream { fin, .. }) = last {
             *fin = true
         };
 
@@ -1247,7 +1228,7 @@ mod test {
     }
 
     fn send_stream_data_to(conn: &mut ConnectionInner, id: StreamID, data: Bytes, pn: &mut u8) {
-        let frame = Frame::Stream(StreamData {
+        let frame = Frame::Stream(Stream {
             id,
             fin: false,
             len: false,

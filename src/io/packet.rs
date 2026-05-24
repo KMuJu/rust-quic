@@ -443,7 +443,7 @@ mod test {
     use std::io::{self, Cursor};
 
     use crate::io::{
-        frame::StreamData,
+        frame::Stream,
         stream::{Dir, StreamID},
     };
 
@@ -577,7 +577,7 @@ mod test {
             data: c_data,
         };
 
-        let stream_frame = Frame::Stream(StreamData {
+        let stream_frame = Frame::Stream(Stream {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: false,
