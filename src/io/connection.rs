@@ -23,30 +23,33 @@ use tokio::{
 
 use crate::io::{
     ConnectionToEndpoint, EndpointToConnection,
-    ack_manager::SentPacket,
     congestion::CongestionController,
     crypto::CryptoFrame,
+    encoding::VarInt,
     endpoint::EndpointRef,
-    frame::{Frame, StreamData},
+    frame::{AckRange, Frame, StreamData},
     packet::{Header, Packet, PacketNumber},
     rtt_estimator::RttEstimator,
     socket::Socket,
-    space::{
-        PacketSpace, RttSample, Space,
-        SpaceEvent::{Ack, Crypto, HandshakeDone, RecvStreamFrame, SendStreamFrame},
-    },
+    space::{PacketSpace, Space},
     stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
     timers::{Timer, TimerTable},
     transport_parameters::{SharedConfig, TransportParam},
 };
 
-use super::encoding::VarInt;
+#[derive(PartialEq, Eq, Debug)]
+pub enum LifeCycle {
+    Handshake,
+    Connected,
+    // TODO: Add closed and such
+}
 
 pub struct ConnectionInner {
     id: ConnectionID,
     // Peer's cid
     peer_cid: ConnectionID,
     side: Side,
+    lifeycle: LifeCycle,
 
     connected: Option<oneshot::Sender<()>>,
     state: PacketSpace,
@@ -69,9 +72,10 @@ pub struct ConnectionInner {
 
     stream_number: usize,
 
-    initial_space: Space,
-    handshake_space: Space,
-    data_space: Space,
+    // initial_space: Space,
+    // handshake_space: Space,
+    // data_space: Space,
+    spaces: [Space; 3],
 
     transport_params: SharedConfig,
     rtt: RttEstimator,
@@ -130,8 +134,7 @@ impl ConnectionInner {
             "{:?}({:?})[{:?}]: Got {:?}",
             self.id, self.state, self.side, packet
         );
-        if !self
-            .space_mut(p_space)
+        if !self.spaces[p_space]
             .acker
             .received(packet.packet_number(), packet.is_ack_eliciting())
         {
@@ -143,181 +146,265 @@ impl ConnectionInner {
             return;
         }
 
-        match packet.header {
-            Header::Short { .. } => {
-                if !matches!(self.state, PacketSpace::Data) {
-                    eprintln!("Got 1-RTT header in wrong state: {:?}", self.state);
-                    for frame in packet.frames.iter() {
-                        println!("Frame: {frame:?}");
-                    }
-                    return;
+        match self.lifeycle {
+            LifeCycle::Handshake => {}
+            LifeCycle::Connected => match packet.packet_space() {
+                PacketSpace::Data => return self.handle_data_packet(packet),
+                _ => {
+                    eprintln!("Unexpected handshake packet when connected")
                 }
-                let mut events = Vec::new();
-                for frame in packet.frames {
-                    if let Some(event) =
-                        self.data_space
-                            .handle_frame(frame, &self.rtt, &mut self.congestion)
-                    {
-                        events.push(event);
-                    }
-                }
-                for event in events {
-                    match event {
-                        RecvStreamFrame(id, frame) => {
-                            if !self.recv.contains_key(&id) {
-                                self.handle_new_stream(&id);
-                            }
+            },
+        };
 
-                            let recv = self.recv.get_mut(&id).unwrap();
-
-                            recv.handle_frame(frame);
-                        }
-                        SendStreamFrame(id, frame) => {
-                            if !self.send.contains_key(&id) {
-                                self.handle_new_stream(&id);
-                            }
-
-                            let send = self.send.get_mut(&id).unwrap();
-
-                            send.handle_frame(frame);
-                        }
-                        HandshakeDone => {
-                            self.consume_connected();
-                        }
-                        Ack { sample, lost } => {
-                            self.on_ack_event(PacketSpace::Data, sample, lost);
-                        }
-                        Crypto { offset, data } => todo!(),
-                    }
-                }
-                if matches!(self.side, Side::Client) {
-                    self.handshake_space.discard();
+        match &packet.header {
+            Header::Initial { .. } | Header::Handshake { .. } => {
+                if !self.spaces[packet.packet_space()].is_discarded() {
+                    self.handle_handshake_packet(packet);
                 }
             }
-            Header::Initial { .. } => {
-                let mut events = Vec::new();
-                // Handle initial frames in order to do acks
-                for frame in packet.frames {
-                    if let Some(event) =
-                        self.initial_space
-                            .handle_frame(frame, &self.rtt, &mut self.congestion)
-                    {
-                        events.push(event);
+            Header::Short { .. } => self.handle_data_packet(packet),
+        }
+    }
+
+    fn handle_data_packet(&mut self, packet: Packet) {
+        let p_space = PacketSpace::Data;
+        for frame in packet.frames {
+            match frame {
+                Frame::Padding => continue,
+                Frame::Ping => {
+                    if let Some(ack) = self.spaces[p_space].acker.get_ack() {
+                        self.spaces[p_space].pending_frames.push_back(ack);
                     }
                 }
-
-                if matches!(self.side, Side::Client) || !matches!(self.state, PacketSpace::Initial)
-                {
-                    // Does not have to handle initial events for client or if not in initial state
-                    return;
+                Frame::Ack {
+                    largest,
+                    delay,
+                    first_range,
+                    ranges,
+                    ecn,
+                } => {
+                    self.on_ack_received(p_space, largest, delay, first_range, &ranges);
                 }
-
-                for event in events {
-                    match event {
-                        Crypto { offset, data } => {
-                            let mut data = Cursor::new(data);
-                            let c_frame = CryptoFrame::decode(&mut data);
-                            if matches!(c_frame, CryptoFrame::ClientHello) {
-                                self.state = PacketSpace::Handshake;
-
-                                let crypto_data = CryptoFrame::ServerHello;
-                                let mut c_data = Vec::new();
-                                crypto_data.encode(&mut c_data);
-                                let crypto_frame = Frame::Crypto {
-                                    offset: VarInt(0),
-                                    data: c_data,
-                                };
-
-                                self.handshake_space.push_back_frame(crypto_frame);
-
-                                self.initial_space.discard();
-                            }
-                        }
-                        Ack { sample, lost } => {
-                            self.on_ack_event(PacketSpace::Initial, sample, lost);
-                        }
-                        RecvStreamFrame(_, _) | SendStreamFrame(_, _) | HandshakeDone => (),
+                Frame::ResetStream {
+                    id,
+                    error_code,
+                    final_size,
+                } => todo!(),
+                Frame::StopSending { id, error_code } => todo!(),
+                Frame::Crypto { offset, data } => {
+                    eprintln!("[CRYPTO] Got crypto while established")
+                }
+                Frame::NewToken { token } => todo!(),
+                Frame::Stream(stream) => {
+                    if !self.recv.contains_key(&stream.id) {
+                        self.handle_new_stream(&stream.id);
                     }
+
+                    let recv = self.recv.get_mut(&stream.id).unwrap();
+                    recv.handle_stream_frame(stream);
                 }
-            }
-            Header::Handshake { .. } => {
-                let mut events = Vec::new();
-                for frame in packet.frames {
-                    if let Some(event) =
-                        self.handshake_space
-                            .handle_frame(frame, &self.rtt, &mut self.congestion)
-                    {
-                        events.push(event);
-                    }
-                }
-                if !matches!(self.state, PacketSpace::Handshake) {
-                    // Does not have to handle handshake events if not in handshake state
-                    return;
-                }
-                for event in events {
-                    match event {
-                        Crypto { offset, data } => match self.side {
-                            Side::Client => {
-                                let mut data = Cursor::new(data);
-                                let c_frame = CryptoFrame::decode(&mut data);
-                                if matches!(c_frame, CryptoFrame::ServerHello) {
-                                    self.state = PacketSpace::Data;
-                                    let crypto_data = CryptoFrame::Finished;
-                                    let mut c_data = Vec::new();
-                                    crypto_data.encode(&mut c_data);
-                                    let crypto_frame = Frame::Crypto {
-                                        offset: VarInt(0),
-                                        data: c_data,
-                                    };
-                                    self.handshake_space.push_back_frame(crypto_frame);
-                                    self.initial_space.discard();
-                                }
-                            }
-                            Side::Server => {
-                                let mut data = Cursor::new(data);
-                                let c_frame = CryptoFrame::decode(&mut data);
-                                if matches!(c_frame, CryptoFrame::Finished) {
-                                    self.state = PacketSpace::Data;
-                                    self.consume_connected();
-                                    let frame = Frame::HandshakeDone;
-                                    self.data_space.push_back_frame(frame);
-                                    self.handshake_space.discard();
-                                }
-                            }
-                        },
-                        Ack { sample, lost } => {
-                            self.on_ack_event(PacketSpace::Handshake, sample, lost);
-                        }
-                        RecvStreamFrame(_, _) | SendStreamFrame(_, _) | HandshakeDone => (),
-                    }
+                Frame::MaxData { max_data } => todo!(),
+                Frame::MaxStreamData {
+                    id,
+                    max_stream_data,
+                } => todo!(),
+                Frame::MaxStreams { dir, max_streams } => todo!(),
+                Frame::DataBlocked { max_data } => todo!(),
+                Frame::StreamDataBlocked {
+                    id,
+                    max_stream_data,
+                } => todo!(),
+                Frame::StreamsBlocked { dir, max_streams } => todo!(),
+                Frame::NewConnectionId {
+                    seq_num,
+                    retire,
+                    cid,
+                    stateless_reset_token,
+                } => todo!(),
+                Frame::RetireConnectionId { seq_num } => todo!(),
+                Frame::PathChallenge { data } => todo!(),
+                Frame::PathResponse { data } => todo!(),
+                Frame::ConnectionCloseQuic {
+                    error_code,
+                    frame_type,
+                    reason_phrase,
+                } => todo!(),
+                Frame::ConnectionCloseApp {
+                    error_code,
+                    reason_phrase,
+                } => todo!(),
+                Frame::HandshakeDone => {
+                    self.consume_connected();
+                    self.spaces[PacketSpace::Initial].discard();
+                    self.spaces[PacketSpace::Handshake].discard();
                 }
             }
         }
     }
 
-    /// Missing part of RFC 9002 A.7
-    /// Does what can't be done in `Space::handle_ack_frame` which is
-    /// - Queue pending frames
-    /// - Update RTT
-    /// - Set loss timer
-    fn on_ack_event(
+    fn handle_handshake_packet(&mut self, packet: Packet) {
+        let p_space = packet.packet_space();
+        for frame in packet.frames {
+            match frame {
+                Frame::Padding | Frame::Ping => {}
+                Frame::Ack {
+                    largest,
+                    delay,
+                    first_range,
+                    ranges,
+                    ecn,
+                } => self.on_ack_received(p_space, largest, delay, first_range, &ranges),
+                Frame::Crypto { offset, data } => self.handle_crypto(p_space, offset, data),
+                Frame::ConnectionCloseQuic {
+                    error_code,
+                    frame_type,
+                    reason_phrase,
+                } => todo!(),
+                _ => {
+                    unreachable!("Got illigal frame type when processing handshake packet")
+                }
+            }
+        }
+    }
+
+    fn handle_crypto(&mut self, p_space: PacketSpace, offset: VarInt, data: Vec<u8>) {
+        match p_space {
+            PacketSpace::Initial => {
+                if matches!(self.side, Side::Client) || !matches!(self.state, PacketSpace::Initial)
+                {
+                    // Does not have to handle initial events for client or if not in initial state
+                    return;
+                }
+                let mut data = Cursor::new(data);
+                let c_frame = CryptoFrame::decode(&mut data);
+                if matches!(c_frame, CryptoFrame::ClientHello) {
+                    self.state = PacketSpace::Handshake;
+
+                    let crypto_data = CryptoFrame::ServerHello;
+                    let mut c_data = Vec::new();
+                    crypto_data.encode(&mut c_data);
+                    let crypto_frame = Frame::Crypto {
+                        offset: VarInt(0),
+                        data: c_data,
+                    };
+
+                    self.spaces[PacketSpace::Handshake].push_back_frame(crypto_frame);
+
+                    self.spaces[PacketSpace::Initial].discard();
+                }
+            }
+            PacketSpace::Handshake => {
+                if !matches!(self.state, PacketSpace::Handshake) {
+                    // Does not have to handle handshake events if not in handshake state
+                    return;
+                }
+
+                match self.side {
+                    Side::Client => {
+                        let mut data = Cursor::new(data);
+                        let c_frame = CryptoFrame::decode(&mut data);
+                        if matches!(c_frame, CryptoFrame::ServerHello) {
+                            self.state = PacketSpace::Data;
+                            let crypto_data = CryptoFrame::Finished;
+                            let mut c_data = Vec::new();
+                            crypto_data.encode(&mut c_data);
+                            let crypto_frame = Frame::Crypto {
+                                offset: VarInt(0),
+                                data: c_data,
+                            };
+                            self.spaces[PacketSpace::Handshake].push_back_frame(crypto_frame);
+                            self.spaces[PacketSpace::Initial].discard();
+                            self.lifeycle = LifeCycle::Connected;
+                        }
+                    }
+                    Side::Server => {
+                        let mut data = Cursor::new(data);
+                        let c_frame = CryptoFrame::decode(&mut data);
+                        if matches!(c_frame, CryptoFrame::Finished) {
+                            self.state = PacketSpace::Data;
+                            let frame = Frame::HandshakeDone;
+                            self.spaces[PacketSpace::Data].push_back_frame(frame);
+                            self.spaces[PacketSpace::Handshake].discard();
+
+                            self.consume_connected();
+                            self.lifeycle = LifeCycle::Connected;
+                        }
+                    }
+                }
+            }
+            PacketSpace::Data => {}
+        }
+    }
+
+    /// Follows RFC 9002 A.7
+    fn on_ack_received(
         &mut self,
         p_space: PacketSpace,
-        sample: Option<RttSample>,
-        lost: Vec<SentPacket>,
+        largest: VarInt,
+        delay: VarInt,
+        first_range: VarInt,
+        ranges: &Vec<AckRange>,
     ) {
-        if !lost.is_empty() {
-            let lost_frames: Vec<_> = lost.into_iter().flat_map(|lost| lost.frames).collect();
-            self.add_lost_to_pending(p_space, lost_frames);
+        let mut acked = Vec::new();
+        let mut current = largest.0;
+
+        // First range: largest down to largest - first_range
+        for pn in (current - first_range.0..=current).rev() {
+            acked.push(pn as u32);
         }
-        if let Some(sample) = sample {
+        current -= first_range.0;
+
+        // Subsequent ranges: skip gap+2, then ack length+1
+        for range in ranges {
+            current -= range.gap.0 + 2;
+            for pn in (current - range.length.0..=current).rev() {
+                acked.push(pn as u32);
+            }
+            current -= range.length.0;
+        }
+
+        let newly_acked: Vec<_> = acked
+            .iter()
+            .filter_map(|&pn| self.spaces[p_space].acker.acked(pn))
+            .collect();
+
+        if newly_acked.is_empty() {
+            return;
+        }
+
+        let largest_acked = newly_acked.iter().max_by_key(|acked| acked.pn).unwrap();
+        if largest_acked.pn == (largest.0 as u32)
+            && newly_acked.iter().any(|acked| acked.ack_eliciting)
+        {
+            let latest_rtt = Instant::now() - largest_acked.timestamp;
+            let ack_delay =
+                Duration::from_millis(delay.0 << self.transport_params.ack_delay_exponent);
             self.rtt.update(
-                sample.latest_rtt,
-                sample.ack_delay,
+                latest_rtt,
+                ack_delay,
                 &self.transport_params.max_ack_delay,
                 self.handshake_is_done(),
             );
         }
+
+        let lost = self.spaces[p_space].acker.get_lost_frames(&self.rtt);
+        if !lost.is_empty() {
+            self.congestion.on_loss(lost.as_slice(), &self.rtt);
+        }
+
+        newly_acked
+            .iter()
+            .filter(|acked| acked.in_flight)
+            .for_each(|acked| {
+                self.congestion
+                    .on_ack(acked.sent_bytes as u64, acked.timestamp)
+            });
+
+        if !lost.is_empty() {
+            let lost_frames: Vec<_> = lost.into_iter().flat_map(|lost| lost.frames).collect();
+            self.add_lost_to_pending(p_space, lost_frames);
+        }
+
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
         }
@@ -333,25 +420,7 @@ impl ConnectionInner {
         self.pto_count = 0;
     }
 
-    #[inline]
-    fn space_mut(&mut self, p_space: PacketSpace) -> &mut Space {
-        match p_space {
-            PacketSpace::Initial => &mut self.initial_space,
-            PacketSpace::Handshake => &mut self.handshake_space,
-            PacketSpace::Data => &mut self.data_space,
-        }
-    }
-
-    #[inline]
-    fn space(&self, p_space: PacketSpace) -> &Space {
-        match p_space {
-            PacketSpace::Initial => &self.initial_space,
-            PacketSpace::Handshake => &self.handshake_space,
-            PacketSpace::Data => &self.data_space,
-        }
-    }
-
-    fn add_lost_to_pending(&mut self, space: PacketSpace, lost: Vec<Frame>) {
+    fn add_lost_to_pending(&mut self, p_space: PacketSpace, lost: Vec<Frame>) {
         // println!("Lost these frames({space:?})[{:?}]: {lost:?}", self.side);
         for frame in lost {
             // Only retransmitt stream frames for send streams that has not sent reset
@@ -364,7 +433,7 @@ impl ConnectionInner {
                     continue;
                 }
             };
-            self.space_mut(space).push_back_frame(frame);
+            self.spaces[p_space].push_back_frame(frame);
         }
     }
 
@@ -391,7 +460,7 @@ impl ConnectionInner {
     }
 
     fn spaces(&self) -> impl Iterator<Item = &Space> {
-        [&self.initial_space, &self.handshake_space, &self.data_space].into_iter()
+        self.spaces.iter()
     }
 
     fn next_ack_deadline(&self) -> Option<Instant> {
@@ -468,8 +537,7 @@ impl ConnectionInner {
             PacketSpace::Handshake,
             PacketSpace::Data,
         ] {
-            if !self
-                .space(p_space)
+            if !self.spaces[p_space]
                 .acker
                 .has_ack_eliciting_packet_in_flight()
             {
@@ -483,7 +551,7 @@ impl ConnectionInner {
                 duration += self.transport_params.max_ack_delay * 2u32.pow(self.pto_count);
             }
 
-            let Some(last) = self.space(p_space).acker.time_of_last_elicit() else {
+            let Some(last) = self.spaces[p_space].acker.time_of_last_elicit() else {
                 // Skip if space has no sent packet
                 continue;
             };
@@ -515,7 +583,7 @@ impl ConnectionInner {
                     // Follows RFC 9002 A.9
                     let rtt = &self.rtt.clone();
                     if let Some((_, p_space)) = self.get_loss_time_and_space() {
-                        let lost = self.space_mut(p_space).acker.get_lost_frames(rtt);
+                        let lost = self.spaces[p_space].acker.get_lost_frames(rtt);
                         self.congestion.on_loss(lost.as_slice(), rtt);
                         let lost_frames: Vec<_> =
                             lost.into_iter().flat_map(|lost| lost.frames).collect();
@@ -538,7 +606,7 @@ impl ConnectionInner {
                     } else {
                         let p_space = self.pto_space();
                         let pto_frames = self.build_pto_probe(p_space);
-                        self.space_mut(p_space)
+                        self.spaces[p_space]
                             .pending_frames
                             .extend(pto_frames.into_iter());
                     }
@@ -551,7 +619,7 @@ impl ConnectionInner {
 
     fn get_packet(&mut self, p_space: PacketSpace, mut mtu: usize) -> Option<Packet> {
         // println!("[ACK]: Getting packet for {p_space:?}");
-        let pn = PacketNumber::from(self.space(p_space).packet_number);
+        let pn = PacketNumber::from(self.spaces[p_space].packet_number);
 
         let header = match p_space {
             PacketSpace::Initial => Header::Initial {
@@ -585,9 +653,9 @@ impl ConnectionInner {
 
         let mut frames = Vec::new();
 
-        while let Some(frame) = self.space_mut(p_space).pending_frames.front() {
+        while let Some(frame) = self.spaces[p_space].pending_frames.front() {
             if mtu > frame.size() {
-                let frame = self.space_mut(p_space).pending_frames.pop_front().unwrap();
+                let frame = self.spaces[p_space].pending_frames.pop_front().unwrap();
                 // Only retransmitt stream frames for send streams that has not sent reset
                 if let Frame::Stream(StreamData { id, .. }) = &frame {
                     let stream = self.send.get(id);
@@ -605,7 +673,7 @@ impl ConnectionInner {
             }
         }
 
-        if let Some(ack) = self.space_mut(p_space).acker.get_ack() {
+        if let Some(ack) = self.spaces[p_space].acker.get_ack() {
             if mtu > ack.size() {
                 mtu -= ack.size();
                 frames.push(ack);
@@ -640,7 +708,7 @@ impl ConnectionInner {
                     mtu -= size;
                     frames.push(frame);
                 } else {
-                    self.space_mut(p_space).pending_frames.push_back(frame);
+                    self.spaces[p_space].pending_frames.push_back(frame);
                     break;
                 }
             }
@@ -657,12 +725,12 @@ impl ConnectionInner {
 
         let packet = Packet { header, frames };
 
-        self.space_mut(p_space).packet_number += 1;
+        self.spaces[p_space].packet_number += 1;
         Some(packet)
     }
 
     fn build_pto_probe(&mut self, p_space: PacketSpace) -> Vec<Frame> {
-        let unacked = self.space_mut(p_space).acker.unacked_frames();
+        let unacked = self.spaces[p_space].acker.unacked_frames();
         if !unacked.is_empty() {
             unacked
         } else {
@@ -671,16 +739,14 @@ impl ConnectionInner {
     }
 
     fn pto_space(&self) -> PacketSpace {
-        if !self.initial_space.is_discarded()
-            && self
-                .initial_space
+        if !self.spaces[PacketSpace::Initial].is_discarded()
+            && self.spaces[PacketSpace::Initial]
                 .acker
                 .has_ack_eliciting_packet_in_flight()
         {
             PacketSpace::Initial
-        } else if !self.handshake_space.is_discarded()
-            && self
-                .handshake_space
+        } else if !self.spaces[PacketSpace::Handshake].is_discarded()
+            && self.spaces[PacketSpace::Handshake]
                 .acker
                 .has_ack_eliciting_packet_in_flight()
         {
@@ -739,6 +805,7 @@ impl Connection {
             id: cid,
             peer_cid,
             side,
+            lifeycle: LifeCycle::Handshake,
             connected: Some(connected),
             state: PacketSpace::Initial,
             recv: HashMap::new(),
@@ -752,9 +819,11 @@ impl Connection {
             write_waker: AtomicWaker::new(),
             stream_number: 0,
 
-            initial_space: Space::new(PacketSpace::Initial, transport_params.clone()),
-            handshake_space: Space::new(PacketSpace::Handshake, transport_params.clone()),
-            data_space: Space::new(PacketSpace::Data, transport_params.clone()),
+            spaces: [
+                Space::new(PacketSpace::Initial, transport_params.clone()),
+                Space::new(PacketSpace::Handshake, transport_params.clone()),
+                Space::new(PacketSpace::Data, transport_params.clone()),
+            ],
             pto_count: 0,
             transport_params: transport_params.clone(),
             rtt: RttEstimator::new(),
@@ -830,7 +899,9 @@ impl Connection {
             offset: VarInt(0),
             data: c_data,
         };
-        inner.initial_space.pending_frames.push_back(crypto_frame);
+        inner.spaces[PacketSpace::Initial]
+            .pending_frames
+            .push_back(crypto_frame);
         inner.state = PacketSpace::Handshake;
         inner.write_waker.wake();
     }
@@ -947,7 +1018,7 @@ impl Future for ConnectionDriver {
 
             let mtu = 1200;
             for p_space in PacketSpace::iter() {
-                if conn.space(p_space).is_discarded() {
+                if conn.spaces[p_space].is_discarded() {
                     continue;
                 }
                 while let Some(packet) = {
@@ -961,38 +1032,36 @@ impl Future for ConnectionDriver {
             pkts
         };
 
-        for packet in packets {
-            let p_space = packet.packet_space();
-            println!(
-                "Sending packet({p_space:?})[{:?}]: {packet:?}",
-                this.inner.lock().unwrap().side
-            );
+        {
+            let mut conn = this.inner.lock().unwrap();
+            for packet in packets {
+                println!(
+                    "Sending packet({:?})[{:?}]: {packet:?}",
+                    conn.state, conn.side
+                );
 
-            let mut buf = BytesMut::new();
-            packet.encode(&mut buf).unwrap();
-            this.outgoing_data
-                .send(ConnectionToEndpoint {
-                    data: buf,
-                    addr: this.addr,
-                })
-                .unwrap();
+                let mut buf = BytesMut::new();
+                packet.encode(&mut buf).unwrap();
+                this.outgoing_data
+                    .send(ConnectionToEndpoint {
+                        data: buf,
+                        addr: this.addr,
+                    })
+                    .unwrap();
 
-            let is_in_flight = packet.is_in_flight();
-            let is_ack_eliciting = packet.is_ack_eliciting();
-            this.inner
-                .lock()
-                .unwrap()
-                .space_mut(p_space)
-                .acker
-                .sent_packet(
+                let is_in_flight = packet.is_in_flight();
+                let is_ack_eliciting = packet.is_ack_eliciting();
+                let p_space = packet.packet_space();
+                conn.spaces[p_space].acker.sent_packet(
                     packet.packet_number().clone(),
                     packet.frames,
                     is_in_flight,
                     is_ack_eliciting,
                 );
 
-            if is_in_flight {
-                this.inner.lock().unwrap().set_loss_timer();
+                if is_in_flight {
+                    conn.set_loss_timer();
+                }
             }
         }
 
@@ -1018,7 +1087,7 @@ impl Future for ConnectionDriver {
 
 #[cfg(test)]
 mod test {
-    use bytes::{BufMut, Bytes};
+    use bytes::Bytes;
     use futures::task::noop_waker_ref;
 
     use crate::io::ack_manager::Acker;
@@ -1039,6 +1108,7 @@ mod test {
                 buf: [0; 20],
             },
             side: Side::Server,
+            lifeycle: LifeCycle::Handshake,
             connected: Some(sender),
             state: PacketSpace::Initial,
             recv: HashMap::new(),
@@ -1051,9 +1121,11 @@ mod test {
             pending_send: VecDeque::new(),
             write_waker: AtomicWaker::new(),
             stream_number: 0,
-            initial_space: Space::new(PacketSpace::Initial, transport_params.clone()),
-            handshake_space: Space::new(PacketSpace::Handshake, transport_params.clone()),
-            data_space: Space::new(PacketSpace::Data, transport_params.clone()),
+            spaces: [
+                Space::new(PacketSpace::Initial, transport_params.clone()),
+                Space::new(PacketSpace::Handshake, transport_params.clone()),
+                Space::new(PacketSpace::Data, transport_params.clone()),
+            ],
             transport_params: transport_params.clone(),
             rtt: RttEstimator::new(),
             pto_count: 0,
@@ -1206,7 +1278,7 @@ mod test {
 
         let packet = get_packet(conn, PacketSpace::Data, 1200);
 
-        conn.space_mut(PacketSpace::Data).acker.sent_packet(
+        conn.spaces[PacketSpace::Data].acker.sent_packet(
             packet.packet_number().clone(),
             packet.frames.clone(),
             packet.is_in_flight(),
@@ -1253,6 +1325,9 @@ mod test {
             assert!(Pin::new(&mut receiver).poll(&mut cx).is_ready());
             assert!(connection.handshake_is_done());
         }
+
+        assert_eq!(connection.lifeycle, LifeCycle::Connected);
+        assert_eq!(connection.state, PacketSpace::Data);
     }
 
     #[test]
@@ -1310,7 +1385,7 @@ mod test {
         // The loss should be pto since only no ack has been received
         let (pto, p_space) = connection.get_pto_time_and_space().unwrap();
         assert_eq!(next.unwrap(), pto);
-        assert!(matches!(p_space, PacketSpace::Data));
+        assert_eq!(p_space, PacketSpace::Data);
 
         // Conn sends two packets
         let sending_bytes = Bytes::from_static(&[1, 2, 3, 4, 5]);
@@ -1328,7 +1403,7 @@ mod test {
         assert!(next.is_some());
         let (loss, p_space) = connection.get_loss_time_and_space().unwrap();
         assert_eq!(next.unwrap(), loss);
-        assert!(matches!(p_space, PacketSpace::Data));
+        assert_eq!(p_space, PacketSpace::Data);
 
         // Now the unacked packet is acked, so it should reset the loss timer
         acker.received(unacked.packet_number(), unacked.is_ack_eliciting());

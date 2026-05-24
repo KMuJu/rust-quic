@@ -75,27 +75,25 @@ impl RecvStream {
         match frame {
             Frame::ResetStream { .. } => todo!(),
             Frame::StopSending { .. } => todo!(),
-            Frame::Stream(StreamData {
-                id: _,
-                fin,
-                len: _,
-                offset,
-                data,
-            }) => {
-                // TODO: Handle fin bit
-                if matches!(self.state, RecvState::Recv | RecvState::SizeKnown) {
-                    self.assembler.add(data, offset.0);
-                    if fin {
-                        self.state = RecvState::SizeKnown;
-                    }
-                } else {
-                    eprint!("Received data in wrong state");
-                }
+            Frame::Stream(frame) => {
+                self.handle_stream_frame(frame);
             }
             Frame::MaxStreamData { .. } => todo!(),
             Frame::StreamDataBlocked { .. } => todo!(),
             _ => (),
         };
+    }
+
+    pub(super) fn handle_stream_frame(&mut self, frame: StreamData) {
+        // TODO: Handle fin bit
+        if matches!(self.state, RecvState::Recv | RecvState::SizeKnown) {
+            self.assembler.add(frame.data, frame.offset.0);
+            if frame.fin {
+                self.state = RecvState::SizeKnown;
+            }
+        } else {
+            eprint!("Received data in wrong state");
+        }
     }
 
     pub(super) fn is_reset(&self) -> bool {

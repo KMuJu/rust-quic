@@ -428,6 +428,14 @@ impl Header {
             } => 1 + dst_cid.len as usize + packet_number.len() as usize,
         }
     }
+
+    pub(super) fn packet_space(&self) -> PacketSpace {
+        match self {
+            Header::Initial { .. } => PacketSpace::Initial,
+            Header::Handshake { .. } => PacketSpace::Handshake,
+            Header::Short { .. } => PacketSpace::Data,
+        }
+    }
 }
 
 #[cfg(test)]
