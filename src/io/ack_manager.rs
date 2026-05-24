@@ -6,7 +6,7 @@ use tokio::time::Instant;
 
 use crate::io::{
     encoding::VarInt,
-    frame::{AckRange, Frame},
+    frame::{Ack, AckRange, Frame},
     packet::PacketNumber,
     rtt_estimator::RttEstimator,
     transport_parameters::SharedConfig,
@@ -156,13 +156,13 @@ impl Acker {
             prev_end = *range.start();
         }
 
-        Frame::Ack {
+        Frame::Ack(Ack {
             largest: VarInt(largest as u64),
             delay: VarInt(encoded_delay as u64),
             first_range: VarInt(first_range as u64),
             ranges,
             ecn: None,
-        }
+        })
     }
 
     pub(super) fn sent_packet(
@@ -303,13 +303,13 @@ mod tests {
 
         println!("Frame: {frame:?}");
         match frame {
-            Frame::Ack {
+            Frame::Ack(Ack {
                 largest,
                 delay,
                 first_range,
                 ranges,
                 ecn,
-            } => {
+            }) => {
                 assert_eq!(largest.0, 9);
                 assert_eq!(first_range.0, 0);
                 assert_eq!(ranges.len(), 2);
@@ -334,13 +334,13 @@ mod tests {
 
         println!("Frame: {frame:?}");
         match frame {
-            Frame::Ack {
+            Frame::Ack(Ack {
                 largest,
                 delay,
                 first_range,
                 ranges,
                 ecn,
-            } => {
+            }) => {
                 assert_eq!(largest.0, 3);
                 assert_eq!(first_range.0, 2);
                 assert_eq!(ranges.len(), 0);
@@ -365,13 +365,13 @@ mod tests {
 
         println!("Frame: {frame:?}");
         match frame {
-            Frame::Ack {
+            Frame::Ack(Ack {
                 largest,
                 delay,
                 first_range,
                 ranges,
                 ecn,
-            } => {
+            }) => {
                 assert_eq!(largest.0, 9);
                 assert_eq!(first_range.0, 1);
                 assert_eq!(ranges.len(), 2);

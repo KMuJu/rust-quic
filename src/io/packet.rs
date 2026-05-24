@@ -428,6 +428,14 @@ impl Header {
             } => 1 + dst_cid.len as usize + packet_number.len() as usize,
         }
     }
+
+    pub(super) fn packet_space(&self) -> PacketSpace {
+        match self {
+            Header::Initial { .. } => PacketSpace::Initial,
+            Header::Handshake { .. } => PacketSpace::Handshake,
+            Header::Short { .. } => PacketSpace::Data,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -435,7 +443,7 @@ mod test {
     use std::io::{self, Cursor};
 
     use crate::io::{
-        frame::StreamData,
+        frame::Stream,
         stream::{Dir, StreamID},
     };
 
@@ -569,7 +577,7 @@ mod test {
             data: c_data,
         };
 
-        let stream_frame = Frame::Stream(StreamData {
+        let stream_frame = Frame::Stream(Stream {
             id: StreamID::new_unchecked(1),
             fin: false,
             len: false,
