@@ -4,6 +4,7 @@ use std::{
     future::poll_fn,
     io::Cursor,
     net::SocketAddr,
+    ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, ready},
@@ -14,6 +15,7 @@ use bytes::{Buf, BytesMut};
 use futures::task::AtomicWaker;
 use rand::{Rng, rngs::StdRng};
 use tokio::{
+    io::ReadBuf,
     sync::{
         mpsc::{UnboundedReceiver, UnboundedSender},
         oneshot,
@@ -27,12 +29,12 @@ use crate::{
     crypto::CryptoFrame,
     encoding::VarInt,
     endpoint::EndpointRef,
-    frame::{Ack, AckRange, Frame, Stream},
+    frame::{Ack, Frame, Stream},
     packet::{Header, Packet, PacketNumber},
     rtt_estimator::RttEstimator,
     socket::Socket,
     space::{PacketSpace, Space},
-    stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
+    stream::{Dir, ReadError, RecvStream, SendError, SendStream, Side, StreamID},
     timers::{Timer, TimerTable},
     transport_parameters::{SharedConfig, TransportParam},
 };
@@ -44,7 +46,7 @@ pub enum LifeCycle {
     // TODO: Add closed and such
 }
 
-pub struct ConnectionInner {
+pub struct ConnectionCore {
     id: ConnectionID,
     // Peer's cid
     peer_cid: ConnectionID,
@@ -120,7 +122,45 @@ impl Debug for ConnectionID {
     }
 }
 
-impl ConnectionInner {
+impl ConnectionCore {
+    pub(crate) fn new(
+        cid: ConnectionID,
+        peer_cid: ConnectionID,
+        side: Side,
+        connected: oneshot::Sender<()>,
+        transport_params: SharedConfig,
+    ) -> Self {
+        ConnectionCore {
+            id: cid,
+            peer_cid,
+            side,
+            lifeycle: LifeCycle::Handshake,
+            connected: Some(connected),
+            state: PacketSpace::Initial,
+            recv: HashMap::new(),
+            send: HashMap::new(),
+            bidir_acceptable: VecDeque::new(),
+            bidir_accept_waker: AtomicWaker::new(),
+            unidir_acceptable: VecDeque::new(),
+            unidir_accept_waker: AtomicWaker::new(),
+            pending_recv: VecDeque::new(),
+            pending_send: VecDeque::new(),
+            write_waker: AtomicWaker::new(),
+            stream_number: 0,
+
+            spaces: [
+                Space::new(PacketSpace::Initial, transport_params.clone()),
+                Space::new(PacketSpace::Handshake, transport_params.clone()),
+                Space::new(PacketSpace::Data, transport_params.clone()),
+            ],
+            pto_count: 0,
+            transport_params: transport_params.clone(),
+            rtt: RttEstimator::new(),
+            congestion: CongestionController::new(transport_params.clone()),
+            timers: TimerTable::new(),
+        }
+    }
+
     pub fn handle_datagram(&mut self, buf: &[u8]) {
         let packet = match Packet::decode(&mut Cursor::new(buf), self.id.len) {
             Ok(p) => p,
@@ -737,6 +777,19 @@ impl ConnectionInner {
         }
     }
 
+    pub(super) fn packet_sent(
+        &mut self,
+        p_space: PacketSpace,
+        pn: PacketNumber,
+        frames: Vec<Frame>,
+        is_in_flight: bool,
+        is_ack_eliciting: bool,
+    ) {
+        self.spaces[p_space]
+            .acker
+            .sent_packet(pn, frames, is_in_flight, is_ack_eliciting);
+    }
+
     pub(super) fn mark_pending_on_recv(&mut self, id: StreamID) {
         self.pending_recv.push_back(id);
         self.write_waker.wake();
@@ -767,8 +820,19 @@ pub(super) struct ConnectionHandle {
 }
 
 #[derive(Clone)]
+pub struct ConnectionRef(Arc<Mutex<ConnectionIO>>);
+
+impl Deref for ConnectionRef {
+    type Target = Arc<Mutex<ConnectionIO>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone)]
 pub struct Connection {
-    inner: Arc<Mutex<ConnectionInner>>,
+    inner: ConnectionRef,
 }
 
 impl Connection {
@@ -782,87 +846,50 @@ impl Connection {
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     ) -> Self {
         let transport_params = Arc::new(TransportParam::new());
-        let inner = Arc::new(Mutex::new(ConnectionInner {
-            id: cid,
+        let io = ConnectionRef(Arc::new(Mutex::new(ConnectionIO::new(
+            cid,
             peer_cid,
+            addr,
             side,
-            lifeycle: LifeCycle::Handshake,
-            connected: Some(connected),
-            state: PacketSpace::Initial,
-            recv: HashMap::new(),
-            send: HashMap::new(),
-            bidir_acceptable: VecDeque::new(),
-            bidir_accept_waker: AtomicWaker::new(),
-            unidir_acceptable: VecDeque::new(),
-            unidir_accept_waker: AtomicWaker::new(),
-            pending_recv: VecDeque::new(),
-            pending_send: VecDeque::new(),
-            write_waker: AtomicWaker::new(),
-            stream_number: 0,
-
-            spaces: [
-                Space::new(PacketSpace::Initial, transport_params.clone()),
-                Space::new(PacketSpace::Handshake, transport_params.clone()),
-                Space::new(PacketSpace::Data, transport_params.clone()),
-            ],
-            pto_count: 0,
-            transport_params: transport_params.clone(),
-            rtt: RttEstimator::new(),
-            congestion: CongestionController::new(transport_params.clone()),
-            timers: TimerTable::new(),
-        }));
-        let driver = ConnectionDriver {
-            inner: inner.clone(),
-            incoming_data,
+            transport_params,
             outgoing_data,
+            connected,
+        ))));
+        let driver = ConnectionDriver {
+            io: io.clone(),
+            incoming_data,
             addr,
             timer: None,
         };
 
         tokio::spawn(driver);
-        Connection { inner }
+        Connection { inner: io }
     }
 
     pub async fn accept_bidir(&self) -> (SendStreamHandle, RecvStreamHandle) {
-        poll_fn(|cx| {
+        let id = poll_fn(|cx| {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(id) = inner.bidir_acceptable.pop_front() {
-                Poll::Ready((
-                    SendStreamHandle::new(id.clone(), self.inner.clone()),
-                    RecvStreamHandle::new(id, self.inner.clone()),
-                ))
-            } else {
-                inner.bidir_accept_waker.register(cx.waker());
-                Poll::Pending
-            }
+            inner.poll_accept_bidir(cx)
         })
-        .await
+        .await;
+        (
+            SendStreamHandle::new(id.clone(), self.inner.clone()),
+            RecvStreamHandle::new(id.clone(), self.inner.clone()),
+        )
     }
 
     pub async fn accept_uni(&self) -> RecvStreamHandle {
-        poll_fn(|cx| {
+        let id = poll_fn(|cx| {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(id) = inner.unidir_acceptable.pop_front() {
-                Poll::Ready(RecvStreamHandle::new(id, self.inner.clone()))
-            } else {
-                inner.unidir_accept_waker.register(cx.waker());
-                Poll::Pending
-            }
+            inner.poll_accept_unidir(cx)
         })
-        .await
+        .await;
+        RecvStreamHandle::new(id.clone(), self.inner.clone())
     }
 
     pub fn open_bidir(&self) -> (RecvStreamHandle, SendStreamHandle) {
         let mut inner = self.inner.lock().unwrap();
-        let id = StreamID::new(inner.stream_number, &inner.side, Dir::Bidir);
-        // TODO: Have seperate counters for each?
-        // Currently this will shrink the number of possible stream ids
-        inner.stream_number += 1;
-        let recv = RecvStream::new(id.clone());
-        let send = SendStream::new(id.clone());
-
-        inner.recv.insert(id.clone(), recv);
-        inner.send.insert(id.clone(), send);
+        let id = inner.new_bidir();
 
         let recv_handle = RecvStreamHandle::new(id.clone(), self.inner.clone());
         let send_handle = SendStreamHandle::new(id.clone(), self.inner.clone());
@@ -873,18 +900,7 @@ impl Connection {
     // Send initial packet to peer
     pub(super) fn init(&self) {
         let mut inner = self.inner.lock().unwrap();
-        let crypto_data = CryptoFrame::ClientHello;
-        let mut c_data = Vec::new();
-        crypto_data.encode(&mut c_data);
-        let crypto_frame = Frame::Crypto {
-            offset: VarInt(0),
-            data: c_data,
-        };
-        inner.spaces[PacketSpace::Initial]
-            .pending_frames
-            .push_back(crypto_frame);
-        inner.state = PacketSpace::Handshake;
-        inner.write_waker.wake();
+        inner.init();
     }
 }
 
@@ -893,7 +909,7 @@ impl Debug for Connection {
         let inner = self.inner.lock().unwrap();
         f.write_fmt(format_args!(
             "Connection({:?}, {:?})",
-            inner.id, inner.peer_cid
+            inner.core.id, inner.core.peer_cid
         ))
     }
 }
@@ -940,12 +956,244 @@ impl<S: Socket> Future for Incoming<S> {
     }
 }
 
+pub struct SendStreamHandle {
+    id: StreamID,
+    connection: ConnectionRef,
+}
+
+pub struct RecvStreamHandle {
+    id: StreamID,
+    connection: ConnectionRef,
+}
+
+impl RecvStreamHandle {
+    pub fn new(id: StreamID, connection: ConnectionRef) -> Self {
+        Self { id, connection }
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+        let mut buf = ReadBuf::new(buf);
+        poll_fn(|cx| {
+            self.connection
+                .lock()
+                .unwrap()
+                .poll_read(&mut buf, &self.id, cx)
+        })
+        .await
+    }
+}
+
+impl SendStreamHandle {
+    pub fn new(id: StreamID, connection: ConnectionRef) -> Self {
+        Self { id, connection }
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
+        let mut inner = self.connection.lock().unwrap();
+        inner.write(buf, self.id.clone())
+    }
+}
+
+pub struct ConnectionIO {
+    core: ConnectionCore,
+    addr: SocketAddr,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    outgoing_data: UnboundedSender<ConnectionToEndpoint>,
+}
+
+impl ConnectionIO {
+    pub(crate) fn new(
+        cid: ConnectionID,
+        peer_cid: ConnectionID,
+        addr: SocketAddr,
+        side: Side,
+        transport_params: SharedConfig,
+        outgoing_data: UnboundedSender<ConnectionToEndpoint>,
+        // TODO: Remove
+        connected: oneshot::Sender<()>,
+    ) -> Self {
+        let core = ConnectionCore::new(cid, peer_cid, side, connected, transport_params);
+        Self {
+            core,
+            addr,
+            timer: None,
+            outgoing_data,
+        }
+    }
+
+    pub(crate) fn poll_accept_bidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
+        if let Some(id) = self.core.bidir_acceptable.pop_front() {
+            Poll::Ready(id)
+        } else {
+            self.core.bidir_accept_waker.register(cx.waker());
+            Poll::Pending
+        }
+    }
+
+    pub(crate) fn poll_accept_unidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
+        if let Some(id) = self.core.unidir_acceptable.pop_front() {
+            Poll::Ready(id)
+        } else {
+            self.core.unidir_accept_waker.register(cx.waker());
+            Poll::Pending
+        }
+    }
+
+    pub(crate) fn new_bidir(&mut self) -> StreamID {
+        let id = StreamID::new(self.core.stream_number, &self.core.side, Dir::Bidir);
+        // TODO: Have seperate counters for each?
+        // Currently this will shrink the number of possible stream ids
+        self.core.stream_number += 1;
+        let recv = RecvStream::new(id.clone());
+        let send = SendStream::new(id.clone());
+
+        self.core.recv.insert(id.clone(), recv);
+        self.core.send.insert(id.clone(), send);
+
+        id
+    }
+
+    pub(super) fn init(&mut self) {
+        let crypto_data = CryptoFrame::ClientHello;
+        let mut c_data = Vec::new();
+        crypto_data.encode(&mut c_data);
+        let crypto_frame = Frame::Crypto {
+            offset: VarInt(0),
+            data: c_data,
+        };
+        self.core.spaces[PacketSpace::Initial]
+            .pending_frames
+            .push_back(crypto_frame);
+        self.core.state = PacketSpace::Handshake;
+        self.core.write_waker.wake();
+    }
+
+    pub(crate) fn poll_read(
+        &mut self,
+        buf: &mut ReadBuf,
+        id: &StreamID,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, ReadError>> {
+        let Some(recv) = self.core.recv(id) else {
+            return Poll::Ready(Err(ReadError::ClosedStream));
+        };
+        recv.poll_read(buf, cx)
+    }
+
+    pub(crate) fn write(&mut self, buf: &[u8], id: StreamID) -> Result<usize, SendError> {
+        let Some(send) = self.core.send(&id) else {
+            // Stream does not exist, this means that something is wrong
+            // TODO: Different error?
+            return Err(SendError::ClosedStream);
+        };
+
+        if !send.can_send() {
+            return Err(SendError::WrongState);
+        }
+
+        send.set_buffer(buf);
+        self.core.mark_pending_on_send(id);
+
+        Ok(buf.len())
+    }
+
+    pub(crate) fn handle_data(&mut self, data: Vec<EndpointToConnection>) {
+        for data in data {
+            self.core.handle_datagram(&data.data);
+        }
+    }
+
+    pub(crate) fn check_timeout(&mut self, cx: &mut Context<'_>) {
+        let timer_fired = self
+            .timer
+            .as_mut()
+            .map(|timer| timer.as_mut().poll(cx).is_ready())
+            .unwrap_or(false);
+
+        if timer_fired {
+            self.timer = None;
+            self.core.handle_timeout(Instant::now());
+        }
+    }
+
+    pub(crate) fn drive_transmit(&mut self) {
+        let mut packets = Vec::new();
+
+        let mtu = 1200;
+        for p_space in PacketSpace::iter() {
+            if self.core.spaces[p_space].is_discarded() {
+                continue;
+            }
+            while let Some(packet) = {
+                let available = self.core.congestion.available_space();
+                self.core.get_packet(p_space, mtu.min(available))
+            } {
+                self.core.congestion.on_packet_sent(packet.size() as u64);
+                packets.push(packet);
+            }
+        }
+        for packet in packets {
+            println!(
+                "Sending packet({:?})[{:?}]: {packet:?}",
+                self.core.state, self.core.side
+            );
+
+            let mut buf = BytesMut::new();
+            packet.encode(&mut buf).unwrap();
+            self.outgoing_data
+                .send(ConnectionToEndpoint {
+                    data: buf,
+                    addr: self.addr,
+                })
+                .unwrap();
+
+            let is_in_flight = packet.is_in_flight();
+            let is_ack_eliciting = packet.is_ack_eliciting();
+            let p_space = packet.packet_space();
+            self.core.packet_sent(
+                p_space,
+                packet.packet_number().clone(),
+                packet.frames,
+                is_in_flight,
+                is_ack_eliciting,
+            );
+
+            if is_in_flight {
+                self.core.set_loss_timer();
+            }
+        }
+    }
+
+    pub(crate) fn rearm_timer(&mut self, cx: &mut Context<'_>) {
+        let deadline = self.core.next_deadline();
+        match (deadline, self.timer.as_mut()) {
+            (Some(deadline), Some(timer)) => {
+                timer.as_mut().reset(deadline);
+            }
+            (Some(deadline), None) => {
+                let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
+                let _ = sleep.as_mut().poll(cx); // register waker
+                self.timer = Some(sleep);
+            }
+            (None, _) => {
+                self.timer = None;
+            }
+        }
+    }
+
+    fn register_waker(&mut self, cx: &mut Context<'_>) {
+        self.core.write_waker.register(cx.waker());
+        self.core
+            .spaces()
+            .for_each(|space| space.acker.register_waker(cx.waker()));
+    }
+}
+
 // Handles reeiving data from the endpoint and passing it to inner and seeing if pending data
 // exists
 struct ConnectionDriver {
-    inner: Arc<Mutex<ConnectionInner>>,
+    io: ConnectionRef,
     incoming_data: UnboundedReceiver<EndpointToConnection>,
-    outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     addr: SocketAddr,
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
@@ -955,13 +1203,7 @@ impl Future for ConnectionDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.inner.lock().unwrap().write_waker.register(cx.waker());
-
-        this.inner
-            .lock()
-            .unwrap()
-            .spaces()
-            .for_each(|s| s.acker.register_waker(cx.waker()));
+        this.io.lock().unwrap().register_waker(cx);
 
         // Handle incomming packets
         let mut buffer = Vec::new();
@@ -973,94 +1215,19 @@ impl Future for ConnectionDriver {
             }
         }
 
+        let mut conn = this.io.lock().unwrap();
         if !buffer.is_empty() {
-            let mut conn = this.inner.lock().unwrap();
-            for data in buffer {
-                conn.handle_datagram(&data.data);
-            }
+            conn.handle_data(buffer);
         }
 
         // Handle timeout
-        let timer_fired = this
-            .timer
-            .as_mut()
-            .map(|t| t.as_mut().poll(cx).is_ready())
-            .unwrap_or(false);
-
-        if timer_fired {
-            this.timer = None;
-            this.inner.lock().unwrap().handle_timeout(Instant::now());
-        }
+        conn.check_timeout(cx);
 
         // Get packets from connection
-        let packets = {
-            let mut conn = this.inner.lock().unwrap();
-            let mut pkts = Vec::new();
-
-            let mtu = 1200;
-            for p_space in PacketSpace::iter() {
-                if conn.spaces[p_space].is_discarded() {
-                    continue;
-                }
-                while let Some(packet) = {
-                    let available = conn.congestion.available_space();
-                    conn.get_packet(p_space, mtu.min(available))
-                } {
-                    conn.congestion.on_packet_sent(packet.size() as u64);
-                    pkts.push(packet);
-                }
-            }
-            pkts
-        };
-
-        {
-            let mut conn = this.inner.lock().unwrap();
-            for packet in packets {
-                println!(
-                    "Sending packet({:?})[{:?}]: {packet:?}",
-                    conn.state, conn.side
-                );
-
-                let mut buf = BytesMut::new();
-                packet.encode(&mut buf).unwrap();
-                this.outgoing_data
-                    .send(ConnectionToEndpoint {
-                        data: buf,
-                        addr: this.addr,
-                    })
-                    .unwrap();
-
-                let is_in_flight = packet.is_in_flight();
-                let is_ack_eliciting = packet.is_ack_eliciting();
-                let p_space = packet.packet_space();
-                conn.spaces[p_space].acker.sent_packet(
-                    packet.packet_number().clone(),
-                    packet.frames,
-                    is_in_flight,
-                    is_ack_eliciting,
-                );
-
-                if is_in_flight {
-                    conn.set_loss_timer();
-                }
-            }
-        }
+        conn.drive_transmit();
 
         // Rearm timer
-        let deadline = this.inner.lock().unwrap().next_deadline();
-        match (deadline, this.timer.as_mut()) {
-            (Some(deadline), Some(timer)) => {
-                timer.as_mut().reset(deadline);
-            }
-            (Some(deadline), None) => {
-                let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
-                let _ = sleep.as_mut().poll(cx); // register waker
-                this.timer = Some(sleep);
-            }
-            (None, _) => {
-                this.timer = None;
-            }
-        }
+        conn.rearm_timer(cx);
 
         Poll::Pending
     }
@@ -1078,8 +1245,8 @@ mod test {
     fn create_connection(
         sender: oneshot::Sender<()>,
         transport_params: SharedConfig,
-    ) -> ConnectionInner {
-        ConnectionInner {
+    ) -> ConnectionCore {
+        ConnectionCore {
             id: ConnectionID {
                 len: 1,
                 buf: [0; 20],
@@ -1152,7 +1319,7 @@ mod test {
         buf.freeze()
     }
 
-    fn get_packet(conn: &mut ConnectionInner, p_space: PacketSpace, mtu: usize) -> Packet {
+    fn get_packet(conn: &mut ConnectionCore, p_space: PacketSpace, mtu: usize) -> Packet {
         let Some(resp) = conn.get_packet(p_space, mtu) else {
             panic!("Could not get packet from {p_space:?} of mtu={mtu:?}");
         };
@@ -1160,7 +1327,7 @@ mod test {
     }
 
     // TODO: Will have to update when the handshake updates
-    fn server_initial_state(conn: &mut ConnectionInner) {
+    fn server_initial_state(conn: &mut ConnectionCore) {
         let crypto_data = CryptoFrame::ClientHello;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
@@ -1188,7 +1355,7 @@ mod test {
     }
 
     // TODO: Will have to update when the handshake updates
-    fn server_handshake_state(conn: &mut ConnectionInner) {
+    fn server_handshake_state(conn: &mut ConnectionCore) {
         let crypto_data = CryptoFrame::Finished;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
@@ -1215,7 +1382,7 @@ mod test {
         assert!(conn.handshake_is_done());
     }
 
-    fn open_bidir(conn: &mut ConnectionInner) -> StreamID {
+    fn open_bidir(conn: &mut ConnectionCore) -> StreamID {
         let id = StreamID::new(conn.stream_number, &conn.side, Dir::Bidir);
         conn.stream_number += 1;
         let recv = RecvStream::new(id.clone());
@@ -1227,7 +1394,7 @@ mod test {
         id
     }
 
-    fn send_stream_data_to(conn: &mut ConnectionInner, id: StreamID, data: Bytes, pn: &mut u8) {
+    fn send_stream_data_to(conn: &mut ConnectionCore, id: StreamID, data: Bytes, pn: &mut u8) {
         let frame = Frame::Stream(Stream {
             id,
             fin: false,
@@ -1248,7 +1415,7 @@ mod test {
         conn.handle_datagram(&packet);
     }
 
-    fn send_stream_data_from(conn: &mut ConnectionInner, id: StreamID, data: Bytes) -> Packet {
+    fn send_stream_data_from(conn: &mut ConnectionCore, id: StreamID, data: Bytes) -> Packet {
         let Some(send) = conn.send(&id) else {
             panic!("Could not find send stream with id={id:?}");
         };
@@ -1275,7 +1442,7 @@ mod test {
         packet
     }
 
-    fn send_ack_to(conn: &mut ConnectionInner, acker: &mut Acker, pn: &mut u8) {
+    fn send_ack_to(conn: &mut ConnectionCore, acker: &mut Acker, pn: &mut u8) {
         let frame = acker.get_ack().expect("Acker should not be cleared");
 
         let packet = create_packet(

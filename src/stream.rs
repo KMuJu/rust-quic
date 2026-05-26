@@ -2,7 +2,7 @@ use std::{
     future::poll_fn,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::Poll,
+    task::{Context, Poll},
 };
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
-    connection::ConnectionInner,
+    connection::{ConnectionCore, ConnectionRef},
     frame::{Frame, Stream},
     frame_assembler::FrameAssembler,
 };
@@ -38,22 +38,6 @@ pub struct SendStream {
     buffer: BytesMut,
     offset: u64,
     state: SendState,
-}
-
-pub struct SendStreamHandle {
-    id: StreamID,
-    connection: Arc<Mutex<ConnectionInner>>,
-}
-
-pub struct RecvStreamHandle {
-    id: StreamID,
-    connection: Arc<Mutex<ConnectionInner>>,
-}
-
-impl SendStreamHandle {
-    pub fn new(id: StreamID, connection: Arc<Mutex<ConnectionInner>>) -> Self {
-        Self { id, connection }
-    }
 }
 
 impl RecvStream {
@@ -94,6 +78,21 @@ impl RecvStream {
         } else {
             eprint!("Received data in wrong state");
         }
+    }
+
+    pub(super) fn poll_read(
+        &mut self,
+        buf: &mut ReadBuf,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, ReadError>> {
+        let pinned = Pin::new(&mut self.assembler);
+        let before = buf.filled().len();
+        let res = pinned
+            .poll_read(cx, buf)
+            .map(|r| r.map(|_| buf.filled().len() - before))
+            .map_err(ReadError::IO);
+
+        res
     }
 
     pub(super) fn is_reset(&self) -> bool {
@@ -162,73 +161,12 @@ impl SendStream {
         matches!(self.state, SendState::ResetSent | SendState::ResetRecvd)
     }
 
-    #[cfg(test)]
+    pub(crate) fn can_send(&self) -> bool {
+        matches!(self.state, SendState::Ready | SendState::Send)
+    }
+
     pub(super) fn set_buffer(&mut self, buf: &[u8]) {
         self.buffer.put_slice(buf);
-    }
-}
-
-impl RecvStreamHandle {
-    pub fn new(id: StreamID, connection: Arc<Mutex<ConnectionInner>>) -> Self {
-        Self { id, connection }
-    }
-
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let mut buf = ReadBuf::new(buf);
-        poll_fn(|cx| {
-            let before = buf.filled().len();
-            let mut conn_inner = self.connection.lock().unwrap();
-            let Some(recv) = conn_inner.recv(&self.id) else {
-                return Poll::Ready(Err(ReadError::ClosedStream));
-            };
-            let pinned = Pin::new(&mut recv.assembler);
-            let res = pinned
-                .poll_read(cx, &mut buf)
-                .map(|r| r.map(|_| buf.filled().len() - before))
-                .map_err(ReadError::IO);
-
-            res
-        })
-        .await
-    }
-}
-
-impl SendStreamHandle {
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
-        let mut inner = self.connection.lock().unwrap();
-
-        let Some(send) = inner.send(&self.id) else {
-            // Stream does not exist, this means that something is wrong
-            // TODO: Different error?
-            return Err(SendError::ClosedStream);
-        };
-
-        if !matches!(send.state, SendState::Ready | SendState::Send) {
-            return Err(SendError::WrongState);
-        }
-
-        send.buffer.put_slice(buf);
-        inner.mark_pending_on_send(self.id.clone());
-
-        Ok(buf.len())
-    }
-
-    pub fn finish(&mut self) -> Result<(), SendError> {
-        let mut inner = self.connection.lock().unwrap();
-
-        let Some(send) = inner.send(&self.id) else {
-            // Stream does not exist, this means that something is wrong
-            // TODO: Different error?
-            return Err(SendError::ClosedStream);
-        };
-
-        if !matches!(send.state, SendState::Send) {
-            return Err(SendError::WrongState);
-        }
-
-        send.state = SendState::DataSent;
-
-        Ok(())
     }
 }
 
