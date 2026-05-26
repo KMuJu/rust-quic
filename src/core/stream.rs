@@ -1,18 +1,17 @@
 use std::{
-    future::poll_fn,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
 use bytes::{Buf, BufMut, BytesMut};
-use thiserror::Error;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
-    connection::{ConnectionCore, ConnectionRef},
-    frame::{Frame, Stream},
-    frame_assembler::FrameAssembler,
+    core::{
+        frame::{Frame, Stream},
+        frame_assembler::FrameAssembler,
+    },
+    io::connection::ReadError,
 };
 
 #[derive(Debug, Clone)]
@@ -41,7 +40,7 @@ pub struct SendStream {
 }
 
 impl RecvStream {
-    pub(super) fn new(id: StreamID) -> Self {
+    pub(crate) fn new(id: StreamID) -> Self {
         Self {
             id,
             assembler: FrameAssembler::new(),
@@ -210,20 +209,4 @@ impl StreamID {
             Side::Server
         }
     }
-}
-
-#[derive(Debug, Error)]
-pub enum ReadError {
-    #[error("Closed stream")]
-    ClosedStream,
-    #[error("IO: {0}")]
-    IO(#[from] std::io::Error),
-}
-
-#[derive(Debug, Error)]
-pub enum SendError {
-    #[error("Closed stream")]
-    ClosedStream,
-    #[error("Wrong state")]
-    WrongState,
 }

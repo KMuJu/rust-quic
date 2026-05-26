@@ -2,7 +2,7 @@ use std::{f64, time::Duration};
 
 use tokio::time::Instant;
 
-use crate::{
+use crate::core::{
     ack_manager::SentPacket, rtt_estimator::RttEstimator, transport_parameters::SharedConfig,
 };
 
@@ -139,7 +139,7 @@ mod tests {
 
     use tokio::time;
 
-    use crate::transport_parameters::TransportParam;
+    use crate::core::transport_parameters::TransportParam;
 
     use super::*;
 

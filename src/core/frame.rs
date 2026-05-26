@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 use thiserror::Error;
 
-use crate::{
+use crate::core::{
     connection::ConnectionID,
     encoding::{VarInt, VarIntError, variable_length, variable_length_encode},
     packet::Token,
@@ -38,7 +38,7 @@ mod frame_type {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Frame {
+pub(crate) enum Frame {
     Padding,
     Ping,
     Ack(Ack),

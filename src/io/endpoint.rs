@@ -19,12 +19,14 @@ use tokio::{
     },
 };
 
+use crate::{ConnectionToEndpoint, EndpointToConnection, io::connection::Incoming, socket::Socket};
 use crate::{
-    ConnectionToEndpoint, EndpointToConnection,
-    connection::{Connection, ConnectionHandle, ConnectionID, Incoming, IncomingInner},
-    packet::{Header, Packet, PacketError},
-    socket::Socket,
-    stream::Side,
+    core::{
+        connection::ConnectionID,
+        packet::{Header, PacketError},
+        stream::Side,
+    },
+    io::connection::{Connection, ConnectionHandle, IncomingInner},
 };
 
 pub struct EndpointIO<S: Socket> {
@@ -175,32 +177,6 @@ impl<S: Socket> EndpointIO<S> {
     }
 
     fn handle_datagram(&mut self, data: Bytes, addr: SocketAddr) {
-        // println!("Datagram: {data:?}");
-        // TODO: Swap with peek header thingy
-        // let packet = match Packet::decode(&mut Cursor::new(&data), self.cid_len) {
-        //     Ok(p) => p,
-        //     Err(e) => {
-        //         println!("Error when decoding: {e}");
-        //         return;
-        //     }
-        // };
-        // let cid = packet.dst_cid();
-        // if packet.is_client_hello() && !self.connections.contains_key(&cid) {
-        //     println!("Got initial hello packet: {packet:?}");
-        //     let src_cid = packet.src_cid().unwrap();
-        //     self.insert_new_connection(cid, src_cid, addr);
-        // }
-        //
-        // if let Some(handle) = self.connection_handles.get(&cid) {
-        //     handle
-        //         .incoming_data
-        //         .send(EndpointToConnection { data, addr })
-        //         .unwrap();
-        // } else {
-        //     eprintln!("Could not get connection handle to {cid:?}");
-        //     eprintln!("{:?}", self.connection_handles);
-        // }
-
         match self.core.handle_datagram(data, addr) {
             EndpointOutput::RouteToConnection {
                 dst_cid,

@@ -3,7 +3,7 @@ use std::{fmt::Debug, io::Cursor};
 use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
 
-use crate::{
+use crate::core::{
     connection::ConnectionID,
     crypto::CryptoFrame,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
@@ -39,7 +39,7 @@ pub enum Header {
     },
 }
 
-pub(super) struct Packet {
+pub struct Packet {
     pub header: Header,
     pub frames: Vec<Frame>,
 }
@@ -107,7 +107,7 @@ impl Packet {
         self.frames.iter().any(|f| !matches!(f, Frame::Ack { .. }))
     }
 
-    pub(super) fn packet_space(&self) -> PacketSpace {
+    pub(crate) fn packet_space(&self) -> PacketSpace {
         match &self.header {
             Header::Initial { .. } => PacketSpace::Initial,
             Header::Handshake { .. } => PacketSpace::Handshake,
@@ -453,7 +453,7 @@ impl Header {
 mod test {
     use std::io::{self, Cursor};
 
-    use crate::{
+    use crate::core::{
         frame::Stream,
         stream::{Dir, StreamID},
     };
