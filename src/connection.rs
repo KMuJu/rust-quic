@@ -900,15 +900,15 @@ impl Debug for Connection {
 
 pub struct IncomingInner {
     id: ConnectionID,
-    src_cid: ConnectionID,
+    // src_cid: ConnectionID,
     connected: oneshot::Receiver<()>,
 }
 
 impl IncomingInner {
-    pub fn new(id: ConnectionID, src_cid: ConnectionID, connected: oneshot::Receiver<()>) -> Self {
+    pub fn new(id: ConnectionID, connected: oneshot::Receiver<()>) -> Self {
         Self {
             id,
-            src_cid,
+            // src_cid,
             connected,
         }
     }
@@ -933,7 +933,7 @@ impl<S: Socket> Future for Incoming<S> {
         println!("Waiting for connected notification");
         ready!(Pin::new(&mut this.inner.connected).poll(cx)).unwrap();
 
-        let endpoint = this.endpoint.state.lock().unwrap();
+        let endpoint = this.endpoint.lock().unwrap();
 
         let connection = endpoint.connections.get(&this.inner.id).unwrap();
         Poll::Ready(connection.clone())

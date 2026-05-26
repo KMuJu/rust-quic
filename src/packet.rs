@@ -65,19 +65,11 @@ impl Packet {
     }
 
     pub fn dst_cid(&self) -> ConnectionID {
-        match self.header {
-            Header::Initial { dst_cid, .. } => dst_cid,
-            Header::Handshake { dst_cid, .. } => dst_cid,
-            Header::Short { dst_cid, .. } => dst_cid,
-        }
+        self.header.dst_cid()
     }
 
     pub fn src_cid(&self) -> Option<ConnectionID> {
-        match self.header {
-            Header::Initial { src_cid, .. } => Some(src_cid),
-            Header::Handshake { src_cid, .. } => Some(src_cid),
-            _ => None,
-        }
+        self.header.src_cid()
     }
 
     pub fn packet_number(&self) -> &PacketNumber {
@@ -89,7 +81,7 @@ impl Packet {
     }
 
     pub fn is_initial(&self) -> bool {
-        matches!(self.header, Header::Initial { .. })
+        self.header.is_initial()
     }
 
     pub fn is_client_hello(&self) -> bool {
@@ -435,6 +427,25 @@ impl Header {
             Header::Handshake { .. } => PacketSpace::Handshake,
             Header::Short { .. } => PacketSpace::Data,
         }
+    }
+    pub fn dst_cid(&self) -> ConnectionID {
+        match self {
+            Header::Initial { dst_cid, .. } => *dst_cid,
+            Header::Handshake { dst_cid, .. } => *dst_cid,
+            Header::Short { dst_cid, .. } => *dst_cid,
+        }
+    }
+
+    pub fn src_cid(&self) -> Option<ConnectionID> {
+        match self {
+            Header::Initial { src_cid, .. } => Some(*src_cid),
+            Header::Handshake { src_cid, .. } => Some(*src_cid),
+            _ => None,
+        }
+    }
+
+    pub fn is_initial(&self) -> bool {
+        matches!(self, Header::Initial { .. })
     }
 }
 

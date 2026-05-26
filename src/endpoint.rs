@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rand::rngs::StdRng;
 use thiserror::Error;
 use tokio::{
@@ -22,13 +22,14 @@ use tokio::{
 use crate::{
     ConnectionToEndpoint, EndpointToConnection,
     connection::{Connection, ConnectionHandle, ConnectionID, Incoming, IncomingInner},
-    packet::{Packet, PacketError},
+    packet::{Header, Packet, PacketError},
     socket::Socket,
     stream::Side,
 };
 
-pub struct EndpointState<S: Socket> {
+pub struct EndpointIO<S: Socket> {
     socket: S,
+    core: EndpointCore,
     // TODO: Multiple connectionids can point to the same connection, so add a map between
     // connectionid and internal handle
     connection_handles: HashMap<ConnectionID, ConnectionHandle>,
@@ -41,9 +42,7 @@ pub struct EndpointState<S: Socket> {
     outgoing_tx: UnboundedSender<ConnectionToEndpoint>,   // To be cloned into connections
 }
 
-pub struct EndpointInner<S: Socket> {
-    pub state: Mutex<EndpointState<S>>,
-}
+pub struct EndpointRef<S: Socket>(Arc<Mutex<EndpointIO<S>>>);
 
 pub struct Endpoint<S: Socket> {
     inner: EndpointRef<S>,
@@ -56,12 +55,19 @@ impl Endpoint<UdpSocket> {
     }
 }
 
+pub struct EndpointCore {
+    rng: StdRng,
+    cid_len: u8,
+    connections: HashMap<ConnectionID, SocketAddr>,
+}
+
 impl<S: Socket> Endpoint<S> {
     pub fn new_generic(socket: S) -> Self {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state = EndpointState {
+        let state = EndpointIO {
             socket,
+            core: EndpointCore::new(),
             connection_handles: HashMap::new(),
             connections: HashMap::new(),
             rng: rand::make_rng(),
@@ -71,12 +77,11 @@ impl<S: Socket> Endpoint<S> {
             outgoing_rx,
             outgoing_tx,
         };
-        let endpoint = EndpointInner {
-            state: Mutex::new(state),
-        };
-        let endpointref = EndpointRef(Arc::new(endpoint));
+        let endpointref = EndpointRef(Arc::new(Mutex::new(state)));
 
-        let driver = EndpointDriver(endpointref.clone());
+        let driver = EndpointDriver {
+            endpoint: endpointref.clone(),
+        };
         tokio::spawn(async move {
             if let Err(e) = driver.await {
                 eprintln!("Error in driver: {e}");
@@ -97,9 +102,9 @@ impl<S: Socket> Endpoint<S> {
 
     pub async fn connect(&mut self, addr: SocketAddr) -> Connection {
         let (conn, connected_recv) = {
-            let mut state = self.inner.state.lock().unwrap();
-            let peer_cid = ConnectionID::new(state.cid_len, &mut state.rng);
-            let cid = ConnectionID::new(state.cid_len, &mut state.rng);
+            let mut endpoint = self.inner.lock().unwrap();
+            let peer_cid = ConnectionID::new(endpoint.cid_len, &mut endpoint.rng);
+            let cid = ConnectionID::new(endpoint.cid_len, &mut endpoint.rng);
 
             let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
             let (connected_send, connected_recv) = oneshot::channel();
@@ -112,15 +117,16 @@ impl<S: Socket> Endpoint<S> {
                 Side::Client,
                 connected_send,
                 incoming_rx,
-                state.outgoing_tx.clone(),
+                endpoint.outgoing_tx.clone(),
             );
             let handle = ConnectionHandle {
                 addr,
                 incoming_data,
             };
 
-            state.connection_handles.insert(cid, handle);
-            state.connections.insert(cid, conn.clone());
+            endpoint.connection_handles.insert(cid, handle);
+            endpoint.connections.insert(cid, conn.clone());
+            endpoint.core.add_cid(cid, addr);
 
             (conn, connected_recv)
         };
@@ -134,7 +140,7 @@ impl<S: Socket> Endpoint<S> {
     }
 }
 
-impl<S: Socket> EndpointState<S> {
+impl<S: Socket> EndpointIO<S> {
     fn insert_new_connection(
         &mut self,
         dst_cid: ConnectionID,
@@ -164,38 +170,72 @@ impl<S: Socket> EndpointState<S> {
         self.connections.insert(dst_cid, connection);
 
         // TODO: Handle create incomming connection
-        let incoming = IncomingInner::new(dst_cid, src_cid, connected_recv);
+        let incoming = IncomingInner::new(dst_cid, connected_recv);
         self.incoming_tx.send(incoming).unwrap();
     }
 
-    fn handle_datagram(&mut self, data: &[u8], addr: SocketAddr) {
+    fn handle_datagram(&mut self, data: Bytes, addr: SocketAddr) {
         // println!("Datagram: {data:?}");
         // TODO: Swap with peek header thingy
-        let packet = match Packet::decode(&mut Cursor::new(data), self.cid_len) {
-            Ok(p) => p,
-            Err(e) => {
-                println!("Error when decoding: {e}");
-                return;
-            }
-        };
-        let cid = packet.dst_cid();
-        if packet.is_client_hello() && !self.connections.contains_key(&cid) {
-            println!("Got initial hello packet: {packet:?}");
-            let src_cid = packet.src_cid().unwrap();
-            self.insert_new_connection(cid, src_cid, addr);
-        }
+        // let packet = match Packet::decode(&mut Cursor::new(&data), self.cid_len) {
+        //     Ok(p) => p,
+        //     Err(e) => {
+        //         println!("Error when decoding: {e}");
+        //         return;
+        //     }
+        // };
+        // let cid = packet.dst_cid();
+        // if packet.is_client_hello() && !self.connections.contains_key(&cid) {
+        //     println!("Got initial hello packet: {packet:?}");
+        //     let src_cid = packet.src_cid().unwrap();
+        //     self.insert_new_connection(cid, src_cid, addr);
+        // }
+        //
+        // if let Some(handle) = self.connection_handles.get(&cid) {
+        //     handle
+        //         .incoming_data
+        //         .send(EndpointToConnection { data, addr })
+        //         .unwrap();
+        // } else {
+        //     eprintln!("Could not get connection handle to {cid:?}");
+        //     eprintln!("{:?}", self.connection_handles);
+        // }
 
-        if let Some(handle) = self.connection_handles.get(&cid) {
-            handle
-                .incoming_data
-                .send(EndpointToConnection {
-                    data: data.to_vec(),
-                    addr,
-                })
-                .unwrap();
-        } else {
-            eprintln!("Could not get connection handle to {cid:?}");
-            eprintln!("{:?}", self.connection_handles);
+        match self.core.handle_datagram(data, addr) {
+            EndpointOutput::RouteToConnection {
+                dst_cid,
+                data,
+                migration,
+            } => {
+                if let Some(handle) = self.connection_handles.get(&dst_cid) {
+                    handle
+                        .incoming_data
+                        .send(EndpointToConnection { data, addr })
+                        .unwrap();
+                } else {
+                    eprintln!("Could not get connection handle to {dst_cid:?}");
+                    eprintln!("{:?}", self.connection_handles);
+                }
+            }
+            EndpointOutput::NewConnection {
+                dst_cid,
+                src_cid,
+                data,
+                remote,
+            } => {
+                self.insert_new_connection(dst_cid, src_cid, remote);
+                if let Some(handle) = self.connection_handles.get(&dst_cid) {
+                    handle
+                        .incoming_data
+                        .send(EndpointToConnection { data, addr })
+                        .unwrap();
+                } else {
+                    eprintln!("Could not get connection handle to {dst_cid:?}");
+                    eprintln!("{:?}", self.connection_handles);
+                }
+            }
+            EndpointOutput::Drop => todo!(),
+            EndpointOutput::SendDatagram => todo!(),
         }
     }
 
@@ -205,7 +245,8 @@ impl<S: Socket> EndpointState<S> {
         loop {
             match self.socket.poll_recv_from(cx, &mut buf) {
                 Poll::Ready(Ok(addr)) => {
-                    self.handle_datagram(buf.filled(), addr);
+                    let data = Bytes::copy_from_slice(buf.filled());
+                    self.handle_datagram(data, addr);
                     buf.clear();
                 }
                 // From quin-rs/quin
@@ -249,8 +290,6 @@ impl<S: Socket> EndpointState<S> {
     }
 }
 
-pub struct EndpointRef<S: Socket>(Arc<EndpointInner<S>>);
-
 impl<S: Socket> Clone for EndpointRef<S> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -258,26 +297,23 @@ impl<S: Socket> Clone for EndpointRef<S> {
 }
 
 impl<S: Socket> std::ops::Deref for EndpointRef<S> {
-    type Target = EndpointInner<S>;
+    type Target = Arc<Mutex<EndpointIO<S>>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-struct EndpointDriver<S: Socket>(EndpointRef<S>);
+struct EndpointDriver<S: Socket> {
+    endpoint: EndpointRef<S>,
+}
 
 // Future that drives the IO for an endpoint
 impl<S: Socket> Future for EndpointDriver<S> {
     type Output = Result<(), DriverError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // let Ok(mut endpoint) = self.0.state.try_lock() else {
-        //     cx.waker().wake_by_ref();
-        //     return Poll::Pending;
-        // };
-
-        let mut endpoint = self.0.state.lock().unwrap();
+        let mut endpoint = self.endpoint.lock().unwrap();
 
         let mut did_work = false;
         // Receive packets
@@ -301,4 +337,81 @@ pub enum DriverError {
 
     #[error("IO: {0}")]
     IO(#[from] io::Error),
+}
+
+pub enum EndpointOutput {
+    RouteToConnection {
+        dst_cid: ConnectionID,
+        data: Bytes,
+        migration: Option<SocketAddr>,
+    },
+    NewConnection {
+        dst_cid: ConnectionID,
+        src_cid: ConnectionID,
+        data: Bytes,
+        remote: SocketAddr,
+    },
+    Drop,
+    SendDatagram,
+}
+
+impl EndpointCore {
+    pub fn new() -> Self {
+        Self {
+            rng: rand::make_rng(),
+            cid_len: 4,
+            connections: HashMap::new(),
+        }
+    }
+
+    pub fn handle_datagram(&mut self, data: Bytes, remote: SocketAddr) -> EndpointOutput {
+        let header =
+            Header::decode(&mut Cursor::new(&data), self.cid_len).expect("Could not decode header");
+        let dst_cid = header.dst_cid();
+
+        if let Some(old_remote) = self.connections.get(&dst_cid) {
+            if old_remote == &remote {
+                return EndpointOutput::RouteToConnection {
+                    dst_cid,
+                    data,
+                    migration: None,
+                };
+            }
+
+            return EndpointOutput::RouteToConnection {
+                dst_cid,
+                data,
+                migration: Some(remote),
+            };
+        }
+
+        if !header.is_initial() {
+            // TODO: Stateless reset
+            return EndpointOutput::Drop;
+        }
+
+        // TODO:
+        // Server config must be some?
+        // Do retry?
+        // Validate token?
+
+        self.connections.insert(dst_cid, remote);
+        let src_cid = header.src_cid().unwrap();
+        EndpointOutput::NewConnection {
+            dst_cid,
+            src_cid,
+            data,
+            remote,
+        }
+    }
+
+    pub fn add_cid(&mut self, local_cid: ConnectionID, remote: SocketAddr) {
+        self.connections.insert(local_cid, remote);
+    }
+}
+
+impl Default for EndpointCore {
+    fn default() -> Self {
+        Self::new()
+    }
 }

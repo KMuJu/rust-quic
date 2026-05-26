@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 pub mod ack_manager;
 pub mod congestion;
@@ -28,6 +28,6 @@ struct ConnectionToEndpoint {
 
 #[derive(Debug)]
 struct EndpointToConnection {
-    data: Vec<u8>,
+    data: Bytes,
     addr: SocketAddr,
 }
