@@ -57,9 +57,6 @@ pub struct ConnectionCore {
     pending_recv: VecDeque<StreamID>,
     pending_send: VecDeque<StreamID>,
 
-    // Wakes up when a stream has written data pending
-    write_waker: AtomicWaker,
-
     stream_number: usize,
 
     // initial_space: Space,
@@ -133,9 +130,7 @@ impl ConnectionCore {
             unidir_accept_waker: AtomicWaker::new(),
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
-            write_waker: AtomicWaker::new(),
             stream_number: 0,
-
             spaces: [
                 Space::new(PacketSpace::Initial, transport_params.clone()),
                 Space::new(PacketSpace::Handshake, transport_params.clone()),
@@ -830,7 +825,6 @@ impl ConnectionCore {
             .pending_frames
             .push_back(crypto_frame);
         self.state = PacketSpace::Handshake;
-        self.write_waker.wake();
     }
 
     pub(crate) fn poll_read(
@@ -857,19 +851,13 @@ impl ConnectionCore {
         }
 
         send.set_buffer(buf);
-        self.mark_pending_on_send(id);
+        self.pending_send.push_back(id);
 
         Ok(buf.len())
     }
 
     pub(crate) fn is_discarded(&self, p_space: PacketSpace) -> bool {
         self.spaces[p_space].is_discarded()
-    }
-
-    pub fn register_waker(&mut self, cx: &mut Context<'_>) {
-        self.write_waker.register(cx.waker());
-        self.spaces()
-            .for_each(|space| space.acker.register_waker(cx.waker()));
     }
 
     pub(crate) fn poll_accept_bidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
@@ -927,7 +915,6 @@ mod test {
             unidir_accept_waker: AtomicWaker::new(),
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
-            write_waker: AtomicWaker::new(),
             stream_number: 0,
             spaces: [
                 Space::new(PacketSpace::Initial, transport_params.clone()),

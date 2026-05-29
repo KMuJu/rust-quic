@@ -40,7 +40,7 @@ pub(super) struct Acker {
     largest_received: Option<LargestReceived>,
     last_elicit_time: Option<Instant>,
 
-    waker: AtomicWaker,
+    need_to_send_ack: bool,
 }
 
 impl Acker {
@@ -56,12 +56,8 @@ impl Acker {
             largest_acked: u32::MAX,
             largest_received: None,
             last_elicit_time: None,
-            waker: AtomicWaker::new(),
+            need_to_send_ack: false,
         }
-    }
-
-    pub(super) fn register_waker(&self, waker: &Waker) {
-        self.waker.register(waker);
     }
 
     /// # Returns
@@ -90,7 +86,7 @@ impl Acker {
             if elicit {
                 self.eliciting_count += 1;
                 if self.eliciting_count >= 2 {
-                    self.waker.wake();
+                    self.need_to_send_ack = true;
                     println!("Eliciting packet count >= 2: NEED TO SEND ACK");
                 }
                 if self.ack_deadline.is_none() {
@@ -238,10 +234,6 @@ impl Acker {
         for pn in lost_pns {
             let sent = self.sent.remove(&pn).unwrap();
             lost.push(sent);
-        }
-
-        if !lost.is_empty() {
-            self.waker.wake();
         }
 
         lost

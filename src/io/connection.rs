@@ -1,3 +1,4 @@
+use futures::task::AtomicWaker;
 use std::{
     fmt::Debug,
     future::poll_fn,
@@ -74,8 +75,6 @@ impl Connection {
         let driver = ConnectionDriver {
             io: io.clone(),
             incoming_data,
-            addr,
-            timer: None,
         };
 
         tokio::spawn(driver);
@@ -231,6 +230,7 @@ pub struct ConnectionIO {
     addr: SocketAddr,
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
     outgoing_data: UnboundedSender<ConnectionToEndpoint>,
+    driver: AtomicWaker,
 }
 
 impl ConnectionIO {
@@ -250,6 +250,7 @@ impl ConnectionIO {
             addr,
             timer: None,
             outgoing_data,
+            driver: AtomicWaker::new(),
         }
     }
 
@@ -266,7 +267,8 @@ impl ConnectionIO {
     }
 
     pub(super) fn init(&mut self) {
-        self.core.init()
+        self.core.init();
+        self.driver.wake();
     }
 
     pub(crate) fn poll_read(
@@ -279,7 +281,9 @@ impl ConnectionIO {
     }
 
     pub(crate) fn write(&mut self, buf: &[u8], id: StreamID) -> Result<usize, SendError> {
-        self.core.write(buf, id)
+        let res = self.core.write(buf, id);
+        self.driver.wake(); // TODO: Only wake when Ok(..)?
+        res
     }
 
     pub(crate) fn handle_data(&mut self, data: Vec<EndpointToConnection>) {
@@ -366,8 +370,6 @@ impl ConnectionIO {
 struct ConnectionDriver {
     io: ConnectionRef,
     incoming_data: UnboundedReceiver<EndpointToConnection>,
-    addr: SocketAddr,
-    timer: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Future for ConnectionDriver {
@@ -375,7 +377,7 @@ impl Future for ConnectionDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.io.lock().unwrap().core.register_waker(cx);
+        this.io.lock().unwrap().driver.register(cx.waker());
 
         // Handle incomming packets
         let mut buffer = Vec::new();
