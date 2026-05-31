@@ -295,7 +295,7 @@ impl ConnectionIO {
 
     pub(crate) fn handle_data(&mut self, data: Vec<EndpointToConnection>) {
         for data in data {
-            self.core.handle_datagram(&data.data);
+            self.core.handle_datagram(data.protected);
         }
     }
 
@@ -330,7 +330,7 @@ impl ConnectionIO {
                 packet.encode(&mut buf).unwrap();
                 self.outgoing_data
                     .send(ConnectionToEndpoint {
-                        data: buf,
+                        data: buf.freeze(),
                         addr: self.addr,
                     })
                     .unwrap();

@@ -17,7 +17,7 @@ use crate::{
         crypto::CryptoFrame,
         encoding::VarInt,
         frame::{Ack, Frame, Stream},
-        packet::{Header, Packet, PacketNumber},
+        packet::{Header, Packet, PacketNumber, ProtectedPacket},
         rtt_estimator::RttEstimator,
         space::{PacketSpace, Space},
         stream::{Dir, RecvStream, SendStream, Side, StreamID},
@@ -156,8 +156,8 @@ impl ConnectionCore {
         }
     }
 
-    pub fn handle_datagram(&mut self, buf: &[u8]) {
-        let packet = match Packet::decode(&mut Cursor::new(buf), self.id.len) {
+    pub fn handle_datagram(&mut self, protected: ProtectedPacket) {
+        let packet = match protected.unprotect() {
             Ok(p) => p,
             Err(e) => {
                 println!("Error when decoding datagram: {e}");
@@ -927,7 +927,7 @@ mod test {
         src_cid: ConnectionID,
         pn: PacketNumber,
         frames: Vec<Frame>,
-    ) -> Bytes {
+    ) -> ProtectedPacket {
         let header = match p_space {
             PacketSpace::Initial => Header::Initial {
                 dst_cid,
@@ -955,7 +955,9 @@ mod test {
         let packet = Packet { header, frames };
         let mut buf = BytesMut::new();
         packet.encode(&mut buf).unwrap();
-        buf.freeze()
+        let buf = buf.freeze();
+        ProtectedPacket::new(buf, dst_cid.len)
+            .expect("Should be able to get protected packet from encoded packet")
     }
 
     fn get_packet(conn: &mut ConnectionCore, p_space: PacketSpace, mtu: usize) -> Packet {
@@ -983,7 +985,7 @@ mod test {
             vec![crypto_frame],
         );
 
-        conn.handle_datagram(&packet);
+        conn.handle_datagram(packet);
 
         let Some(resp) = conn.get_packet(PacketSpace::Handshake, 1200) else {
             panic!("Could not get handshake packet after ClientHello");
@@ -1010,7 +1012,7 @@ mod test {
             vec![crypto_frame],
         );
 
-        conn.handle_datagram(&packet);
+        conn.handle_datagram(packet);
 
         let Some(resp) = conn.get_packet(PacketSpace::Data, 1200) else {
             panic!("Could not get Handshake packet after Finished frame");
@@ -1051,7 +1053,7 @@ mod test {
         );
         *pn += 1;
 
-        conn.handle_datagram(&packet);
+        conn.handle_datagram(packet);
     }
 
     fn send_stream_data_from(conn: &mut ConnectionCore, id: StreamID, data: Bytes) -> Packet {
@@ -1094,7 +1096,7 @@ mod test {
 
         *pn += 1;
 
-        conn.handle_datagram(&packet);
+        conn.handle_datagram(packet);
     }
 
     #[test]

@@ -1,18 +1,18 @@
 use std::net::SocketAddr;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+
+use crate::core::packet::ProtectedPacket;
 
 pub mod connection;
 pub mod endpoint;
 
-#[derive(Debug)]
-struct ConnectionToEndpoint {
-    data: BytesMut,
+pub(crate) struct ConnectionToEndpoint {
+    data: Bytes,
     addr: SocketAddr,
 }
 
-#[derive(Debug)]
-struct EndpointToConnection {
-    data: Bytes,
+pub(crate) struct EndpointToConnection {
+    protected: ProtectedPacket,
     addr: SocketAddr,
 }
