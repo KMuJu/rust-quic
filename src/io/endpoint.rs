@@ -19,15 +19,18 @@ use tokio::{
     },
 };
 
-use crate::{ConnectionToEndpoint, EndpointToConnection, io::connection::Incoming, socket::Socket};
 use crate::{
     core::{
         connection::ConnectionID,
         packet::{Header, PacketError},
         stream::Side,
     },
-    io::connection::{Connection, ConnectionHandle, IncomingInner},
+    io::{
+        ConnectionToEndpoint, EndpointToConnection,
+        connection::{Connection, ConnectionHandle, IncomingInner},
+    },
 };
+use crate::{io::connection::Incoming, socket::Socket};
 
 pub struct EndpointIO<S: Socket> {
     socket: S,

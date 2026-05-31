@@ -637,7 +637,7 @@ impl Frame {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Stream {
+pub(crate) struct Stream {
     pub(super) id: StreamID,
     pub(super) fin: bool,
     pub(super) len: bool, // true if length field is present
@@ -646,7 +646,7 @@ pub(super) struct Stream {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Ack {
+pub(crate) struct Ack {
     pub(super) largest: VarInt,
     pub(super) delay: VarInt,
     pub(super) first_range: VarInt,
@@ -687,7 +687,7 @@ impl Iterator for FrameIterator {
 }
 
 #[derive(Debug, Error)]
-pub(super) enum FrameDecodeError {
+pub(crate) enum FrameDecodeError {
     #[error("Invalid frame type")]
     InvalidFrameType,
     #[error("Not enough data in the buffer when parsing")]

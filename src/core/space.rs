@@ -32,7 +32,7 @@ impl PacketSpace {
     }
 }
 
-pub(super) struct Space {
+pub(crate) struct Space {
     pub(super) space: PacketSpace,
     discarded: bool,
     pub(super) acker: Acker,

@@ -14,6 +14,7 @@ use bytes::BytesMut;
 use tokio::{
     io::ReadBuf,
     sync::{
+        Notify,
         mpsc::{UnboundedReceiver, UnboundedSender},
         oneshot,
     },
@@ -21,14 +22,13 @@ use tokio::{
 };
 
 use crate::{
-    ConnectionToEndpoint, EndpointToConnection,
     core::{
-        connection::{ConnectionCore, ConnectionID},
+        connection::{ConnEvent, ConnectionCore, ConnectionID, StreamEvent},
         space::PacketSpace,
-        stream::{Side, StreamID},
+        stream::{Dir, Side, StreamID},
         transport_parameters::TransportParam,
     },
-    io::endpoint::EndpointRef,
+    io::{ConnectionToEndpoint, EndpointToConnection, endpoint::EndpointRef},
     socket::Socket,
 };
 
@@ -38,15 +38,26 @@ pub(crate) struct ConnectionHandle {
     pub(super) incoming_data: UnboundedSender<EndpointToConnection>,
 }
 
+pub struct ConnectionState {
+    state: Mutex<ConnectionIO>,
+    shared: Shared,
+}
+
 #[derive(Clone)]
-pub struct ConnectionRef(Arc<Mutex<ConnectionIO>>);
+pub struct ConnectionRef(Arc<ConnectionState>);
 
 impl Deref for ConnectionRef {
-    type Target = Arc<Mutex<ConnectionIO>>;
+    type Target = Arc<ConnectionState>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+struct Shared {
+    new_bidir_stream: Notify,
+    new_unidir_stream: Notify,
+    handshake_done: Notify,
 }
 
 #[derive(Clone)]
@@ -64,14 +75,23 @@ impl Connection {
         incoming_data: UnboundedReceiver<EndpointToConnection>,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
     ) -> Self {
-        let io = ConnectionRef(Arc::new(Mutex::new(ConnectionIO::new(
-            cid,
-            peer_cid,
-            addr,
-            side,
-            outgoing_data,
-            connected,
-        ))));
+        let shared = Shared {
+            new_bidir_stream: Notify::new(),
+            new_unidir_stream: Notify::new(),
+            handshake_done: Notify::new(),
+        };
+        let state = ConnectionState {
+            state: Mutex::new(ConnectionIO::new(
+                cid,
+                peer_cid,
+                addr,
+                side,
+                outgoing_data,
+                connected,
+            )),
+            shared,
+        };
+        let io = ConnectionRef(Arc::new(state));
         let driver = ConnectionDriver {
             io: io.clone(),
             incoming_data,
@@ -82,28 +102,30 @@ impl Connection {
     }
 
     pub async fn accept_bidir(&self) -> (SendStreamHandle, RecvStreamHandle) {
-        let id = poll_fn(|cx| {
-            let mut inner = self.inner.lock().unwrap();
-            inner.poll_accept_bidir(cx)
-        })
-        .await;
-        (
-            SendStreamHandle::new(id.clone(), self.inner.clone()),
-            RecvStreamHandle::new(id.clone(), self.inner.clone()),
-        )
+        loop {
+            if let Some(id) = self.inner.state.lock().unwrap().core.poll_accept_bidir() {
+                return (
+                    SendStreamHandle::new(id.clone(), self.inner.clone()),
+                    RecvStreamHandle::new(id.clone(), self.inner.clone()),
+                );
+            }
+
+            self.inner.shared.new_bidir_stream.notified().await;
+        }
     }
 
     pub async fn accept_uni(&self) -> RecvStreamHandle {
-        let id = poll_fn(|cx| {
-            let mut inner = self.inner.lock().unwrap();
-            inner.poll_accept_unidir(cx)
-        })
-        .await;
-        RecvStreamHandle::new(id.clone(), self.inner.clone())
+        loop {
+            if let Some(id) = self.inner.state.lock().unwrap().core.poll_accept_unidir() {
+                return RecvStreamHandle::new(id.clone(), self.inner.clone());
+            }
+
+            self.inner.shared.new_unidir_stream.notified().await;
+        }
     }
 
     pub fn open_bidir(&self) -> (RecvStreamHandle, SendStreamHandle) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.state.lock().unwrap();
         let id = inner.new_bidir();
 
         let recv_handle = RecvStreamHandle::new(id.clone(), self.inner.clone());
@@ -114,20 +136,10 @@ impl Connection {
 
     // Send initial packet to peer
     pub(super) fn init(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.state.lock().unwrap();
         inner.init();
     }
 }
-
-// impl Debug for Connection {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         let inner = self.inner.lock().unwrap();
-//         f.write_fmt(format_args!(
-//             "Connection({:?}, {:?})",
-//             inner.core.id, inner.core.peer_cid
-//         ))
-//     }
-// }
 
 pub struct IncomingInner {
     id: ConnectionID,
@@ -206,6 +218,7 @@ impl RecvStreamHandle {
         let mut buf = ReadBuf::new(buf);
         poll_fn(|cx| {
             self.connection
+                .state
                 .lock()
                 .unwrap()
                 .poll_read(&mut buf, &self.id, cx)
@@ -220,7 +233,7 @@ impl SendStreamHandle {
     }
 
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
-        let mut inner = self.connection.lock().unwrap();
+        let mut inner = self.connection.state.lock().unwrap();
         inner.write(buf, self.id.clone())
     }
 }
@@ -230,6 +243,7 @@ pub struct ConnectionIO {
     addr: SocketAddr,
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
     outgoing_data: UnboundedSender<ConnectionToEndpoint>,
+    connected: Option<oneshot::Sender<()>>,
     driver: AtomicWaker,
 }
 
@@ -244,22 +258,15 @@ impl ConnectionIO {
         connected: oneshot::Sender<()>,
     ) -> Self {
         let transport_params = Arc::new(TransportParam::new());
-        let core = ConnectionCore::new(cid, peer_cid, side, connected, transport_params);
+        let core = ConnectionCore::new(cid, peer_cid, side, transport_params);
         Self {
             core,
             addr,
             timer: None,
             outgoing_data,
+            connected: Some(connected),
             driver: AtomicWaker::new(),
         }
-    }
-
-    pub(crate) fn poll_accept_bidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
-        self.core.poll_accept_bidir(cx)
-    }
-
-    pub(crate) fn poll_accept_unidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
-        self.core.poll_accept_unidir(cx)
     }
 
     pub(crate) fn new_bidir(&mut self) -> StreamID {
@@ -363,6 +370,31 @@ impl ConnectionIO {
             }
         }
     }
+
+    fn drain_app_events(&mut self, shared: &Shared) {
+        while let Some(event) = self.core.poll_conn_event() {
+            match event {
+                ConnEvent::HandshakeDone => {
+                    shared.handshake_done.notify_waiters();
+                    if let Some(connected) = self.connected.take() {
+                        connected.send(()).unwrap();
+                    } else {
+                        eprintln!("[ERROR]: Connected already consumed. Something is wrong")
+                    }
+                }
+                ConnEvent::Stream(stream) => match stream {
+                    StreamEvent::NewStream { id } => match id.dir() {
+                        Dir::Bidir => shared.new_bidir_stream.notify_waiters(),
+                        Dir::Uni => shared.new_unidir_stream.notify_waiters(),
+                    },
+                    StreamEvent::ClosedStream { id } => todo!(),
+                    StreamEvent::Readable { id } => todo!(),
+                    StreamEvent::Writeable { id } => todo!(),
+                },
+                ConnEvent::CloseConnection => todo!(),
+            }
+        }
+    }
 }
 
 // Handles reeiving data from the endpoint and passing it to inner and seeing if pending data
@@ -377,7 +409,7 @@ impl Future for ConnectionDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.io.lock().unwrap().driver.register(cx.waker());
+        this.io.state.lock().unwrap().driver.register(cx.waker());
 
         // Handle incomming packets
         let mut buffer = Vec::new();
@@ -389,12 +421,14 @@ impl Future for ConnectionDriver {
             }
         }
 
-        let mut conn = this.io.lock().unwrap();
+        let mut conn = this.io.state.lock().unwrap();
 
         conn.handle_data(buffer);
 
         // Handle timeout
         conn.check_timeout(cx);
+
+        conn.drain_app_events(&this.io.shared);
 
         // Get packets from connection
         conn.drive_transmit();

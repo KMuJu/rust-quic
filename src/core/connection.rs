@@ -27,11 +27,27 @@ use crate::{
     io::connection::{ReadError, SendError},
 };
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum LifeCycle {
     Handshake,
     Connected,
     // TODO: Add closed and such
+}
+
+/// Output events from the connection
+#[derive(PartialEq, Eq, Debug)]
+pub enum ConnEvent {
+    HandshakeDone,
+    CloseConnection,
+    Stream(StreamEvent),
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum StreamEvent {
+    NewStream { id: StreamID },
+    ClosedStream { id: StreamID },
+    Readable { id: StreamID },
+    Writeable { id: StreamID },
 }
 
 pub struct ConnectionCore {
@@ -41,7 +57,6 @@ pub struct ConnectionCore {
     side: Side,
     lifeycle: LifeCycle,
 
-    connected: Option<oneshot::Sender<()>>,
     state: PacketSpace,
 
     recv: HashMap<StreamID, RecvStream>,
@@ -49,9 +64,7 @@ pub struct ConnectionCore {
 
     // Streams that can be accepted
     bidir_acceptable: VecDeque<StreamID>,
-    bidir_accept_waker: AtomicWaker,
     unidir_acceptable: VecDeque<StreamID>,
-    unidir_accept_waker: AtomicWaker,
 
     // Streams that have data to send
     pending_recv: VecDeque<StreamID>,
@@ -70,6 +83,8 @@ pub struct ConnectionCore {
 
     congestion: CongestionController,
     timers: TimerTable,
+
+    conn_event_queue: VecDeque<ConnEvent>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -112,7 +127,6 @@ impl ConnectionCore {
         cid: ConnectionID,
         peer_cid: ConnectionID,
         side: Side,
-        connected: oneshot::Sender<()>,
         transport_params: SharedConfig,
     ) -> Self {
         ConnectionCore {
@@ -120,14 +134,11 @@ impl ConnectionCore {
             peer_cid,
             side,
             lifeycle: LifeCycle::Handshake,
-            connected: Some(connected),
             state: PacketSpace::Initial,
             recv: HashMap::new(),
             send: HashMap::new(),
             bidir_acceptable: VecDeque::new(),
-            bidir_accept_waker: AtomicWaker::new(),
             unidir_acceptable: VecDeque::new(),
-            unidir_accept_waker: AtomicWaker::new(),
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
             stream_number: 0,
@@ -141,6 +152,7 @@ impl ConnectionCore {
             rtt: RttEstimator::new(),
             congestion: CongestionController::new(transport_params.clone()),
             timers: TimerTable::new(),
+            conn_event_queue: VecDeque::new(),
         }
     }
 
@@ -416,11 +428,8 @@ impl ConnectionCore {
     }
 
     fn consume_connected(&mut self) {
-        if let Some(connected) = self.connected.take() {
-            connected.send(()).unwrap();
-        } else {
-            eprintln!("[ERROR]: Connected already consumed. Something is wrong")
-        }
+        self.conn_event_queue.push_back(ConnEvent::HandshakeDone);
+        self.lifeycle = LifeCycle::Connected;
         self.pto_count = 0;
     }
 
@@ -448,14 +457,15 @@ impl ConnectionCore {
                 self.send.insert(id.clone(), SendStream::new(id.clone()));
                 self.recv.insert(id.clone(), RecvStream::new(id.clone()));
                 self.bidir_acceptable.push_back(id.clone());
-                self.bidir_accept_waker.wake();
             }
             Dir::Uni => {
                 self.recv.insert(id.clone(), RecvStream::new(id.clone()));
                 self.unidir_acceptable.push_back(id.clone());
-                self.unidir_accept_waker.wake();
             }
         }
+
+        self.conn_event_queue
+            .push_back(ConnEvent::Stream(StreamEvent::NewStream { id: id.clone() }));
     }
 
     fn peer_completed_address_validation(&self) -> bool {
@@ -463,7 +473,7 @@ impl ConnectionCore {
         self.handshake_is_done()
     }
 
-    pub fn spaces(&self) -> impl Iterator<Item = &Space> {
+    pub(crate) fn spaces(&self) -> impl Iterator<Item = &Space> {
         self.spaces.iter()
     }
 
@@ -777,26 +787,18 @@ impl ConnectionCore {
             .sent_packet(pn, frames, is_in_flight, is_ack_eliciting);
     }
 
-    pub(super) fn mark_pending_on_recv(&mut self, id: StreamID) {
-        self.pending_recv.push_back(id);
-        self.write_waker.wake();
-    }
-
-    pub(super) fn mark_pending_on_send(&mut self, id: StreamID) {
-        self.pending_send.push_back(id);
-        self.write_waker.wake();
-    }
-
-    pub(super) fn recv(&mut self, id: &StreamID) -> Option<&mut RecvStream> {
+    pub fn recv(&mut self, id: &StreamID) -> Option<&mut RecvStream> {
         self.recv.get_mut(id)
     }
 
-    pub(super) fn send(&mut self, id: &StreamID) -> Option<&mut SendStream> {
+    pub fn send(&mut self, id: &StreamID) -> Option<&mut SendStream> {
         self.send.get_mut(id)
     }
 
+    /// Handshake is done if the lifecycle is past the handshake stage
+    /// Should not be able to get back to handshake state afterwards
     fn handshake_is_done(&self) -> bool {
-        self.connected.is_none()
+        self.lifeycle > LifeCycle::Handshake
     }
 
     pub(crate) fn new_bidir(&mut self) -> StreamID {
@@ -839,6 +841,8 @@ impl ConnectionCore {
         recv.poll_read(buf, cx)
     }
 
+    // TODO: Handle max data
+    // Will have to wait if max data is hit
     pub(crate) fn write(&mut self, buf: &[u8], id: StreamID) -> Result<usize, SendError> {
         let Some(send) = self.send(&id) else {
             // Stream does not exist, this means that something is wrong
@@ -860,40 +864,30 @@ impl ConnectionCore {
         self.spaces[p_space].is_discarded()
     }
 
-    pub(crate) fn poll_accept_bidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
-        if let Some(id) = self.bidir_acceptable.pop_front() {
-            Poll::Ready(id)
-        } else {
-            self.bidir_accept_waker.register(cx.waker());
-            Poll::Pending
-        }
+    pub(crate) fn poll_accept_bidir(&mut self) -> Option<StreamID> {
+        self.bidir_acceptable.pop_front()
     }
 
-    pub(crate) fn poll_accept_unidir(&mut self, cx: &mut Context<'_>) -> Poll<StreamID> {
-        if let Some(id) = self.unidir_acceptable.pop_front() {
-            Poll::Ready(id)
-        } else {
-            self.unidir_accept_waker.register(cx.waker());
-            Poll::Pending
-        }
+    pub(crate) fn poll_accept_unidir(&mut self) -> Option<StreamID> {
+        self.unidir_acceptable.pop_front()
+    }
+
+    pub(crate) fn poll_conn_event(&mut self) -> Option<ConnEvent> {
+        self.conn_event_queue.pop_front()
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::{pin::Pin, sync::Arc};
+    use std::sync::Arc;
 
     use bytes::Bytes;
-    use futures::task::noop_waker_ref;
 
     use crate::core::{ack_manager::Acker, transport_parameters::TransportParam};
 
     use super::*;
 
-    fn create_connection(
-        sender: oneshot::Sender<()>,
-        transport_params: SharedConfig,
-    ) -> ConnectionCore {
+    fn create_connection(transport_params: SharedConfig) -> ConnectionCore {
         ConnectionCore {
             id: ConnectionID {
                 len: 1,
@@ -905,14 +899,11 @@ mod test {
             },
             side: Side::Server,
             lifeycle: LifeCycle::Handshake,
-            connected: Some(sender),
             state: PacketSpace::Initial,
             recv: HashMap::new(),
             send: HashMap::new(),
             bidir_acceptable: VecDeque::new(),
-            bidir_accept_waker: AtomicWaker::new(),
             unidir_acceptable: VecDeque::new(),
-            unidir_accept_waker: AtomicWaker::new(),
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
             stream_number: 0,
@@ -926,6 +917,7 @@ mod test {
             pto_count: 0,
             congestion: CongestionController::new(transport_params),
             timers: TimerTable::new(),
+            conn_event_queue: VecDeque::new(),
         }
     }
 
@@ -1107,29 +1099,23 @@ mod test {
 
     #[test]
     fn test_handshake() {
-        let (sender, mut receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params);
+        let mut connection = create_connection(transport_params);
 
         server_initial_state(&mut connection);
         server_handshake_state(&mut connection);
 
-        {
-            // Checking if it notified the oneshot channel
-            let mut cx = Context::from_waker(noop_waker_ref());
-            assert!(Pin::new(&mut receiver).poll(&mut cx).is_ready());
-            assert!(connection.handshake_is_done());
-        }
-
         assert_eq!(connection.lifeycle, LifeCycle::Connected);
         assert_eq!(connection.state, PacketSpace::Data);
+
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::HandshakeDone);
     }
 
     #[test]
     fn test_maxackdelay_timer() {
-        let (sender, _receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params.clone());
+        let mut connection = create_connection(transport_params);
         let mut pn = 0u8;
         server_initial_state(&mut connection);
         server_handshake_state(&mut connection);
@@ -1159,9 +1145,8 @@ mod test {
 
     #[test]
     fn test_loss_timer() {
-        let (sender, _receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params.clone());
+        let mut connection = create_connection(transport_params.clone());
         let mut acker = Acker::new(transport_params);
         let mut pn = 0u8;
         server_initial_state(&mut connection);
@@ -1210,12 +1195,14 @@ mod test {
 
     #[test]
     fn test_send_data_from() {
-        let (sender, _receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params.clone());
+        let mut connection = create_connection(transport_params.clone());
         let mut acker = Acker::new(transport_params);
         server_initial_state(&mut connection);
         server_handshake_state(&mut connection);
+
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::HandshakeDone);
 
         let id = open_bidir(&mut connection);
         // Sending one stream packets and acking
@@ -1231,5 +1218,31 @@ mod test {
             panic!("No stream frame after sending data");
         };
         assert_eq!(frame.data, sending_bytes);
+    }
+
+    #[test]
+    fn test_app_output() {
+        let transport_params = Arc::new(TransportParam::new());
+        let mut connection = create_connection(transport_params.clone());
+        let mut pn = 0u8;
+        server_initial_state(&mut connection);
+        server_handshake_state(&mut connection);
+
+        // HandshakeDone is queued after connecting
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::HandshakeDone);
+
+        // Sends stream frame with a stream id that is not in the connection
+        // Should queue NewStream event
+        let id = StreamID::new(1, &Side::Client, Dir::Bidir);
+        send_stream_data_to(
+            &mut connection,
+            id.clone(),
+            Bytes::from_static(&[1, 2, 3, 4, 5]),
+            &mut pn,
+        );
+
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::Stream(StreamEvent::NewStream { id }));
     }
 }

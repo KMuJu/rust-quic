@@ -129,7 +129,7 @@ impl SendStream {
 
     pub(super) fn handle_frame(&mut self, frame: Frame) {}
 
-    pub(super) fn read_n(&mut self, buf: &mut BytesMut, size: usize) -> usize {
+    pub fn read_n(&mut self, buf: &mut BytesMut, size: usize) -> usize {
         let read = self.buffer.len().min(size);
         buf.put_slice(&self.buffer[..read]);
         self.offset += read as u64;

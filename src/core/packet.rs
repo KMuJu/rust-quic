@@ -41,7 +41,7 @@ pub enum Header {
 
 pub struct Packet {
     pub header: Header,
-    pub frames: Vec<Frame>,
+    pub(crate) frames: Vec<Frame>,
 }
 
 impl Packet {
