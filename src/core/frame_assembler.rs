@@ -3,10 +3,11 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{self},
     pin::Pin,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes};
+use futures::task::AtomicWaker;
 use tokio::io::{AsyncRead, ReadBuf};
 
 // Will handle buffering out of order frames
@@ -14,7 +15,7 @@ pub struct FrameAssembler {
     read_pos: u64,
     buffer: BTreeMap<u64, Bytes>,
     readable: VecDeque<Bytes>,
-    waker: Option<Waker>,
+    waker: AtomicWaker,
 }
 
 impl FrameAssembler {
@@ -23,13 +24,11 @@ impl FrameAssembler {
             read_pos: 0,
             buffer: BTreeMap::new(),
             readable: VecDeque::new(),
-            waker: None,
+            waker: AtomicWaker::new(),
         }
     }
 
     pub fn add(&mut self, mut data: Bytes, offset: u64) {
-        // println!("State: [pos: {}]", self.read_pos);
-        // println!("Adding data: {data:?}, {offset}");
         let data_len = data.remaining() as u64;
         if offset + data_len <= self.read_pos {
             return;
@@ -40,9 +39,7 @@ impl FrameAssembler {
             self.read_pos += data_len;
             self.handle_domino_effect();
         } else if offset < self.read_pos && offset + data_len > self.read_pos {
-            // println!("Some duplicate data: {data:?}");
             data.advance((self.read_pos - offset) as usize);
-            // println!("Advanced: {data:?}");
             let data_len = data.remaining() as u64;
             self.readable.push_back(data);
             self.read_pos += data_len;
@@ -52,13 +49,8 @@ impl FrameAssembler {
         }
 
         if !self.readable.is_empty() {
-            if let Some(waker) = self.waker.take() {
-                waker.wake();
-            }
+            self.waker.wake();
         }
-
-        // println!("Buffer: {:?}", self.buffer);
-        // println!("Readable: {:?}", self.readable);
     }
 
     fn handle_domino_effect(&mut self) {
@@ -86,9 +78,7 @@ impl FrameAssembler {
             self.read_pos += chunk.remaining() as u64;
             self.readable.push_back(chunk);
             self.handle_domino_effect();
-            if let Some(waker) = self.waker.take() {
-                waker.wake();
-            }
+            self.waker.wake();
         }
     }
 }
@@ -135,7 +125,7 @@ impl AsyncRead for FrameAssembler {
         }
 
         if this.readable.is_empty() {
-            this.waker = Some(cx.waker().clone());
+            this.waker.register(cx.waker());
             return Poll::Pending;
         }
 

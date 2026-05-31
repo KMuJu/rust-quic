@@ -3,10 +3,10 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use crate::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
+use crate::core::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PacketSpace {
+pub enum PacketSpace {
     Initial,
     Handshake,
     Data,
@@ -27,12 +27,12 @@ impl IndexMut<PacketSpace> for [Space; 3] {
 }
 
 impl PacketSpace {
-    pub(super) fn iter() -> impl Iterator<Item = Self> {
+    pub fn iter() -> impl Iterator<Item = Self> {
         [Self::Initial, Self::Handshake, Self::Data].into_iter()
     }
 }
 
-pub(super) struct Space {
+pub(crate) struct Space {
     pub(super) space: PacketSpace,
     discarded: bool,
     pub(super) acker: Acker,

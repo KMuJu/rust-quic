@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use rust_quic::{endpoint::Endpoint, mock_socket::mock::MockSocket};
+use rust_quic::{io::endpoint::Endpoint, mock_socket::mock::MockSocket};
 
 #[tokio::test]
 async fn test_handshake() {

@@ -1,57 +1,62 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
-    future::poll_fn,
     io::Cursor,
-    net::SocketAddr,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
     time::Duration,
 };
 
 use bytes::{Buf, BytesMut};
 use futures::task::AtomicWaker;
 use rand::{Rng, rngs::StdRng};
-use tokio::{
-    sync::{
-        mpsc::{UnboundedReceiver, UnboundedSender},
-        oneshot,
-    },
-    time::Instant,
-};
+use tokio::{io::ReadBuf, sync::oneshot, time::Instant};
 
 use crate::{
-    ConnectionToEndpoint, EndpointToConnection,
-    congestion::CongestionController,
-    crypto::CryptoFrame,
-    encoding::VarInt,
-    endpoint::EndpointRef,
-    frame::{Ack, AckRange, Frame, Stream},
-    packet::{Header, Packet, PacketNumber},
-    rtt_estimator::RttEstimator,
-    socket::Socket,
-    space::{PacketSpace, Space},
-    stream::{Dir, RecvStream, RecvStreamHandle, SendStream, SendStreamHandle, Side, StreamID},
-    timers::{Timer, TimerTable},
-    transport_parameters::{SharedConfig, TransportParam},
+    core::{
+        congestion::CongestionController,
+        crypto::CryptoFrame,
+        encoding::VarInt,
+        frame::{Ack, Frame, Stream},
+        packet::{Header, Packet, PacketNumber},
+        rtt_estimator::RttEstimator,
+        space::{PacketSpace, Space},
+        stream::{Dir, RecvStream, SendStream, Side, StreamID},
+        timers::{Timer, TimerTable},
+        transport_parameters::SharedConfig,
+    },
+    io::connection::{ReadError, SendError},
 };
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum LifeCycle {
     Handshake,
     Connected,
     // TODO: Add closed and such
 }
 
-pub struct ConnectionInner {
+/// Output events from the connection
+#[derive(PartialEq, Eq, Debug)]
+pub enum ConnEvent {
+    HandshakeDone,
+    CloseConnection,
+    Stream(StreamEvent),
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum StreamEvent {
+    NewStream { id: StreamID },
+    ClosedStream { id: StreamID },
+    Readable { id: StreamID },
+    Writeable { id: StreamID },
+}
+
+pub struct ConnectionCore {
     id: ConnectionID,
     // Peer's cid
     peer_cid: ConnectionID,
     side: Side,
     lifeycle: LifeCycle,
 
-    connected: Option<oneshot::Sender<()>>,
     state: PacketSpace,
 
     recv: HashMap<StreamID, RecvStream>,
@@ -59,16 +64,11 @@ pub struct ConnectionInner {
 
     // Streams that can be accepted
     bidir_acceptable: VecDeque<StreamID>,
-    bidir_accept_waker: AtomicWaker,
     unidir_acceptable: VecDeque<StreamID>,
-    unidir_accept_waker: AtomicWaker,
 
     // Streams that have data to send
     pending_recv: VecDeque<StreamID>,
     pending_send: VecDeque<StreamID>,
-
-    // Wakes up when a stream has written data pending
-    write_waker: AtomicWaker,
 
     stream_number: usize,
 
@@ -83,6 +83,8 @@ pub struct ConnectionInner {
 
     congestion: CongestionController,
     timers: TimerTable,
+
+    conn_event_queue: VecDeque<ConnEvent>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -120,7 +122,40 @@ impl Debug for ConnectionID {
     }
 }
 
-impl ConnectionInner {
+impl ConnectionCore {
+    pub(crate) fn new(
+        cid: ConnectionID,
+        peer_cid: ConnectionID,
+        side: Side,
+        transport_params: SharedConfig,
+    ) -> Self {
+        ConnectionCore {
+            id: cid,
+            peer_cid,
+            side,
+            lifeycle: LifeCycle::Handshake,
+            state: PacketSpace::Initial,
+            recv: HashMap::new(),
+            send: HashMap::new(),
+            bidir_acceptable: VecDeque::new(),
+            unidir_acceptable: VecDeque::new(),
+            pending_recv: VecDeque::new(),
+            pending_send: VecDeque::new(),
+            stream_number: 0,
+            spaces: [
+                Space::new(PacketSpace::Initial, transport_params.clone()),
+                Space::new(PacketSpace::Handshake, transport_params.clone()),
+                Space::new(PacketSpace::Data, transport_params.clone()),
+            ],
+            pto_count: 0,
+            transport_params: transport_params.clone(),
+            rtt: RttEstimator::new(),
+            congestion: CongestionController::new(transport_params.clone()),
+            timers: TimerTable::new(),
+            conn_event_queue: VecDeque::new(),
+        }
+    }
+
     pub fn handle_datagram(&mut self, buf: &[u8]) {
         let packet = match Packet::decode(&mut Cursor::new(buf), self.id.len) {
             Ok(p) => p,
@@ -393,11 +428,8 @@ impl ConnectionInner {
     }
 
     fn consume_connected(&mut self) {
-        if let Some(connected) = self.connected.take() {
-            connected.send(()).unwrap();
-        } else {
-            eprintln!("[ERROR]: Connected already consumed. Something is wrong")
-        }
+        self.conn_event_queue.push_back(ConnEvent::HandshakeDone);
+        self.lifeycle = LifeCycle::Connected;
         self.pto_count = 0;
     }
 
@@ -425,14 +457,15 @@ impl ConnectionInner {
                 self.send.insert(id.clone(), SendStream::new(id.clone()));
                 self.recv.insert(id.clone(), RecvStream::new(id.clone()));
                 self.bidir_acceptable.push_back(id.clone());
-                self.bidir_accept_waker.wake();
             }
             Dir::Uni => {
                 self.recv.insert(id.clone(), RecvStream::new(id.clone()));
                 self.unidir_acceptable.push_back(id.clone());
-                self.unidir_accept_waker.wake();
             }
         }
+
+        self.conn_event_queue
+            .push_back(ConnEvent::Stream(StreamEvent::NewStream { id: id.clone() }));
     }
 
     fn peer_completed_address_validation(&self) -> bool {
@@ -440,16 +473,16 @@ impl ConnectionInner {
         self.handshake_is_done()
     }
 
-    fn spaces(&self) -> impl Iterator<Item = &Space> {
+    pub(crate) fn spaces(&self) -> impl Iterator<Item = &Space> {
         self.spaces.iter()
     }
 
-    fn next_ack_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_ack_deadline(&self) -> Option<Instant> {
         self.spaces().filter_map(|s| s.acker.get_deadline()).min()
     }
 
     /// Follows RFC 9002 A.8
-    fn get_loss_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
+    pub(crate) fn get_loss_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
         self.spaces()
             .filter_map(|s| Some((s.acker.get_loss_time()?, s.space)))
             .min_by_key(|(time, _)| *time)
@@ -460,7 +493,7 @@ impl ConnectionInner {
             .any(|s| s.acker.has_ack_eliciting_packet_in_flight())
     }
 
-    fn next_deadline(&mut self) -> Option<Instant> {
+    pub fn next_deadline(&mut self) -> Option<Instant> {
         // Updates max ack delay timer because I could not get it to work if I set it other places
         let ack_deadline = self.next_ack_deadline();
         match ack_deadline {
@@ -477,7 +510,7 @@ impl ConnectionInner {
     /// - Loss detection timeout
     /// - Received ack
     /// - Packet sent
-    fn set_loss_timer(&mut self) {
+    pub fn set_loss_timer(&mut self) {
         let earliest = self.get_loss_time_and_space();
 
         if let Some((deadline, _)) = earliest {
@@ -548,7 +581,7 @@ impl ConnectionInner {
         pto_timeout
     }
 
-    fn handle_timeout(&mut self, time: Instant) {
+    pub(crate) fn handle_timeout(&mut self, time: Instant) {
         for timer in Timer::values() {
             if !self.timers.has_passed(timer, time) {
                 continue;
@@ -598,8 +631,10 @@ impl ConnectionInner {
         }
     }
 
-    fn get_packet(&mut self, p_space: PacketSpace, mut mtu: usize) -> Option<Packet> {
+    pub fn get_packet(&mut self, p_space: PacketSpace, mtu: usize) -> Option<Packet> {
         // println!("[ACK]: Getting packet for {p_space:?}");
+        let available = self.congestion.available_space();
+        let mut mtu = mtu.min(available);
         let pn = PacketNumber::from(self.spaces[p_space].packet_number);
 
         let header = match p_space {
@@ -737,142 +772,50 @@ impl ConnectionInner {
         }
     }
 
-    pub(super) fn mark_pending_on_recv(&mut self, id: StreamID) {
-        self.pending_recv.push_back(id);
-        self.write_waker.wake();
+    pub(crate) fn packet_sent(
+        &mut self,
+        p_space: PacketSpace,
+        pn: PacketNumber,
+        frames: Vec<Frame>,
+        is_in_flight: bool,
+        is_ack_eliciting: bool,
+        sent_bytes: u64,
+    ) {
+        self.congestion.on_packet_sent(sent_bytes);
+        self.spaces[p_space]
+            .acker
+            .sent_packet(pn, frames, is_in_flight, is_ack_eliciting);
     }
 
-    pub(super) fn mark_pending_on_send(&mut self, id: StreamID) {
-        self.pending_send.push_back(id);
-        self.write_waker.wake();
-    }
-
-    pub(super) fn recv(&mut self, id: &StreamID) -> Option<&mut RecvStream> {
+    pub fn recv(&mut self, id: &StreamID) -> Option<&mut RecvStream> {
         self.recv.get_mut(id)
     }
 
-    pub(super) fn send(&mut self, id: &StreamID) -> Option<&mut SendStream> {
+    pub fn send(&mut self, id: &StreamID) -> Option<&mut SendStream> {
         self.send.get_mut(id)
     }
 
+    /// Handshake is done if the lifecycle is past the handshake stage
+    /// Should not be able to get back to handshake state afterwards
     fn handshake_is_done(&self) -> bool {
-        self.connected.is_none()
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct ConnectionHandle {
-    pub(super) addr: SocketAddr,
-    pub(super) incoming_data: UnboundedSender<EndpointToConnection>,
-}
-
-#[derive(Clone)]
-pub struct Connection {
-    inner: Arc<Mutex<ConnectionInner>>,
-}
-
-impl Connection {
-    pub(super) fn new(
-        cid: ConnectionID,
-        peer_cid: ConnectionID,
-        addr: SocketAddr,
-        side: Side,
-        connected: oneshot::Sender<()>,
-        incoming_data: UnboundedReceiver<EndpointToConnection>,
-        outgoing_data: UnboundedSender<ConnectionToEndpoint>,
-    ) -> Self {
-        let transport_params = Arc::new(TransportParam::new());
-        let inner = Arc::new(Mutex::new(ConnectionInner {
-            id: cid,
-            peer_cid,
-            side,
-            lifeycle: LifeCycle::Handshake,
-            connected: Some(connected),
-            state: PacketSpace::Initial,
-            recv: HashMap::new(),
-            send: HashMap::new(),
-            bidir_acceptable: VecDeque::new(),
-            bidir_accept_waker: AtomicWaker::new(),
-            unidir_acceptable: VecDeque::new(),
-            unidir_accept_waker: AtomicWaker::new(),
-            pending_recv: VecDeque::new(),
-            pending_send: VecDeque::new(),
-            write_waker: AtomicWaker::new(),
-            stream_number: 0,
-
-            spaces: [
-                Space::new(PacketSpace::Initial, transport_params.clone()),
-                Space::new(PacketSpace::Handshake, transport_params.clone()),
-                Space::new(PacketSpace::Data, transport_params.clone()),
-            ],
-            pto_count: 0,
-            transport_params: transport_params.clone(),
-            rtt: RttEstimator::new(),
-            congestion: CongestionController::new(transport_params.clone()),
-            timers: TimerTable::new(),
-        }));
-        let driver = ConnectionDriver {
-            inner: inner.clone(),
-            incoming_data,
-            outgoing_data,
-            addr,
-            timer: None,
-        };
-
-        tokio::spawn(driver);
-        Connection { inner }
+        self.lifeycle > LifeCycle::Handshake
     }
 
-    pub async fn accept_bidir(&self) -> (SendStreamHandle, RecvStreamHandle) {
-        poll_fn(|cx| {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(id) = inner.bidir_acceptable.pop_front() {
-                Poll::Ready((
-                    SendStreamHandle::new(id.clone(), self.inner.clone()),
-                    RecvStreamHandle::new(id, self.inner.clone()),
-                ))
-            } else {
-                inner.bidir_accept_waker.register(cx.waker());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-
-    pub async fn accept_uni(&self) -> RecvStreamHandle {
-        poll_fn(|cx| {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(id) = inner.unidir_acceptable.pop_front() {
-                Poll::Ready(RecvStreamHandle::new(id, self.inner.clone()))
-            } else {
-                inner.unidir_accept_waker.register(cx.waker());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-
-    pub fn open_bidir(&self) -> (RecvStreamHandle, SendStreamHandle) {
-        let mut inner = self.inner.lock().unwrap();
-        let id = StreamID::new(inner.stream_number, &inner.side, Dir::Bidir);
+    pub(crate) fn new_bidir(&mut self) -> StreamID {
+        let id = StreamID::new(self.stream_number, &self.side, Dir::Bidir);
         // TODO: Have seperate counters for each?
         // Currently this will shrink the number of possible stream ids
-        inner.stream_number += 1;
+        self.stream_number += 1;
         let recv = RecvStream::new(id.clone());
         let send = SendStream::new(id.clone());
 
-        inner.recv.insert(id.clone(), recv);
-        inner.send.insert(id.clone(), send);
+        self.recv.insert(id.clone(), recv);
+        self.send.insert(id.clone(), send);
 
-        let recv_handle = RecvStreamHandle::new(id.clone(), self.inner.clone());
-        let send_handle = SendStreamHandle::new(id.clone(), self.inner.clone());
-
-        (recv_handle, send_handle)
+        id
     }
 
-    // Send initial packet to peer
-    pub(super) fn init(&self) {
-        let mut inner = self.inner.lock().unwrap();
+    pub(crate) fn init(&mut self) {
         let crypto_data = CryptoFrame::ClientHello;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
@@ -880,206 +823,72 @@ impl Connection {
             offset: VarInt(0),
             data: c_data,
         };
-        inner.spaces[PacketSpace::Initial]
+        self.spaces[PacketSpace::Initial]
             .pending_frames
             .push_back(crypto_frame);
-        inner.state = PacketSpace::Handshake;
-        inner.write_waker.wake();
+        self.state = PacketSpace::Handshake;
     }
-}
 
-impl Debug for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock().unwrap();
-        f.write_fmt(format_args!(
-            "Connection({:?}, {:?})",
-            inner.id, inner.peer_cid
-        ))
+    pub(crate) fn poll_read(
+        &mut self,
+        buf: &mut ReadBuf,
+        id: &StreamID,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, ReadError>> {
+        let Some(recv) = self.recv(id) else {
+            return Poll::Ready(Err(ReadError::ClosedStream));
+        };
+        recv.poll_read(buf, cx)
     }
-}
 
-pub struct IncomingInner {
-    id: ConnectionID,
-    src_cid: ConnectionID,
-    connected: oneshot::Receiver<()>,
-}
-
-impl IncomingInner {
-    pub fn new(id: ConnectionID, src_cid: ConnectionID, connected: oneshot::Receiver<()>) -> Self {
-        Self {
-            id,
-            src_cid,
-            connected,
-        }
-    }
-}
-
-pub struct Incoming<S: Socket> {
-    inner: IncomingInner,
-    endpoint: EndpointRef<S>,
-}
-
-impl<S: Socket> Incoming<S> {
-    pub fn new(inner: IncomingInner, endpoint: EndpointRef<S>) -> Self {
-        Self { inner, endpoint }
-    }
-}
-
-impl<S: Socket> Future for Incoming<S> {
-    type Output = Connection;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        println!("Waiting for connected notification");
-        ready!(Pin::new(&mut this.inner.connected).poll(cx)).unwrap();
-
-        let endpoint = this.endpoint.state.lock().unwrap();
-
-        let connection = endpoint.connections.get(&this.inner.id).unwrap();
-        Poll::Ready(connection.clone())
-    }
-}
-
-// Handles reeiving data from the endpoint and passing it to inner and seeing if pending data
-// exists
-struct ConnectionDriver {
-    inner: Arc<Mutex<ConnectionInner>>,
-    incoming_data: UnboundedReceiver<EndpointToConnection>,
-    outgoing_data: UnboundedSender<ConnectionToEndpoint>,
-    addr: SocketAddr,
-    timer: Option<Pin<Box<tokio::time::Sleep>>>,
-}
-
-impl Future for ConnectionDriver {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        this.inner.lock().unwrap().write_waker.register(cx.waker());
-
-        this.inner
-            .lock()
-            .unwrap()
-            .spaces()
-            .for_each(|s| s.acker.register_waker(cx.waker()));
-
-        // Handle incomming packets
-        let mut buffer = Vec::new();
-        loop {
-            match this.incoming_data.poll_recv(cx) {
-                Poll::Ready(Some(data)) => buffer.push(data),
-                Poll::Ready(None) => return Poll::Ready(()), // channel closed
-                Poll::Pending => break,
-            }
-        }
-
-        if !buffer.is_empty() {
-            let mut conn = this.inner.lock().unwrap();
-            for data in buffer {
-                conn.handle_datagram(&data.data);
-            }
-        }
-
-        // Handle timeout
-        let timer_fired = this
-            .timer
-            .as_mut()
-            .map(|t| t.as_mut().poll(cx).is_ready())
-            .unwrap_or(false);
-
-        if timer_fired {
-            this.timer = None;
-            this.inner.lock().unwrap().handle_timeout(Instant::now());
-        }
-
-        // Get packets from connection
-        let packets = {
-            let mut conn = this.inner.lock().unwrap();
-            let mut pkts = Vec::new();
-
-            let mtu = 1200;
-            for p_space in PacketSpace::iter() {
-                if conn.spaces[p_space].is_discarded() {
-                    continue;
-                }
-                while let Some(packet) = {
-                    let available = conn.congestion.available_space();
-                    conn.get_packet(p_space, mtu.min(available))
-                } {
-                    conn.congestion.on_packet_sent(packet.size() as u64);
-                    pkts.push(packet);
-                }
-            }
-            pkts
+    // TODO: Handle max data
+    // Will have to wait if max data is hit
+    pub(crate) fn write(&mut self, buf: &[u8], id: StreamID) -> Result<usize, SendError> {
+        let Some(send) = self.send(&id) else {
+            // Stream does not exist, this means that something is wrong
+            // TODO: Different error?
+            return Err(SendError::ClosedStream);
         };
 
-        {
-            let mut conn = this.inner.lock().unwrap();
-            for packet in packets {
-                println!(
-                    "Sending packet({:?})[{:?}]: {packet:?}",
-                    conn.state, conn.side
-                );
-
-                let mut buf = BytesMut::new();
-                packet.encode(&mut buf).unwrap();
-                this.outgoing_data
-                    .send(ConnectionToEndpoint {
-                        data: buf,
-                        addr: this.addr,
-                    })
-                    .unwrap();
-
-                let is_in_flight = packet.is_in_flight();
-                let is_ack_eliciting = packet.is_ack_eliciting();
-                let p_space = packet.packet_space();
-                conn.spaces[p_space].acker.sent_packet(
-                    packet.packet_number().clone(),
-                    packet.frames,
-                    is_in_flight,
-                    is_ack_eliciting,
-                );
-
-                if is_in_flight {
-                    conn.set_loss_timer();
-                }
-            }
+        if !send.can_send() {
+            return Err(SendError::WrongState);
         }
 
-        // Rearm timer
-        let deadline = this.inner.lock().unwrap().next_deadline();
-        match (deadline, this.timer.as_mut()) {
-            (Some(deadline), Some(timer)) => {
-                timer.as_mut().reset(deadline);
-            }
-            (Some(deadline), None) => {
-                let mut sleep = Box::pin(tokio::time::sleep_until(deadline));
-                let _ = sleep.as_mut().poll(cx); // register waker
-                this.timer = Some(sleep);
-            }
-            (None, _) => {
-                this.timer = None;
-            }
-        }
+        send.set_buffer(buf);
+        self.pending_send.push_back(id);
 
-        Poll::Pending
+        Ok(buf.len())
+    }
+
+    pub(crate) fn is_discarded(&self, p_space: PacketSpace) -> bool {
+        self.spaces[p_space].is_discarded()
+    }
+
+    pub(crate) fn poll_accept_bidir(&mut self) -> Option<StreamID> {
+        self.bidir_acceptable.pop_front()
+    }
+
+    pub(crate) fn poll_accept_unidir(&mut self) -> Option<StreamID> {
+        self.unidir_acceptable.pop_front()
+    }
+
+    pub(crate) fn poll_conn_event(&mut self) -> Option<ConnEvent> {
+        self.conn_event_queue.pop_front()
     }
 }
 
 #[cfg(test)]
 mod test {
-    use bytes::Bytes;
-    use futures::task::noop_waker_ref;
+    use std::sync::Arc;
 
-    use crate::ack_manager::Acker;
+    use bytes::Bytes;
+
+    use crate::core::{ack_manager::Acker, transport_parameters::TransportParam};
 
     use super::*;
 
-    fn create_connection(
-        sender: oneshot::Sender<()>,
-        transport_params: SharedConfig,
-    ) -> ConnectionInner {
-        ConnectionInner {
+    fn create_connection(transport_params: SharedConfig) -> ConnectionCore {
+        ConnectionCore {
             id: ConnectionID {
                 len: 1,
                 buf: [0; 20],
@@ -1090,17 +899,13 @@ mod test {
             },
             side: Side::Server,
             lifeycle: LifeCycle::Handshake,
-            connected: Some(sender),
             state: PacketSpace::Initial,
             recv: HashMap::new(),
             send: HashMap::new(),
             bidir_acceptable: VecDeque::new(),
-            bidir_accept_waker: AtomicWaker::new(),
             unidir_acceptable: VecDeque::new(),
-            unidir_accept_waker: AtomicWaker::new(),
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
-            write_waker: AtomicWaker::new(),
             stream_number: 0,
             spaces: [
                 Space::new(PacketSpace::Initial, transport_params.clone()),
@@ -1112,6 +917,7 @@ mod test {
             pto_count: 0,
             congestion: CongestionController::new(transport_params),
             timers: TimerTable::new(),
+            conn_event_queue: VecDeque::new(),
         }
     }
 
@@ -1152,7 +958,7 @@ mod test {
         buf.freeze()
     }
 
-    fn get_packet(conn: &mut ConnectionInner, p_space: PacketSpace, mtu: usize) -> Packet {
+    fn get_packet(conn: &mut ConnectionCore, p_space: PacketSpace, mtu: usize) -> Packet {
         let Some(resp) = conn.get_packet(p_space, mtu) else {
             panic!("Could not get packet from {p_space:?} of mtu={mtu:?}");
         };
@@ -1160,7 +966,7 @@ mod test {
     }
 
     // TODO: Will have to update when the handshake updates
-    fn server_initial_state(conn: &mut ConnectionInner) {
+    fn server_initial_state(conn: &mut ConnectionCore) {
         let crypto_data = CryptoFrame::ClientHello;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
@@ -1188,7 +994,7 @@ mod test {
     }
 
     // TODO: Will have to update when the handshake updates
-    fn server_handshake_state(conn: &mut ConnectionInner) {
+    fn server_handshake_state(conn: &mut ConnectionCore) {
         let crypto_data = CryptoFrame::Finished;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
@@ -1215,7 +1021,7 @@ mod test {
         assert!(conn.handshake_is_done());
     }
 
-    fn open_bidir(conn: &mut ConnectionInner) -> StreamID {
+    fn open_bidir(conn: &mut ConnectionCore) -> StreamID {
         let id = StreamID::new(conn.stream_number, &conn.side, Dir::Bidir);
         conn.stream_number += 1;
         let recv = RecvStream::new(id.clone());
@@ -1227,7 +1033,7 @@ mod test {
         id
     }
 
-    fn send_stream_data_to(conn: &mut ConnectionInner, id: StreamID, data: Bytes, pn: &mut u8) {
+    fn send_stream_data_to(conn: &mut ConnectionCore, id: StreamID, data: Bytes, pn: &mut u8) {
         let frame = Frame::Stream(Stream {
             id,
             fin: false,
@@ -1248,7 +1054,7 @@ mod test {
         conn.handle_datagram(&packet);
     }
 
-    fn send_stream_data_from(conn: &mut ConnectionInner, id: StreamID, data: Bytes) -> Packet {
+    fn send_stream_data_from(conn: &mut ConnectionCore, id: StreamID, data: Bytes) -> Packet {
         let Some(send) = conn.send(&id) else {
             panic!("Could not find send stream with id={id:?}");
         };
@@ -1275,7 +1081,7 @@ mod test {
         packet
     }
 
-    fn send_ack_to(conn: &mut ConnectionInner, acker: &mut Acker, pn: &mut u8) {
+    fn send_ack_to(conn: &mut ConnectionCore, acker: &mut Acker, pn: &mut u8) {
         let frame = acker.get_ack().expect("Acker should not be cleared");
 
         let packet = create_packet(
@@ -1293,29 +1099,23 @@ mod test {
 
     #[test]
     fn test_handshake() {
-        let (sender, mut receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params);
+        let mut connection = create_connection(transport_params);
 
         server_initial_state(&mut connection);
         server_handshake_state(&mut connection);
 
-        {
-            // Checking if it notified the oneshot channel
-            let mut cx = Context::from_waker(noop_waker_ref());
-            assert!(Pin::new(&mut receiver).poll(&mut cx).is_ready());
-            assert!(connection.handshake_is_done());
-        }
-
         assert_eq!(connection.lifeycle, LifeCycle::Connected);
         assert_eq!(connection.state, PacketSpace::Data);
+
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::HandshakeDone);
     }
 
     #[test]
     fn test_maxackdelay_timer() {
-        let (sender, _receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params.clone());
+        let mut connection = create_connection(transport_params);
         let mut pn = 0u8;
         server_initial_state(&mut connection);
         server_handshake_state(&mut connection);
@@ -1345,9 +1145,8 @@ mod test {
 
     #[test]
     fn test_loss_timer() {
-        let (sender, _receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params.clone());
+        let mut connection = create_connection(transport_params.clone());
         let mut acker = Acker::new(transport_params);
         let mut pn = 0u8;
         server_initial_state(&mut connection);
@@ -1396,12 +1195,14 @@ mod test {
 
     #[test]
     fn test_send_data_from() {
-        let (sender, _receiver) = oneshot::channel();
         let transport_params = Arc::new(TransportParam::new());
-        let mut connection = create_connection(sender, transport_params.clone());
+        let mut connection = create_connection(transport_params.clone());
         let mut acker = Acker::new(transport_params);
         server_initial_state(&mut connection);
         server_handshake_state(&mut connection);
+
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::HandshakeDone);
 
         let id = open_bidir(&mut connection);
         // Sending one stream packets and acking
@@ -1417,5 +1218,31 @@ mod test {
             panic!("No stream frame after sending data");
         };
         assert_eq!(frame.data, sending_bytes);
+    }
+
+    #[test]
+    fn test_app_output() {
+        let transport_params = Arc::new(TransportParam::new());
+        let mut connection = create_connection(transport_params.clone());
+        let mut pn = 0u8;
+        server_initial_state(&mut connection);
+        server_handshake_state(&mut connection);
+
+        // HandshakeDone is queued after connecting
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::HandshakeDone);
+
+        // Sends stream frame with a stream id that is not in the connection
+        // Should queue NewStream event
+        let id = StreamID::new(1, &Side::Client, Dir::Bidir);
+        send_stream_data_to(
+            &mut connection,
+            id.clone(),
+            Bytes::from_static(&[1, 2, 3, 4, 5]),
+            &mut pn,
+        );
+
+        let app_event = connection.poll_conn_event().unwrap();
+        assert_eq!(app_event, ConnEvent::Stream(StreamEvent::NewStream { id }));
     }
 }

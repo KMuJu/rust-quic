@@ -3,7 +3,7 @@ use std::{fmt::Debug, io::Cursor};
 use bytes::{Buf, BufMut, Bytes, TryGetError};
 use thiserror::Error;
 
-use crate::{
+use crate::core::{
     connection::ConnectionID,
     crypto::CryptoFrame,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
@@ -39,9 +39,9 @@ pub enum Header {
     },
 }
 
-pub(super) struct Packet {
+pub struct Packet {
     pub header: Header,
-    pub frames: Vec<Frame>,
+    pub(crate) frames: Vec<Frame>,
 }
 
 impl Packet {
@@ -65,19 +65,11 @@ impl Packet {
     }
 
     pub fn dst_cid(&self) -> ConnectionID {
-        match self.header {
-            Header::Initial { dst_cid, .. } => dst_cid,
-            Header::Handshake { dst_cid, .. } => dst_cid,
-            Header::Short { dst_cid, .. } => dst_cid,
-        }
+        self.header.dst_cid()
     }
 
     pub fn src_cid(&self) -> Option<ConnectionID> {
-        match self.header {
-            Header::Initial { src_cid, .. } => Some(src_cid),
-            Header::Handshake { src_cid, .. } => Some(src_cid),
-            _ => None,
-        }
+        self.header.src_cid()
     }
 
     pub fn packet_number(&self) -> &PacketNumber {
@@ -89,7 +81,7 @@ impl Packet {
     }
 
     pub fn is_initial(&self) -> bool {
-        matches!(self.header, Header::Initial { .. })
+        self.header.is_initial()
     }
 
     pub fn is_client_hello(&self) -> bool {
@@ -115,7 +107,7 @@ impl Packet {
         self.frames.iter().any(|f| !matches!(f, Frame::Ack { .. }))
     }
 
-    pub(super) fn packet_space(&self) -> PacketSpace {
+    pub(crate) fn packet_space(&self) -> PacketSpace {
         match &self.header {
             Header::Initial { .. } => PacketSpace::Initial,
             Header::Handshake { .. } => PacketSpace::Handshake,
@@ -436,13 +428,32 @@ impl Header {
             Header::Short { .. } => PacketSpace::Data,
         }
     }
+    pub fn dst_cid(&self) -> ConnectionID {
+        match self {
+            Header::Initial { dst_cid, .. } => *dst_cid,
+            Header::Handshake { dst_cid, .. } => *dst_cid,
+            Header::Short { dst_cid, .. } => *dst_cid,
+        }
+    }
+
+    pub fn src_cid(&self) -> Option<ConnectionID> {
+        match self {
+            Header::Initial { src_cid, .. } => Some(*src_cid),
+            Header::Handshake { src_cid, .. } => Some(*src_cid),
+            _ => None,
+        }
+    }
+
+    pub fn is_initial(&self) -> bool {
+        matches!(self, Header::Initial { .. })
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::io::{self, Cursor};
 
-    use crate::{
+    use crate::core::{
         frame::Stream,
         stream::{Dir, StreamID},
     };

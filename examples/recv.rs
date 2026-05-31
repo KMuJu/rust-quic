@@ -1,6 +1,6 @@
 use std::io;
 
-use rust_quic::{connection::Connection, endpoint::Endpoint};
+use rust_quic::io::{connection::Connection, endpoint::Endpoint};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {

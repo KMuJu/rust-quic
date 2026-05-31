@@ -1,12 +1,12 @@
 use std::io;
 
-use rust_quic::endpoint::Endpoint;
+use rust_quic::io::endpoint::Endpoint;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let mut endpoint = Endpoint::new(([127, 0, 0, 1], 32030).into()).await?;
     let conn = endpoint.connect(([127, 0, 0, 1], 42069).into()).await;
-    println!("Created connection: {conn:?}");
+    println!("Created connection");
 
     for _ in 0..5 {
         let (mut recv, mut send) = conn.open_bidir();

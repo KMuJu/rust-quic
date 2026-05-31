@@ -1,18 +1,17 @@
 use std::{
-    future::poll_fn,
     pin::Pin,
-    sync::{Arc, Mutex},
-    task::Poll,
+    task::{Context, Poll},
 };
 
 use bytes::{Buf, BufMut, BytesMut};
-use thiserror::Error;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{
-    connection::ConnectionInner,
-    frame::{Frame, Stream},
-    frame_assembler::FrameAssembler,
+    core::{
+        frame::{Frame, Stream},
+        frame_assembler::FrameAssembler,
+    },
+    io::connection::ReadError,
 };
 
 #[derive(Debug, Clone)]
@@ -40,24 +39,8 @@ pub struct SendStream {
     state: SendState,
 }
 
-pub struct SendStreamHandle {
-    id: StreamID,
-    connection: Arc<Mutex<ConnectionInner>>,
-}
-
-pub struct RecvStreamHandle {
-    id: StreamID,
-    connection: Arc<Mutex<ConnectionInner>>,
-}
-
-impl SendStreamHandle {
-    pub fn new(id: StreamID, connection: Arc<Mutex<ConnectionInner>>) -> Self {
-        Self { id, connection }
-    }
-}
-
 impl RecvStream {
-    pub(super) fn new(id: StreamID) -> Self {
+    pub(crate) fn new(id: StreamID) -> Self {
         Self {
             id,
             assembler: FrameAssembler::new(),
@@ -96,6 +79,21 @@ impl RecvStream {
         }
     }
 
+    pub(super) fn poll_read(
+        &mut self,
+        buf: &mut ReadBuf,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<usize, ReadError>> {
+        let pinned = Pin::new(&mut self.assembler);
+        let before = buf.filled().len();
+        let res = pinned
+            .poll_read(cx, buf)
+            .map(|r| r.map(|_| buf.filled().len() - before))
+            .map_err(ReadError::IO);
+
+        res
+    }
+
     pub(super) fn is_reset(&self) -> bool {
         matches!(self.state, RecvState::ResetRead | RecvState::ResetRecvd)
     }
@@ -131,7 +129,7 @@ impl SendStream {
 
     pub(super) fn handle_frame(&mut self, frame: Frame) {}
 
-    pub(super) fn read_n(&mut self, buf: &mut BytesMut, size: usize) -> usize {
+    pub fn read_n(&mut self, buf: &mut BytesMut, size: usize) -> usize {
         let read = self.buffer.len().min(size);
         buf.put_slice(&self.buffer[..read]);
         self.offset += read as u64;
@@ -162,73 +160,12 @@ impl SendStream {
         matches!(self.state, SendState::ResetSent | SendState::ResetRecvd)
     }
 
-    #[cfg(test)]
+    pub(crate) fn can_send(&self) -> bool {
+        matches!(self.state, SendState::Ready | SendState::Send)
+    }
+
     pub(super) fn set_buffer(&mut self, buf: &[u8]) {
         self.buffer.put_slice(buf);
-    }
-}
-
-impl RecvStreamHandle {
-    pub fn new(id: StreamID, connection: Arc<Mutex<ConnectionInner>>) -> Self {
-        Self { id, connection }
-    }
-
-    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let mut buf = ReadBuf::new(buf);
-        poll_fn(|cx| {
-            let before = buf.filled().len();
-            let mut conn_inner = self.connection.lock().unwrap();
-            let Some(recv) = conn_inner.recv(&self.id) else {
-                return Poll::Ready(Err(ReadError::ClosedStream));
-            };
-            let pinned = Pin::new(&mut recv.assembler);
-            let res = pinned
-                .poll_read(cx, &mut buf)
-                .map(|r| r.map(|_| buf.filled().len() - before))
-                .map_err(ReadError::IO);
-
-            res
-        })
-        .await
-    }
-}
-
-impl SendStreamHandle {
-    pub fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
-        let mut inner = self.connection.lock().unwrap();
-
-        let Some(send) = inner.send(&self.id) else {
-            // Stream does not exist, this means that something is wrong
-            // TODO: Different error?
-            return Err(SendError::ClosedStream);
-        };
-
-        if !matches!(send.state, SendState::Ready | SendState::Send) {
-            return Err(SendError::WrongState);
-        }
-
-        send.buffer.put_slice(buf);
-        inner.mark_pending_on_send(self.id.clone());
-
-        Ok(buf.len())
-    }
-
-    pub fn finish(&mut self) -> Result<(), SendError> {
-        let mut inner = self.connection.lock().unwrap();
-
-        let Some(send) = inner.send(&self.id) else {
-            // Stream does not exist, this means that something is wrong
-            // TODO: Different error?
-            return Err(SendError::ClosedStream);
-        };
-
-        if !matches!(send.state, SendState::Send) {
-            return Err(SendError::WrongState);
-        }
-
-        send.state = SendState::DataSent;
-
-        Ok(())
     }
 }
 
@@ -272,20 +209,4 @@ impl StreamID {
             Side::Server
         }
     }
-}
-
-#[derive(Debug, Error)]
-pub enum ReadError {
-    #[error("Closed stream")]
-    ClosedStream,
-    #[error("IO: {0}")]
-    IO(#[from] std::io::Error),
-}
-
-#[derive(Debug, Error)]
-pub enum SendError {
-    #[error("Closed stream")]
-    ClosedStream,
-    #[error("Wrong state")]
-    WrongState,
 }
