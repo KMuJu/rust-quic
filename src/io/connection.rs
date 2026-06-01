@@ -300,7 +300,7 @@ impl ConnectionIO {
     }
 
     pub(crate) fn drive_transmit(&mut self) {
-        let mtu = 1200;
+        let mtu = 1500;
         for p_space in PacketSpace::iter() {
             if self.core.is_discarded(p_space) {
                 continue;

@@ -5,7 +5,7 @@ use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::ServerName;
 use thiserror::Error;
 
-use crate::core::transport_error::TransportError;
+use crate::core::{connection::ConnectionID, transport_error::TransportError};
 
 // TODO: This is just a mock, will later use rustls
 
@@ -36,9 +36,15 @@ impl CryptoFrame {
     }
 }
 
+enum CryptoConfig {
+    Client(Arc<rustls::ClientConfig>),
+    Server(Arc<rustls::ServerConfig>),
+}
+
 pub struct CryptoConn {
     conn: rustls::quic::Connection,
     next_secret: Option<rustls::quic::Secrets>,
+    conf: CryptoConfig,
 }
 
 #[derive(Error, Debug)]
@@ -49,11 +55,13 @@ pub enum CryptoError {
 
 impl CryptoConn {
     pub fn new_server(config: Arc<ServerConfig>, params: Vec<u8>) -> Result<Self, CryptoError> {
-        let conn = rustls::quic::ServerConnection::new(config, rustls::quic::Version::V1, params)?;
+        let conn =
+            rustls::quic::ServerConnection::new(config.clone(), rustls::quic::Version::V1, params)?;
 
         Ok(Self {
             conn: rustls::quic::Connection::Server(conn),
             next_secret: None,
+            conf: CryptoConfig::Server(config),
         })
     }
 
@@ -63,7 +71,7 @@ impl CryptoConn {
         params: Vec<u8>,
     ) -> Result<Self, CryptoError> {
         let conn = rustls::quic::ClientConnection::new(
-            config,
+            config.clone(),
             rustls::quic::Version::V1,
             ServerName::try_from(name).unwrap().to_owned(),
             params,
@@ -72,6 +80,7 @@ impl CryptoConn {
         Ok(Self {
             conn: rustls::quic::Connection::Client(conn),
             next_secret: None,
+            conf: CryptoConfig::Client(config),
         })
     }
 
@@ -96,4 +105,40 @@ impl CryptoConn {
 
         Some(keys)
     }
+
+    pub fn is_handshaking(&self) -> bool {
+        self.conn.is_handshaking()
+    }
+
+    pub fn initial_keys(&mut self, client_dst_connection_id: &[u8]) -> rustls::quic::Keys {
+        let provider = match &self.conf {
+            CryptoConfig::Client(client_config) => client_config.crypto_provider(),
+            CryptoConfig::Server(server_config) => server_config.crypto_provider(),
+        };
+
+        let suite = initial_suite_from_provider(provider)
+            .expect("Could not get TLS13_AES_128_GCM_SHA256 from provider");
+
+        let side = match &self.conf {
+            CryptoConfig::Client(_) => rustls::Side::Client,
+            CryptoConfig::Server(_) => rustls::Side::Server,
+        };
+
+        suite.keys(client_dst_connection_id, side, rustls::quic::Version::V1)
+    }
+}
+
+fn initial_suite_from_provider(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Option<rustls::quic::Suite> {
+    provider
+        .cipher_suites
+        .iter()
+        .find_map(|cs| match (cs.suite(), cs.tls13()) {
+            (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => {
+                Some(suite.quic_suite())
+            }
+            _ => None,
+        })
+        .flatten()
 }

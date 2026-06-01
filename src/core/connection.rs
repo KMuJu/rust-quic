@@ -7,9 +7,8 @@ use std::{
 };
 
 use bytes::{Buf, BytesMut};
-use futures::task::AtomicWaker;
 use rand::{Rng, rngs::StdRng};
-use tokio::{io::ReadBuf, sync::oneshot, time::Instant};
+use tokio::{io::ReadBuf, time::Instant};
 
 use crate::{
     core::{
@@ -132,7 +131,7 @@ impl ConnectionCore {
         crypto: CryptoConn,
         transport_params: SharedConfig,
     ) -> Self {
-        ConnectionCore {
+        let mut conn = ConnectionCore {
             id: cid,
             peer_cid,
             side,
@@ -157,7 +156,13 @@ impl ConnectionCore {
             timers: TimerTable::new(),
             conn_event_queue: VecDeque::new(),
             crypto,
-        }
+        };
+
+        let initial_keys = conn.crypto.initial_keys(&cid.buf[..cid.len as usize]);
+
+        conn.spaces[PacketSpace::Initial].set_keys(initial_keys);
+
+        conn
     }
 
     pub fn handle_datagram(&mut self, protected: ProtectedPacket) {
@@ -302,6 +307,8 @@ impl ConnectionCore {
                     // Does not have to handle initial events for client or if not in initial state
                     return;
                 }
+                let hs = self.crypto.read_handshake(&data[1..]);
+                println!("[CRYPTO] Initial: {}", hs.is_ok());
                 let mut data = Cursor::new(data);
                 let c_frame = CryptoFrame::decode(&mut data);
                 if matches!(c_frame, CryptoFrame::ClientHello) {
@@ -310,6 +317,9 @@ impl ConnectionCore {
                     let crypto_data = CryptoFrame::ServerHello;
                     let mut c_data = Vec::new();
                     crypto_data.encode(&mut c_data);
+                    let keys = self.crypto.write_crypto(&mut c_data);
+                    println!("[CRYPTO] server hello len: {}", c_data.len());
+                    println!("[CRYPTO] keys: {}", keys.is_some());
                     let crypto_frame = Frame::Crypto {
                         offset: VarInt(0),
                         data: c_data,
@@ -326,6 +336,8 @@ impl ConnectionCore {
                     return;
                 }
 
+                let hs = self.crypto.read_handshake(&data[1..]);
+                println!("[CRYPTO]({:?}) Handshake: {}", self.side, hs.is_ok());
                 match self.side {
                     Side::Client => {
                         let mut data = Cursor::new(data);
@@ -335,6 +347,9 @@ impl ConnectionCore {
                             let crypto_data = CryptoFrame::Finished;
                             let mut c_data = Vec::new();
                             crypto_data.encode(&mut c_data);
+                            let keys = self.crypto.write_crypto(&mut c_data);
+                            println!("[CRYPTO]({:?}) handshake len: {}", self.side, c_data.len());
+                            println!("[CRYPTO] keys: {}", keys.is_some());
                             let crypto_frame = Frame::Crypto {
                                 offset: VarInt(0),
                                 data: c_data,
@@ -355,6 +370,11 @@ impl ConnectionCore {
 
                             self.consume_connected();
                             self.lifeycle = LifeCycle::Connected;
+
+                            let mut c_data = Vec::new();
+                            let keys = self.crypto.write_crypto(&mut c_data);
+                            println!("[CRYPTO]({:?}) handshake len: {}", self.side, c_data.len());
+                            println!("[CRYPTO] keys: {}", keys.is_some());
                         }
                     }
                 }
@@ -823,10 +843,14 @@ impl ConnectionCore {
         let crypto_data = CryptoFrame::ClientHello;
         let mut c_data = Vec::new();
         crypto_data.encode(&mut c_data);
+        self.crypto.write_crypto(&mut c_data);
+        println!("[CRYPTO] init len: {}", c_data.len());
+
         let crypto_frame = Frame::Crypto {
             offset: VarInt(0),
             data: c_data,
         };
+
         self.spaces[PacketSpace::Initial]
             .pending_frames
             .push_back(crypto_frame);
