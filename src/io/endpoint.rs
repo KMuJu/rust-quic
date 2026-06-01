@@ -21,10 +21,11 @@ use tokio::{
 
 use crate::{
     core::{
-        connection::ConnectionID,
+        connection::{ConnectionCore, ConnectionID},
         endpoint::{EndpointCore, EndpointOutput},
         packet::PacketError,
         stream::Side,
+        transport_parameters::TransportParam,
     },
     io::{
         ConnectionToEndpoint, EndpointToConnection,
@@ -103,17 +104,15 @@ impl<S: Socket> Endpoint<S> {
     pub async fn connect(&mut self, addr: SocketAddr) -> Connection {
         let (conn, connected_recv) = {
             let mut endpoint = self.inner.lock().unwrap();
-            let (peer_cid, cid) = endpoint.core.initial_cids();
 
             let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
             let (connected_send, connected_recv) = oneshot::channel();
 
+            let (core, cid) = endpoint.core.new_client_conn();
             println!("Connecting to endpoint");
             let conn = Connection::new(
-                cid,
-                peer_cid,
                 addr,
-                Side::Client,
+                core,
                 connected_send,
                 incoming_rx,
                 endpoint.outgoing_tx.clone(),
@@ -148,12 +147,11 @@ impl<S: Socket> EndpointIO<S> {
     ) {
         let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let (connected_send, connected_recv) = oneshot::channel();
+        let core = self.core.new_server_conn(dst_cid, src_cid);
         // TODO: Always server??
         let connection = Connection::new(
-            dst_cid,
-            src_cid,
             addr,
-            Side::Server,
+            core,
             connected_send,
             incoming_rx,
             self.outgoing_tx.clone(),

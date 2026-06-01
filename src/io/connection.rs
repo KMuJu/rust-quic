@@ -67,10 +67,8 @@ pub struct Connection {
 
 impl Connection {
     pub(super) fn new(
-        cid: ConnectionID,
-        peer_cid: ConnectionID,
         addr: SocketAddr,
-        side: Side,
+        core: ConnectionCore,
         connected: oneshot::Sender<()>,
         incoming_data: UnboundedReceiver<EndpointToConnection>,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
@@ -81,14 +79,7 @@ impl Connection {
             handshake_done: Notify::new(),
         };
         let state = ConnectionState {
-            state: Mutex::new(ConnectionIO::new(
-                cid,
-                peer_cid,
-                addr,
-                side,
-                outgoing_data,
-                connected,
-            )),
+            state: Mutex::new(ConnectionIO::new(addr, core, outgoing_data, connected)),
             shared,
         };
         let io = ConnectionRef(Arc::new(state));
@@ -249,16 +240,12 @@ pub struct ConnectionIO {
 
 impl ConnectionIO {
     pub(crate) fn new(
-        cid: ConnectionID,
-        peer_cid: ConnectionID,
         addr: SocketAddr,
-        side: Side,
+        core: ConnectionCore,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
         // TODO: Remove
         connected: oneshot::Sender<()>,
     ) -> Self {
-        let transport_params = Arc::new(TransportParam::new());
-        let core = ConnectionCore::new(cid, peer_cid, side, transport_params);
         Self {
             core,
             addr,

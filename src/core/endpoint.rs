@@ -1,9 +1,14 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use rand::rngs::StdRng;
 
-use crate::core::{connection::ConnectionID, packet::ProtectedPacket};
+use crate::core::{
+    connection::{ConnectionCore, ConnectionID},
+    packet::ProtectedPacket,
+    stream::Side,
+    transport_parameters::TransportParam,
+};
 
 pub struct EndpointCore {
     rng: StdRng,
@@ -85,6 +90,25 @@ impl EndpointCore {
             ConnectionID::new(self.cid_len, &mut self.rng),
             ConnectionID::new(self.cid_len, &mut self.rng),
         )
+    }
+
+    pub fn new_client_conn(&mut self) -> (ConnectionCore, ConnectionID) {
+        let transport_params = Arc::new(TransportParam::new());
+        let (cid, peer_cid) = self.initial_cids();
+
+        let core = ConnectionCore::new(cid, peer_cid, Side::Client, transport_params);
+
+        (core, cid)
+    }
+
+    pub fn new_server_conn(
+        &mut self,
+        dst_cid: ConnectionID,
+        src_cid: ConnectionID,
+    ) -> ConnectionCore {
+        let transport_params = Arc::new(TransportParam::new());
+
+        ConnectionCore::new(dst_cid, src_cid, Side::Server, transport_params)
     }
 }
 
