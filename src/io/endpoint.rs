@@ -21,6 +21,7 @@ use tokio::{
 
 use crate::{
     core::{
+        config::{ClientConfig, ServerConfig},
         connection::{ConnectionCore, ConnectionID},
         endpoint::{EndpointCore, EndpointOutput},
         packet::PacketError,
@@ -57,18 +58,46 @@ pub struct Endpoint<S: Socket> {
 }
 
 impl Endpoint<UdpSocket> {
-    pub async fn new(addr: SocketAddr) -> io::Result<Self> {
-        Ok(Self::new_generic(UdpSocket::bind(addr).await?))
+    pub async fn new(
+        addr: SocketAddr,
+        client_config: Option<ClientConfig>,
+        server_config: Option<ServerConfig>,
+    ) -> io::Result<Self> {
+        Ok(Self::new_generic(
+            UdpSocket::bind(addr).await?,
+            client_config,
+            server_config,
+        ))
+    }
+
+    pub async fn client(addr: SocketAddr, client_config: ClientConfig) -> io::Result<Self> {
+        Ok(Self::new_generic(
+            UdpSocket::bind(addr).await?,
+            Some(client_config),
+            None,
+        ))
+    }
+
+    pub async fn server(addr: SocketAddr, server_config: ServerConfig) -> io::Result<Self> {
+        Ok(Self::new_generic(
+            UdpSocket::bind(addr).await?,
+            None,
+            Some(server_config),
+        ))
     }
 }
 
 impl<S: Socket> Endpoint<S> {
-    pub fn new_generic(socket: S) -> Self {
+    pub fn new_generic(
+        socket: S,
+        client_config: Option<ClientConfig>,
+        server_config: Option<ServerConfig>,
+    ) -> Self {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = EndpointIO {
             socket,
-            core: EndpointCore::new(),
+            core: EndpointCore::new(client_config, server_config),
             connection_handles: HashMap::new(),
             connections: HashMap::new(),
             rng: rand::make_rng(),
@@ -101,14 +130,14 @@ impl<S: Socket> Endpoint<S> {
         Some(incoming.await)
     }
 
-    pub async fn connect(&mut self, addr: SocketAddr) -> Connection {
+    pub async fn connect(&mut self, name: &str, addr: SocketAddr) -> Connection {
         let (conn, connected_recv) = {
             let mut endpoint = self.inner.lock().unwrap();
 
             let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
             let (connected_send, connected_recv) = oneshot::channel();
 
-            let (core, cid) = endpoint.core.new_client_conn();
+            let (core, cid) = endpoint.core.new_client_conn(name);
             println!("Connecting to endpoint");
             let conn = Connection::new(
                 addr,

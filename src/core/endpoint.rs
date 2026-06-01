@@ -4,7 +4,9 @@ use bytes::Bytes;
 use rand::rngs::StdRng;
 
 use crate::core::{
+    config::{ClientConfig, ServerConfig},
     connection::{ConnectionCore, ConnectionID},
+    crypto::CryptoConn,
     packet::ProtectedPacket,
     stream::Side,
     transport_parameters::TransportParam,
@@ -14,6 +16,8 @@ pub struct EndpointCore {
     rng: StdRng,
     cid_len: u8,
     connections: HashMap<ConnectionID, SocketAddr>,
+    client_config: Option<ClientConfig>,
+    server_config: Option<ServerConfig>,
 }
 
 pub enum EndpointOutput {
@@ -33,11 +37,13 @@ pub enum EndpointOutput {
 }
 
 impl EndpointCore {
-    pub fn new() -> Self {
+    pub fn new(client_config: Option<ClientConfig>, server_config: Option<ServerConfig>) -> Self {
         Self {
             rng: rand::make_rng(),
             cid_len: 4,
             connections: HashMap::new(),
+            client_config,
+            server_config,
         }
     }
 
@@ -85,18 +91,25 @@ impl EndpointCore {
         self.connections.insert(local_cid, remote);
     }
 
-    pub fn initial_cids(&mut self) -> (ConnectionID, ConnectionID) {
+    fn initial_cids(&mut self) -> (ConnectionID, ConnectionID) {
         (
             ConnectionID::new(self.cid_len, &mut self.rng),
             ConnectionID::new(self.cid_len, &mut self.rng),
         )
     }
 
-    pub fn new_client_conn(&mut self) -> (ConnectionCore, ConnectionID) {
+    pub fn new_client_conn(&mut self, name: &str) -> (ConnectionCore, ConnectionID) {
         let transport_params = Arc::new(TransportParam::new());
         let (cid, peer_cid) = self.initial_cids();
 
-        let core = ConnectionCore::new(cid, peer_cid, Side::Client, transport_params);
+        let crypto = CryptoConn::new_client(
+            self.client_config.as_ref().unwrap().crypto.clone(),
+            name,
+            vec![],
+        )
+        .unwrap();
+
+        let core = ConnectionCore::new(cid, peer_cid, Side::Client, crypto, transport_params);
 
         (core, cid)
     }
@@ -108,12 +121,10 @@ impl EndpointCore {
     ) -> ConnectionCore {
         let transport_params = Arc::new(TransportParam::new());
 
-        ConnectionCore::new(dst_cid, src_cid, Side::Server, transport_params)
-    }
-}
+        let crypto =
+            CryptoConn::new_server(self.server_config.as_ref().unwrap().crypto.clone(), vec![])
+                .unwrap();
 
-impl Default for EndpointCore {
-    fn default() -> Self {
-        Self::new()
+        ConnectionCore::new(dst_cid, src_cid, Side::Server, crypto, transport_params)
     }
 }
