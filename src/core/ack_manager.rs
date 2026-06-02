@@ -1,6 +1,5 @@
-use std::{collections::BTreeMap, ops::RangeInclusive, task::Waker, time::Duration};
+use std::{collections::BTreeMap, ops::RangeInclusive, time::Duration};
 
-use futures::task::AtomicWaker;
 use range_set::RangeSet;
 use tokio::time::Instant;
 

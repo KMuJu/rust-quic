@@ -8,7 +8,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use rand::rngs::StdRng;
 use thiserror::Error;
 use tokio::{
     io::ReadBuf,
@@ -22,11 +21,9 @@ use tokio::{
 use crate::{
     core::{
         config::{ClientConfig, ServerConfig},
-        connection::{ConnectionCore, ConnectionID},
+        connection::ConnectionID,
         endpoint::{EndpointCore, EndpointOutput},
         packet::PacketError,
-        stream::Side,
-        transport_parameters::TransportParam,
     },
     io::{
         ConnectionToEndpoint, EndpointToConnection,
@@ -42,10 +39,8 @@ pub struct EndpointIO<S: Socket> {
     // connectionid and internal handle
     connection_handles: HashMap<ConnectionID, ConnectionHandle>,
     pub(super) connections: HashMap<ConnectionID, Connection>,
-    rng: StdRng,
     incoming_tx: UnboundedSender<IncomingInner>,
     stashed_packet: VecDeque<(Bytes, SocketAddr)>,
-    cid_len: u8,
     outgoing_rx: UnboundedReceiver<ConnectionToEndpoint>, // Receives data from connections
     outgoing_tx: UnboundedSender<ConnectionToEndpoint>,   // To be cloned into connections
 }
@@ -100,10 +95,8 @@ impl<S: Socket> Endpoint<S> {
             core: EndpointCore::new(client_config, server_config),
             connection_handles: HashMap::new(),
             connections: HashMap::new(),
-            rng: rand::make_rng(),
             incoming_tx,
             stashed_packet: VecDeque::new(),
-            cid_len: 4,
             outgoing_rx,
             outgoing_tx,
         };

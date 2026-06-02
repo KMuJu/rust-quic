@@ -5,7 +5,7 @@ use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::ServerName;
 use thiserror::Error;
 
-use crate::core::{connection::ConnectionID, transport_error::TransportError};
+use crate::core::transport_error::TransportError;
 
 // TODO: This is just a mock, will later use rustls
 
@@ -141,4 +141,17 @@ fn initial_suite_from_provider(
             _ => None,
         })
         .flatten()
+}
+
+pub fn handshake_type(buf: &[u8]) -> Option<&'static str> {
+    match buf.first()? {
+        1 => Some("ClientHello"),
+        2 => Some("ServerHello"),
+        8 => Some("EncryptedExtensions"),
+        11 => Some("Certificate"),
+        13 => Some("CertificateRequest"),
+        15 => Some("CertificateVerify"),
+        20 => Some("Finished"),
+        _ => Some("Unknown"),
+    }
 }

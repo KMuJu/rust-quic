@@ -25,8 +25,7 @@ use crate::{
     core::{
         connection::{ConnEvent, ConnectionCore, ConnectionID, StreamEvent},
         space::PacketSpace,
-        stream::{Dir, Side, StreamID},
-        transport_parameters::TransportParam,
+        stream::{Dir, StreamID},
     },
     io::{ConnectionToEndpoint, EndpointToConnection, endpoint::EndpointRef},
     socket::Socket,

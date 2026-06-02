@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
-    io::Cursor,
     task::{Context, Poll},
     time::Duration,
 };
@@ -13,7 +12,7 @@ use tokio::{io::ReadBuf, time::Instant};
 use crate::{
     core::{
         congestion::CongestionController,
-        crypto::{CryptoConn, CryptoFrame},
+        crypto::{CryptoConn, handshake_type},
         encoding::VarInt,
         frame::{Ack, Frame, Stream},
         packet::{Header, Packet, PacketNumber, ProtectedPacket},
@@ -54,9 +53,7 @@ pub struct ConnectionCore {
     // Peer's cid
     peer_cid: ConnectionID,
     side: Side,
-    lifeycle: LifeCycle,
-
-    state: PacketSpace,
+    lifecycle: LifeCycle,
 
     recv: HashMap<StreamID, RecvStream>,
     send: HashMap<StreamID, SendStream>,
@@ -71,9 +68,7 @@ pub struct ConnectionCore {
 
     stream_number: usize,
 
-    // initial_space: Space,
-    // handshake_space: Space,
-    // data_space: Space,
+    highest_space_with_keys: PacketSpace,
     spaces: [Space; 3],
 
     transport_params: SharedConfig,
@@ -135,8 +130,7 @@ impl ConnectionCore {
             id: cid,
             peer_cid,
             side,
-            lifeycle: LifeCycle::Handshake,
-            state: PacketSpace::Initial,
+            lifecycle: LifeCycle::Handshake,
             recv: HashMap::new(),
             send: HashMap::new(),
             bidir_acceptable: VecDeque::new(),
@@ -144,6 +138,7 @@ impl ConnectionCore {
             pending_recv: VecDeque::new(),
             pending_send: VecDeque::new(),
             stream_number: 0,
+            highest_space_with_keys: PacketSpace::Initial,
             spaces: [
                 Space::new(PacketSpace::Initial, transport_params.clone()),
                 Space::new(PacketSpace::Handshake, transport_params.clone()),
@@ -176,7 +171,7 @@ impl ConnectionCore {
         let p_space = packet.packet_space();
         println!(
             "{:?}({:?})[{:?}]: Got {:?}",
-            self.id, self.state, self.side, packet
+            self.id, self.lifecycle, self.side, packet
         );
         if !self.spaces[p_space]
             .acker
@@ -190,7 +185,7 @@ impl ConnectionCore {
             return;
         }
 
-        match self.lifeycle {
+        match self.lifecycle {
             LifeCycle::Handshake => {}
             LifeCycle::Connected => match packet.packet_space() {
                 PacketSpace::Data => return self.handle_data_packet(packet),
@@ -202,9 +197,18 @@ impl ConnectionCore {
 
         match &packet.header {
             Header::Initial { .. } | Header::Handshake { .. } => {
-                if !self.spaces[packet.packet_space()].is_discarded() {
-                    self.handle_handshake_packet(packet);
+                if self.spaces[packet.packet_space()].is_discarded() {
+                    return;
                 }
+
+                self.handle_handshake_packet(packet);
+                if self.crypto.is_handshaking() {
+                    return;
+                }
+
+                self.lifecycle = LifeCycle::Connected;
+                self.consume_connected();
+                self.spaces[PacketSpace::Handshake].discard();
             }
             Header::Short { .. } => self.handle_data_packet(packet),
         }
@@ -286,7 +290,7 @@ impl ConnectionCore {
             match frame {
                 Frame::Padding | Frame::Ping => {}
                 Frame::Ack(ack) => self.on_ack_received(p_space, ack),
-                Frame::Crypto { offset, data } => self.handle_crypto(p_space, offset, data),
+                Frame::Crypto { offset, data } => self.read_crypto(p_space, offset, data),
                 Frame::ConnectionCloseQuic {
                     error_code,
                     frame_type,
@@ -297,89 +301,43 @@ impl ConnectionCore {
                 }
             }
         }
+
+        self.write_crypto();
     }
 
-    fn handle_crypto(&mut self, p_space: PacketSpace, offset: VarInt, data: Vec<u8>) {
-        match p_space {
-            PacketSpace::Initial => {
-                if matches!(self.side, Side::Client) || !matches!(self.state, PacketSpace::Initial)
-                {
-                    // Does not have to handle initial events for client or if not in initial state
-                    return;
-                }
-                let hs = self.crypto.read_handshake(&data[1..]);
-                println!("[CRYPTO] Initial: {}", hs.is_ok());
-                let mut data = Cursor::new(data);
-                let c_frame = CryptoFrame::decode(&mut data);
-                if matches!(c_frame, CryptoFrame::ClientHello) {
-                    self.state = PacketSpace::Handshake;
+    // TODO: Actually use a crypto stream from an assembler
+    fn read_crypto(&mut self, p_space: PacketSpace, offset: VarInt, data: Vec<u8>) {
+        println!("[CRYPTO] got crypto frame: {:?}", handshake_type(&data));
+        self.crypto.read_handshake(&data).unwrap();
+    }
 
-                    let crypto_data = CryptoFrame::ServerHello;
-                    let mut c_data = Vec::new();
-                    crypto_data.encode(&mut c_data);
-                    let keys = self.crypto.write_crypto(&mut c_data);
-                    println!("[CRYPTO] server hello len: {}", c_data.len());
-                    println!("[CRYPTO] keys: {}", keys.is_some());
-                    let crypto_frame = Frame::Crypto {
-                        offset: VarInt(0),
-                        data: c_data,
-                    };
+    fn write_crypto(&mut self) {
+        loop {
+            let p_space = self.highest_space_with_keys;
+            let mut crypto_data = Vec::new();
+            let keys = self.crypto.write_crypto(&mut crypto_data);
+            if let Some(keys) = keys {
+                debug_assert!(
+                    p_space != PacketSpace::Data,
+                    "Can't upgrade crypto during Data packet space"
+                );
+                self.upgrade_crypto(p_space, keys);
+            }
 
-                    self.spaces[PacketSpace::Handshake].push_back_frame(crypto_frame);
-
-                    self.spaces[PacketSpace::Initial].discard();
+            if crypto_data.is_empty() {
+                if p_space == self.highest_space_with_keys {
+                    break;
+                } else {
+                    continue;
                 }
             }
-            PacketSpace::Handshake => {
-                if !matches!(self.state, PacketSpace::Handshake) {
-                    // Does not have to handle handshake events if not in handshake state
-                    return;
-                }
 
-                let hs = self.crypto.read_handshake(&data[1..]);
-                println!("[CRYPTO]({:?}) Handshake: {}", self.side, hs.is_ok());
-                match self.side {
-                    Side::Client => {
-                        let mut data = Cursor::new(data);
-                        let c_frame = CryptoFrame::decode(&mut data);
-                        if matches!(c_frame, CryptoFrame::ServerHello) {
-                            self.state = PacketSpace::Data;
-                            let crypto_data = CryptoFrame::Finished;
-                            let mut c_data = Vec::new();
-                            crypto_data.encode(&mut c_data);
-                            let keys = self.crypto.write_crypto(&mut c_data);
-                            println!("[CRYPTO]({:?}) handshake len: {}", self.side, c_data.len());
-                            println!("[CRYPTO] keys: {}", keys.is_some());
-                            let crypto_frame = Frame::Crypto {
-                                offset: VarInt(0),
-                                data: c_data,
-                            };
-                            self.spaces[PacketSpace::Handshake].push_back_frame(crypto_frame);
-                            self.spaces[PacketSpace::Initial].discard();
-                            self.lifeycle = LifeCycle::Connected;
-                        }
-                    }
-                    Side::Server => {
-                        let mut data = Cursor::new(data);
-                        let c_frame = CryptoFrame::decode(&mut data);
-                        if matches!(c_frame, CryptoFrame::Finished) {
-                            self.state = PacketSpace::Data;
-                            let frame = Frame::HandshakeDone;
-                            self.spaces[PacketSpace::Data].push_back_frame(frame);
-                            self.spaces[PacketSpace::Handshake].discard();
+            let crypto_frame = Frame::Crypto {
+                offset: VarInt(0),
+                data: crypto_data,
+            };
 
-                            self.consume_connected();
-                            self.lifeycle = LifeCycle::Connected;
-
-                            let mut c_data = Vec::new();
-                            let keys = self.crypto.write_crypto(&mut c_data);
-                            println!("[CRYPTO]({:?}) handshake len: {}", self.side, c_data.len());
-                            println!("[CRYPTO] keys: {}", keys.is_some());
-                        }
-                    }
-                }
-            }
-            PacketSpace::Data => {}
+            self.spaces[p_space].push_back_frame(crypto_frame);
         }
     }
 
@@ -453,7 +411,7 @@ impl ConnectionCore {
 
     fn consume_connected(&mut self) {
         self.conn_event_queue.push_back(ConnEvent::HandshakeDone);
-        self.lifeycle = LifeCycle::Connected;
+        self.lifecycle = LifeCycle::Connected;
         self.pto_count = 0;
     }
 
@@ -497,23 +455,24 @@ impl ConnectionCore {
         self.handshake_is_done()
     }
 
-    pub(crate) fn spaces(&self) -> impl Iterator<Item = &Space> {
-        self.spaces.iter()
-    }
-
     pub(crate) fn next_ack_deadline(&self) -> Option<Instant> {
-        self.spaces().filter_map(|s| s.acker.get_deadline()).min()
+        self.spaces
+            .iter()
+            .filter_map(|s| s.acker.get_deadline())
+            .min()
     }
 
     /// Follows RFC 9002 A.8
     pub(crate) fn get_loss_time_and_space(&self) -> Option<(Instant, PacketSpace)> {
-        self.spaces()
+        self.spaces
+            .iter()
             .filter_map(|s| Some((s.acker.get_loss_time()?, s.space)))
             .min_by_key(|(time, _)| *time)
     }
 
     fn any_ack_eliciting_packet_in_flight(&self) -> bool {
-        self.spaces()
+        self.spaces
+            .iter()
             .any(|s| s.acker.has_ack_eliciting_packet_in_flight())
     }
 
@@ -822,7 +781,7 @@ impl ConnectionCore {
     /// Handshake is done if the lifecycle is past the handshake stage
     /// Should not be able to get back to handshake state afterwards
     fn handshake_is_done(&self) -> bool {
-        self.lifeycle > LifeCycle::Handshake
+        self.lifecycle > LifeCycle::Handshake
     }
 
     pub(crate) fn new_bidir(&mut self) -> StreamID {
@@ -840,9 +799,7 @@ impl ConnectionCore {
     }
 
     pub(crate) fn init(&mut self) {
-        let crypto_data = CryptoFrame::ClientHello;
         let mut c_data = Vec::new();
-        crypto_data.encode(&mut c_data);
         self.crypto.write_crypto(&mut c_data);
         println!("[CRYPTO] init len: {}", c_data.len());
 
@@ -854,7 +811,6 @@ impl ConnectionCore {
         self.spaces[PacketSpace::Initial]
             .pending_frames
             .push_back(crypto_frame);
-        self.state = PacketSpace::Handshake;
     }
 
     pub(crate) fn poll_read(
@@ -902,6 +858,21 @@ impl ConnectionCore {
 
     pub(crate) fn poll_conn_event(&mut self) -> Option<ConnEvent> {
         self.conn_event_queue.pop_front()
+    }
+
+    fn upgrade_crypto(&mut self, p_space: PacketSpace, keys: rustls::quic::Keys) {
+        self.spaces[p_space].set_keys(keys);
+        self.highest_space_with_keys = p_space;
+
+        // Can discard all spaces earlier than the latest crypto
+        // I think
+        for space in self.spaces.iter_mut() {
+            if space.space < p_space {
+                space.discard();
+            } else {
+                break;
+            }
+        }
     }
 }
 

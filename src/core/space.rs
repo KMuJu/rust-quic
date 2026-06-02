@@ -5,7 +5,7 @@ use std::{
 
 use crate::core::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PacketSpace {
     Initial,
     Handshake,
