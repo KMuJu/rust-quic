@@ -196,7 +196,15 @@ impl ConnectionCore {
         };
 
         match &packet.header {
-            Header::Initial { .. } | Header::Handshake { .. } => {
+            Header::Initial { .. } => {
+                if self.spaces[packet.packet_space()].is_discarded() {
+                    return;
+                }
+
+                self.handle_handshake_packet(packet);
+            }
+            Header::Handshake { .. } => {
+                println!("[CRYPTO] GOT HANDSHAKE PACKET");
                 if self.spaces[packet.packet_space()].is_discarded() {
                     return;
                 }
@@ -208,7 +216,14 @@ impl ConnectionCore {
 
                 self.lifecycle = LifeCycle::Connected;
                 self.consume_connected();
-                self.spaces[PacketSpace::Handshake].discard();
+
+                match self.side {
+                    Side::Client => {}
+                    Side::Server => {
+                        self.spaces[PacketSpace::Data].push_back_frame(Frame::HandshakeDone);
+                        self.spaces[PacketSpace::Handshake].discard();
+                    }
+                }
             }
             Header::Short { .. } => self.handle_data_packet(packet),
         }
@@ -321,7 +336,11 @@ impl ConnectionCore {
                     p_space != PacketSpace::Data,
                     "Can't upgrade crypto during Data packet space"
                 );
-                self.upgrade_crypto(p_space, keys);
+                match p_space {
+                    PacketSpace::Initial => self.upgrade_crypto(PacketSpace::Handshake, keys),
+                    PacketSpace::Handshake => self.upgrade_crypto(PacketSpace::Data, keys),
+                    PacketSpace::Data => unreachable!(),
+                }
             }
 
             if crypto_data.is_empty() {
@@ -804,18 +823,7 @@ impl ConnectionCore {
     }
 
     pub(crate) fn init(&mut self) {
-        let mut c_data = Vec::new();
-        self.crypto.write_crypto(&mut c_data);
-        println!("[CRYPTO] init len: {}", c_data.len());
-
-        let crypto_frame = Frame::Crypto {
-            offset: VarInt(0),
-            data: c_data,
-        };
-
-        self.spaces[PacketSpace::Initial]
-            .pending_frames
-            .push_back(crypto_frame);
+        self.write_crypto();
     }
 
     pub(crate) fn poll_read(
@@ -868,15 +876,5 @@ impl ConnectionCore {
     fn upgrade_crypto(&mut self, p_space: PacketSpace, keys: rustls::quic::Keys) {
         self.spaces[p_space].set_keys(keys);
         self.highest_space_with_keys = p_space;
-
-        // Can discard all spaces earlier than the latest crypto
-        // I think
-        for space in self.spaces.iter_mut() {
-            if space.space < p_space {
-                space.discard();
-            } else {
-                break;
-            }
-        }
     }
 }
