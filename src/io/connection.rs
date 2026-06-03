@@ -95,8 +95,8 @@ impl Connection {
         loop {
             if let Some(id) = self.inner.state.lock().unwrap().core.poll_accept_bidir() {
                 return (
-                    SendStreamHandle::new(id.clone(), self.inner.clone()),
-                    RecvStreamHandle::new(id.clone(), self.inner.clone()),
+                    SendStreamHandle::new(id, self.inner.clone()),
+                    RecvStreamHandle::new(id, self.inner.clone()),
                 );
             }
 
@@ -107,7 +107,7 @@ impl Connection {
     pub async fn accept_uni(&self) -> RecvStreamHandle {
         loop {
             if let Some(id) = self.inner.state.lock().unwrap().core.poll_accept_unidir() {
-                return RecvStreamHandle::new(id.clone(), self.inner.clone());
+                return RecvStreamHandle::new(id, self.inner.clone());
             }
 
             self.inner.shared.new_unidir_stream.notified().await;
@@ -118,8 +118,8 @@ impl Connection {
         let mut inner = self.inner.state.lock().unwrap();
         let id = inner.new_bidir();
 
-        let recv_handle = RecvStreamHandle::new(id.clone(), self.inner.clone());
-        let send_handle = SendStreamHandle::new(id.clone(), self.inner.clone());
+        let recv_handle = RecvStreamHandle::new(id, self.inner.clone());
+        let send_handle = SendStreamHandle::new(id, self.inner.clone());
 
         (recv_handle, send_handle)
     }
@@ -224,7 +224,7 @@ impl SendStreamHandle {
 
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         let mut inner = self.connection.state.lock().unwrap();
-        inner.write(buf, self.id.clone())
+        inner.write(buf, self.id)
     }
 }
 
@@ -332,10 +332,6 @@ impl ConnectionIO {
                     is_ack_eliciting,
                     size,
                 );
-
-                if is_in_flight {
-                    self.core.set_loss_timer();
-                }
             }
         }
     }

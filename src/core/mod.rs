@@ -14,3 +14,6 @@ pub mod stream;
 pub mod timers;
 pub mod transport_error;
 pub mod transport_parameters;
+
+#[cfg(test)]
+mod tests;

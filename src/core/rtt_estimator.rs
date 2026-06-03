@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::{fmt::Debug, time::Duration};
 
 use tokio::time::Instant;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct RttEstimator {
     pub(super) smoothed: Duration,
     pub(super) variance: Duration,

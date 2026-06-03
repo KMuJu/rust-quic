@@ -200,7 +200,7 @@ impl Acker {
     }
 
     /// Roughly follows RFC 9002 A.10
-    pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator) -> Vec<SentPacket> {
+    pub(super) fn get_lost_frames(&mut self, rtt: &RttEstimator, now: Instant) -> Vec<SentPacket> {
         let mut lost = Vec::new();
         if self.cleared {
             return lost;
@@ -213,7 +213,7 @@ impl Acker {
         );
         let loss_delay = rtt.latest_rtt.max(rtt.smoothed) * 9 / 8;
         let loss_delay = loss_delay.max(Duration::from_millis(1));
-        let loss_send_time = Instant::now() - loss_delay;
+        let loss_send_time = now - loss_delay;
 
         let mut lost_pns = Vec::new();
         for (pn, s) in self.sent.iter() {
@@ -389,7 +389,7 @@ mod tests {
         acker.acked(6);
 
         let lost: Vec<_> = acker
-            .get_lost_frames(&RttEstimator::new())
+            .get_lost_frames(&RttEstimator::new(), Instant::now())
             .iter()
             .flat_map(|lost| lost.frames.clone())
             .collect();
