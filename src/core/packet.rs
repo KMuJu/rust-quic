@@ -449,6 +449,179 @@ impl Header {
     }
 }
 
+#[derive(Debug)]
+pub enum ProtectedHeader {
+    Initial {
+        version: u32,
+        dst_cid: ConnectionID,
+        src_cid: ConnectionID,
+        token: Option<Token>,
+        length: VarInt,
+    },
+    Handshake {
+        version: u32,
+        dst_cid: ConnectionID,
+        src_cid: ConnectionID,
+        length: VarInt,
+    },
+    Short {
+        spin: bool,
+        key_phase: bool,
+        dst_cid: ConnectionID,
+    },
+}
+
+pub struct ProtectedPacket {
+    header: ProtectedHeader,
+    /// The rest of the packet, can be multiple packets
+    bytes: Bytes,
+    cid_len: u8,
+}
+
+impl ProtectedHeader {
+    pub fn decode<B: Buf>(buf: &mut B, cid_len: u8) -> Result<Self, PacketError> {
+        let first = buf.try_get_u8()?;
+        match (first >> 7, first >> 6 & 1, first >> 5 & 1, first >> 4 & 1) {
+            (1, 1, 0, 0) => {
+                // TODO: Handle panics
+                let packet_number_len = first & 0x3;
+                let version = buf.try_get_u32()?;
+                let dst_cid_len = buf.try_get_u8()?;
+                let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
+                let src_cid_len = buf.try_get_u8()?;
+                let src_cid = ConnectionID::from_buf(buf, src_cid_len);
+                if dst_cid_len > 20 || src_cid_len > 20 {
+                    return Err(PacketError::InvalidHeader);
+                }
+                // TODO: Fix token
+                let token_len = variable_length_decode(buf)?;
+                let token = if token_len > 0 {
+                    let mut v = vec![0u8; token_len as usize];
+                    buf.copy_to_slice(&mut v);
+                    Some(Token(v))
+                } else {
+                    None
+                };
+                let length = VarInt::decode(buf)?;
+                Ok(Self::Initial {
+                    version,
+                    dst_cid,
+                    src_cid,
+                    token,
+                    length,
+                })
+            }
+            (1, 1, 0, 1) => {
+                // TODO: 0-RTT
+                todo!()
+            }
+            (1, 1, 1, 0) => {
+                // TODO: Handshake
+                // TODO: Handle panics
+                let packet_number_len = first & 0x3;
+                let version = buf.try_get_u32()?;
+                let dst_cid_len = buf.try_get_u8()?;
+                let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
+                let src_cid_len = buf.try_get_u8()?;
+                let src_cid = ConnectionID::from_buf(buf, src_cid_len);
+                if dst_cid_len > 20 || src_cid_len > 20 {
+                    return Err(PacketError::InvalidHeader);
+                }
+                let length = VarInt::decode(buf)?;
+                Ok(Self::Handshake {
+                    version,
+                    dst_cid,
+                    src_cid,
+                    length,
+                })
+            }
+            (1, 1, 1, 1) => {
+                // TODO: Retry
+                todo!()
+            }
+            (0, 1, _, _) => {
+                if buf.remaining() < 1 + cid_len as usize {
+                    println!(
+                        "Not enough buffer for first byte and destination connection id: {}",
+                        buf.remaining()
+                    );
+                    return Err(PacketError::InvalidHeader);
+                }
+                let dst_cid = ConnectionID::from_buf(buf, cid_len);
+
+                Ok(Self::Short {
+                    spin: first & 0x20 == 0x20,
+                    key_phase: first & 0x04 == 0x04,
+                    dst_cid,
+                })
+            }
+            _ => {
+                println!("Invalid first four bits");
+                Err(PacketError::InvalidHeader)
+            }
+        }
+    }
+
+    pub fn dst_cid(&self) -> ConnectionID {
+        match self {
+            Self::Initial { dst_cid, .. } => *dst_cid,
+            Self::Handshake { dst_cid, .. } => *dst_cid,
+            Self::Short { dst_cid, .. } => *dst_cid,
+        }
+    }
+
+    pub fn src_cid(&self) -> Option<ConnectionID> {
+        match self {
+            Self::Initial { src_cid, .. } => Some(*src_cid),
+            Self::Handshake { src_cid, .. } => Some(*src_cid),
+            _ => None,
+        }
+    }
+
+    pub fn is_initial(&self) -> bool {
+        matches!(self, Self::Initial { .. })
+    }
+}
+
+impl ProtectedPacket {
+    pub fn new(data: Bytes, cid_len: u8) -> Result<Self, PacketError> {
+        let mut header_data = data.clone();
+        Ok(Self {
+            header: ProtectedHeader::decode(&mut header_data, cid_len)?,
+            bytes: data,
+            cid_len,
+        })
+    }
+
+    /// Decrypts packet
+    // TODO: Handle multiple packets in one datagram
+    // Need encryption keys
+    pub fn unprotect(self) -> Result<Packet, PacketError> {
+        let mut data = self.bytes.clone();
+        Packet::decode(&mut data, self.cid_len)
+    }
+
+    pub fn is_initial(&self) -> bool {
+        self.header.is_initial()
+    }
+
+    pub fn dst_cid(&self) -> ConnectionID {
+        self.header.dst_cid()
+    }
+
+    pub fn src_cid(&self) -> Option<ConnectionID> {
+        self.header.src_cid()
+    }
+}
+
+impl Debug for ProtectedPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtectedPacket")
+            .field("header", &self.header)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::io::{self, Cursor};

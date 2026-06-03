@@ -2,18 +2,6 @@
 
 This project takes some inspiration from quinn-rs/quinn
 
-## Mocking handshake
+## Handhsake
 
-I decided to make a fake version of the handshake.
-
-It goes like this:
-
-```text
-Client                   Server
-|----Initial(ClientHello)--->|
-|<---Handshake(ServerHello)--|
-|----Handshake(Finished)---->|
-|<---Short(HandshakeDone)----|
-```
-
-Here Initial, Handshake, Short are the different packet headers
+This is handled by rustls, and I pass the data from crypto frames into the tls connection

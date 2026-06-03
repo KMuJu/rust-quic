@@ -5,7 +5,7 @@ use std::{
 
 use crate::core::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PacketSpace {
     Initial,
     Handshake,
@@ -38,6 +38,7 @@ pub(crate) struct Space {
     pub(super) acker: Acker,
     pub(super) pending_frames: VecDeque<Frame>,
     pub(super) packet_number: usize,
+    pub(super) keys: Option<rustls::quic::Keys>,
 }
 
 impl Space {
@@ -48,7 +49,12 @@ impl Space {
             acker: Acker::new(transport_params.clone()),
             pending_frames: VecDeque::new(),
             packet_number: 0,
+            keys: None,
         }
+    }
+
+    pub(super) fn set_keys(&mut self, keys: rustls::quic::Keys) {
+        self.keys = Some(keys)
     }
 
     pub(super) fn discard(&mut self) {

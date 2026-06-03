@@ -1,11 +1,28 @@
-use std::io;
+use std::{fs, io, sync::Arc};
 
-use rust_quic::io::endpoint::Endpoint;
+use rust_quic::{core::config::ClientConfig, io::endpoint::Endpoint};
+
+fn client_tls_config() -> Arc<rustls::ClientConfig> {
+    let cert = fs::read("examples/keys/cert.pem").expect("missing cert.pem — run gen_certs first");
+
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut cert.as_slice()) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let mut endpoint = Endpoint::new(([127, 0, 0, 1], 32030).into()).await?;
-    let conn = endpoint.connect(([127, 0, 0, 1], 42069).into()).await;
+    let client_config = ClientConfig::new(client_tls_config());
+    let mut endpoint = Endpoint::client(([127, 0, 0, 1], 32030).into(), client_config).await?;
+    let name = "localhost";
+    let conn = endpoint.connect(name, ([127, 0, 0, 1], 42069).into()).await;
     println!("Created connection");
 
     for _ in 0..5 {

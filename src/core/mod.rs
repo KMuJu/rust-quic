@@ -1,4 +1,5 @@
 pub mod ack_manager;
+pub mod config;
 pub mod congestion;
 pub mod connection;
 pub mod crypto;
@@ -11,4 +12,8 @@ pub mod rtt_estimator;
 pub mod space;
 pub mod stream;
 pub mod timers;
+pub mod transport_error;
 pub mod transport_parameters;
+
+#[cfg(test)]
+mod tests;

@@ -25,8 +25,7 @@ use crate::{
     core::{
         connection::{ConnEvent, ConnectionCore, ConnectionID, StreamEvent},
         space::PacketSpace,
-        stream::{Dir, Side, StreamID},
-        transport_parameters::TransportParam,
+        stream::{Dir, StreamID},
     },
     io::{ConnectionToEndpoint, EndpointToConnection, endpoint::EndpointRef},
     socket::Socket,
@@ -67,10 +66,8 @@ pub struct Connection {
 
 impl Connection {
     pub(super) fn new(
-        cid: ConnectionID,
-        peer_cid: ConnectionID,
         addr: SocketAddr,
-        side: Side,
+        core: ConnectionCore,
         connected: oneshot::Sender<()>,
         incoming_data: UnboundedReceiver<EndpointToConnection>,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
@@ -81,14 +78,7 @@ impl Connection {
             handshake_done: Notify::new(),
         };
         let state = ConnectionState {
-            state: Mutex::new(ConnectionIO::new(
-                cid,
-                peer_cid,
-                addr,
-                side,
-                outgoing_data,
-                connected,
-            )),
+            state: Mutex::new(ConnectionIO::new(addr, core, outgoing_data, connected)),
             shared,
         };
         let io = ConnectionRef(Arc::new(state));
@@ -105,8 +95,8 @@ impl Connection {
         loop {
             if let Some(id) = self.inner.state.lock().unwrap().core.poll_accept_bidir() {
                 return (
-                    SendStreamHandle::new(id.clone(), self.inner.clone()),
-                    RecvStreamHandle::new(id.clone(), self.inner.clone()),
+                    SendStreamHandle::new(id, self.inner.clone()),
+                    RecvStreamHandle::new(id, self.inner.clone()),
                 );
             }
 
@@ -117,7 +107,7 @@ impl Connection {
     pub async fn accept_uni(&self) -> RecvStreamHandle {
         loop {
             if let Some(id) = self.inner.state.lock().unwrap().core.poll_accept_unidir() {
-                return RecvStreamHandle::new(id.clone(), self.inner.clone());
+                return RecvStreamHandle::new(id, self.inner.clone());
             }
 
             self.inner.shared.new_unidir_stream.notified().await;
@@ -128,8 +118,8 @@ impl Connection {
         let mut inner = self.inner.state.lock().unwrap();
         let id = inner.new_bidir();
 
-        let recv_handle = RecvStreamHandle::new(id.clone(), self.inner.clone());
-        let send_handle = SendStreamHandle::new(id.clone(), self.inner.clone());
+        let recv_handle = RecvStreamHandle::new(id, self.inner.clone());
+        let send_handle = SendStreamHandle::new(id, self.inner.clone());
 
         (recv_handle, send_handle)
     }
@@ -234,7 +224,7 @@ impl SendStreamHandle {
 
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, SendError> {
         let mut inner = self.connection.state.lock().unwrap();
-        inner.write(buf, self.id.clone())
+        inner.write(buf, self.id)
     }
 }
 
@@ -249,16 +239,12 @@ pub struct ConnectionIO {
 
 impl ConnectionIO {
     pub(crate) fn new(
-        cid: ConnectionID,
-        peer_cid: ConnectionID,
         addr: SocketAddr,
-        side: Side,
+        core: ConnectionCore,
         outgoing_data: UnboundedSender<ConnectionToEndpoint>,
         // TODO: Remove
         connected: oneshot::Sender<()>,
     ) -> Self {
-        let transport_params = Arc::new(TransportParam::new());
-        let core = ConnectionCore::new(cid, peer_cid, side, transport_params);
         Self {
             core,
             addr,
@@ -295,7 +281,7 @@ impl ConnectionIO {
 
     pub(crate) fn handle_data(&mut self, data: Vec<EndpointToConnection>) {
         for data in data {
-            self.core.handle_datagram(&data.data);
+            self.core.handle_datagram(data.protected);
         }
     }
 
@@ -313,7 +299,7 @@ impl ConnectionIO {
     }
 
     pub(crate) fn drive_transmit(&mut self) {
-        let mtu = 1200;
+        let mtu = 1500;
         for p_space in PacketSpace::iter() {
             if self.core.is_discarded(p_space) {
                 continue;
@@ -330,7 +316,7 @@ impl ConnectionIO {
                 packet.encode(&mut buf).unwrap();
                 self.outgoing_data
                     .send(ConnectionToEndpoint {
-                        data: buf,
+                        data: buf.freeze(),
                         addr: self.addr,
                     })
                     .unwrap();
@@ -346,10 +332,6 @@ impl ConnectionIO {
                     is_ack_eliciting,
                     size,
                 );
-
-                if is_in_flight {
-                    self.core.set_loss_timer();
-                }
             }
         }
     }

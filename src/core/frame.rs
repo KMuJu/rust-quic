@@ -501,7 +501,7 @@ impl Frame {
             | Self::Stream(Stream { id, .. })
             | Self::StopSending { id, .. }
             | Self::MaxStreamData { id, .. }
-            | Self::StreamDataBlocked { id, .. } => Some(id.clone()),
+            | Self::StreamDataBlocked { id, .. } => Some(*id),
             _ => None,
         }
     }
