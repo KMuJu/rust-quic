@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use thiserror::Error;
 use tokio::{
     io::ReadBuf,
@@ -193,7 +193,7 @@ impl<S: Socket> EndpointIO<S> {
         self.incoming_tx.send(incoming).unwrap();
     }
 
-    fn handle_datagram(&mut self, data: Bytes, addr: SocketAddr) {
+    fn handle_datagram(&mut self, data: BytesMut, addr: SocketAddr) {
         match self.core.handle_datagram(data, addr) {
             EndpointOutput::RouteToConnection {
                 dst_cid,
@@ -238,7 +238,7 @@ impl<S: Socket> EndpointIO<S> {
         loop {
             match self.socket.poll_recv_from(cx, &mut buf) {
                 Poll::Ready(Ok(addr)) => {
-                    let data = Bytes::copy_from_slice(buf.filled());
+                    let data = BytesMut::from_iter(buf.filled());
                     self.handle_datagram(data, addr);
                     buf.clear();
                 }

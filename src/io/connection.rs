@@ -10,7 +10,6 @@ use std::{
 };
 use thiserror::Error;
 
-use bytes::BytesMut;
 use tokio::{
     io::ReadBuf,
     sync::{
@@ -304,34 +303,13 @@ impl ConnectionIO {
             if self.core.is_discarded(p_space) {
                 continue;
             }
-            while let Some(packet) = self.core.get_packet(p_space, mtu) {
-                let size = packet.size() as u64;
-
-                // println!(
-                //     "Sending packet({:?})[{:?}]: {packet:?}",
-                //     self.core.state, self.core.side
-                // );
-
-                let mut buf = BytesMut::new();
-                packet.encode(&mut buf).unwrap();
+            while let Some(packet) = self.core.get_encrypted_packet(p_space, mtu) {
                 self.outgoing_data
                     .send(ConnectionToEndpoint {
-                        data: buf.freeze(),
+                        data: packet,
                         addr: self.addr,
                     })
                     .unwrap();
-
-                let is_in_flight = packet.is_in_flight();
-                let is_ack_eliciting = packet.is_ack_eliciting();
-                let p_space = packet.packet_space();
-                self.core.packet_sent(
-                    p_space,
-                    packet.packet_number().clone(),
-                    packet.frames,
-                    is_in_flight,
-                    is_ack_eliciting,
-                    size,
-                );
             }
         }
     }

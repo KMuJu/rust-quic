@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::ServerName;
 use thiserror::Error;
 
-use crate::core::transport_error::TransportError;
+use crate::core::{frame::frame_type, packet::Packet, transport_error::TransportError};
 
 // TODO: This is just a mock, will later use rustls
 
@@ -125,6 +125,44 @@ impl CryptoConn {
         };
 
         suite.keys(client_dst_connection_id, side, rustls::quic::Version::V1)
+    }
+}
+
+pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
+    let mut bytes = BytesMut::new();
+    packet.header.encode(&mut bytes).unwrap();
+    let header_len = bytes.len();
+    let pn_len = packet.packet_number().len() as usize;
+    let pn_offset = header_len - pn_len; // Packet number is the last byte written
+
+    packet
+        .frames
+        .iter()
+        .for_each(|f| f.encode(&mut bytes).unwrap());
+
+    let sample_len = keys.local.header.sample_len();
+    let sample_offset = pn_offset + 4;
+
+    pad_payload_to_len(&mut bytes, sample_offset + 16);
+
+    let (header, sample) = bytes.split_at_mut(sample_offset);
+    let (first, rest) = header.split_at_mut(1);
+
+    keys.local
+        .header
+        .encrypt_in_place(
+            &sample[..sample_len],
+            &mut first[0],
+            &mut rest[pn_offset - 1..],
+        )
+        .unwrap();
+
+    bytes.freeze()
+}
+
+fn pad_payload_to_len(bytes: &mut BytesMut, len: usize) {
+    if bytes.len() < len {
+        bytes.resize(len, frame_type::PADDING as u8);
     }
 }
 
