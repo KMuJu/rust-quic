@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    io::{self, Cursor},
+    io::{self},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
@@ -84,20 +84,6 @@ impl Packet {
 
     pub fn is_initial(&self) -> bool {
         self.header.is_initial()
-    }
-
-    pub fn is_client_hello(&self) -> bool {
-        if !matches!(self.header, Header::Initial { .. }) {
-            return false;
-        }
-        self.frames.iter().any(|f| {
-            let Frame::Crypto { data, .. } = f else {
-                return false;
-            };
-            let mut data = Cursor::new(data);
-            let c_frame = CryptoFrame::decode(&mut data);
-            matches!(c_frame, CryptoFrame::ClientHello)
-        })
     }
 
     /// Is not ACK, PADDING or CONNECTION_CLOSE
@@ -768,33 +754,6 @@ mod test {
     }
 
     #[test]
-    fn test_is_client_hello() {
-        let crypto_data = CryptoFrame::ClientHello;
-        let mut c_data = Vec::new();
-        crypto_data.encode(&mut c_data);
-        let crypto_frame = Frame::Crypto {
-            offset: VarInt(0),
-            data: c_data,
-        };
-
-        let payload = vec![crypto_frame];
-
-        let packet = Packet {
-            header: Header::Initial {
-                version: 1,
-                dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
-                src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
-                length: VarInt(1),
-                token: None,
-                packet_number: PacketNumber::from(1),
-            },
-            frames: payload,
-        };
-
-        assert!(packet.is_client_hello());
-    }
-
-    #[test]
     fn test_initial_size() {
         let header = Header::Initial {
             version: 1,
@@ -850,9 +809,7 @@ mod test {
 
     #[test]
     fn test_packet_size() {
-        let crypto_data = CryptoFrame::ClientHello;
-        let mut c_data = Vec::new();
-        crypto_data.encode(&mut c_data);
+        let mut c_data = vec![1, 2, 3, 4, 5];
         let crypto_frame = Frame::Crypto {
             offset: VarInt(0),
             data: c_data,
