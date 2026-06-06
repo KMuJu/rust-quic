@@ -1,13 +1,11 @@
-use std::{
-    fmt::Debug,
-    io::{self},
-};
+use std::{fmt::Debug, io};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 use thiserror::Error;
 
 use crate::core::{
     connection::ConnectionID,
+    crypto,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
     frame::{Frame, FrameIterator},
     space::PacketSpace,
@@ -136,7 +134,7 @@ pub enum PacketNumber {
 }
 
 impl PacketNumber {
-    fn decode<B: Buf>(buf: &mut B, len: u8) -> Self {
+    pub(super) fn decode<B: Buf>(buf: &mut B, len: u8) -> Self {
         use PacketNumber::*;
         match len {
             1 => U8(buf.get_u8()),
@@ -472,7 +470,6 @@ impl ProtectedHeader {
         match (first >> 7, first >> 6 & 1, first >> 5 & 1, first >> 4 & 1) {
             (1, 1, 0, 0) => {
                 // TODO: Handle panics
-                let packet_number_len = first & 0x3;
                 let version = buf.try_get_u32()?;
                 let dst_cid_len = buf.try_get_u8()?;
                 let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
@@ -506,7 +503,6 @@ impl ProtectedHeader {
             (1, 1, 1, 0) => {
                 // TODO: Handshake
                 // TODO: Handle panics
-                let packet_number_len = first & 0x3;
                 let version = buf.try_get_u32()?;
                 let dst_cid_len = buf.try_get_u8()?;
                 let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
@@ -585,27 +581,10 @@ impl ProtectedPacket {
     // TODO: Handle multiple packets in one datagram
     // Need encryption keys
     pub fn unprotect(mut self, keys: &rustls::quic::Keys) -> Result<Packet, PacketError> {
-        let pn_offset = self.bytes.position();
+        let pn = crypto::decrypt_header(keys, &mut self.bytes);
 
-        let sample_offset = pn_offset + 4;
-        let sample_len = keys.local.header.sample_len();
-
-        let data = self.bytes.get_mut();
-        let (header, sample) = data.split_at_mut(sample_offset as usize);
-        let (first, rest) = header.split_at_mut(1);
-
-        keys.remote
-            .header
-            .decrypt_in_place(
-                &sample[..sample_len],
-                &mut first[0],
-                &mut rest[pn_offset as usize - 1..],
-            )
-            .unwrap();
-
-        let pn_len = self.bytes.get_ref()[0] & 0b11;
-        let pn = PacketNumber::decode(&mut self.bytes, pn_len);
-
+        // Only new information is the packet number
+        // So I don't need to parse the header again
         let header = match self.header {
             ProtectedHeader::Initial {
                 version,
@@ -645,6 +624,8 @@ impl ProtectedPacket {
             },
         };
 
+        // TODO: Do packet decryption
+
         let payload = self.bytes.copy_to_bytes(self.bytes.remaining());
         let frames = FrameIterator::new(payload).collect();
 
@@ -661,31 +642,6 @@ impl ProtectedPacket {
 
     pub fn src_cid(&self) -> Option<ConnectionID> {
         self.header.src_cid()
-    }
-
-    fn pn_offset(&self) -> usize {
-        match &self.header {
-            ProtectedHeader::Initial {
-                dst_cid,
-                src_cid,
-                token,
-                length,
-                ..
-            } => {
-                let token_len = match token {
-                    Some(token) => VarInt(token.0.len() as u64).length() + token.0.len(),
-                    None => 1,
-                };
-                7 + dst_cid.len as usize + src_cid.len as usize + length.length() + token_len
-            }
-            ProtectedHeader::Handshake {
-                dst_cid,
-                src_cid,
-                length,
-                ..
-            } => 7 + dst_cid.len as usize + src_cid.len as usize + length.length(),
-            ProtectedHeader::Short { dst_cid, .. } => 1 + dst_cid.len as usize,
-        }
     }
 
     pub(super) fn packet_space(&self) -> PacketSpace {

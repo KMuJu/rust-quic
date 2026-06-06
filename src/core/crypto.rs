@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::ServerName;
 use thiserror::Error;
 
-use crate::core::{frame::frame_type, packet::Packet, transport_error::TransportError};
+use crate::core::{
+    frame::frame_type,
+    packet::{Packet, PacketNumber},
+    transport_error::TransportError,
+};
 
 enum CryptoConfig {
     Client(Arc<rustls::ClientConfig>),
@@ -99,6 +103,36 @@ impl CryptoConn {
     }
 }
 
+/// Cursor's position need to be at the start of the packet number
+pub fn decrypt_header(
+    keys: &rustls::quic::Keys,
+    cursor: &mut io::Cursor<BytesMut>,
+) -> PacketNumber {
+    let pn_offset = cursor.position() as usize;
+    let data = cursor.get_mut();
+
+    let sample_offset = pn_offset + 4;
+    let sample_len = keys.local.header.sample_len();
+
+    let (header, sample) = data.split_at_mut(sample_offset);
+    let (first, rest) = header.split_at_mut(1);
+
+    keys.remote
+        .header
+        .decrypt_in_place(
+            &sample[..sample_len],
+            &mut first[0],
+            &mut rest[pn_offset - 1..],
+        )
+        .unwrap();
+
+    let pn_len = first[0] & 0b11;
+
+    PacketNumber::decode(cursor, pn_len)
+}
+
+/// Given a packet and keys, returns the encrypted packet
+/// Uses the values from RFC 9001 section 5.4.2 to get the sample
 pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
     let mut bytes = BytesMut::new();
     packet.header.encode(&mut bytes).unwrap();
@@ -111,6 +145,9 @@ pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
         .iter()
         .for_each(|f| f.encode(&mut bytes).unwrap());
 
+    // TODO: Do packet encryption
+
+    // Header encryption
     let sample_len = keys.local.header.sample_len();
     let sample_offset = pn_offset + 4;
 
