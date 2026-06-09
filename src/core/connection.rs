@@ -323,7 +323,9 @@ impl ConnectionCore {
                     reason_phrase,
                 } => todo!(),
                 _ => {
-                    unreachable!("Got illigal frame type when processing handshake packet")
+                    unreachable!(
+                        "Got illigal frame type when processing handshake packet: {frame:?}"
+                    )
                 }
             }
         }

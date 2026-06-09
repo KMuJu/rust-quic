@@ -1,6 +1,6 @@
 use std::{fmt::Debug, io};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
+use bytes::{Buf, BufMut, BytesMut, TryGetError};
 use thiserror::Error;
 
 use crate::core::{
@@ -467,9 +467,9 @@ impl ProtectedPacket {
 
     /// Decrypts packet
     // TODO: Handle multiple packets in one datagram
-    // Need encryption keys
     pub fn unprotect(mut self, keys: &rustls::quic::Keys) -> Result<Packet, PacketError> {
         let pn = crypto::decrypt_header(keys, &mut self.bytes);
+        let packet_number = pn.u32() as u64;
 
         // Only new information is the packet number
         // So I don't need to parse the header again
@@ -512,10 +512,21 @@ impl ProtectedPacket {
             },
         };
 
-        // TODO: Do packet decryption
+        let header_len = self.bytes.position(); // Is after the packet number
+        let mut bytes = self.bytes.into_inner();
+        let header_data = bytes.split_to(header_len as usize);
+        let mut payload = bytes;
 
-        let payload = self.bytes.copy_to_bytes(self.bytes.remaining());
-        let frames = FrameIterator::new(payload).collect();
+        let len = keys
+            .remote
+            .packet
+            .decrypt_in_place(packet_number, &header_data, &mut payload)
+            .unwrap()
+            .len();
+
+        payload.truncate(len);
+
+        let frames = FrameIterator::new(payload.freeze()).collect();
 
         Ok(Packet { header, frames })
     }
@@ -552,6 +563,8 @@ impl Debug for ProtectedPacket {
 #[cfg(test)]
 mod test {
     use std::io::{self, Cursor};
+
+    use bytes::Bytes;
 
     use crate::core::{
         frame::Stream,
