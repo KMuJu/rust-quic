@@ -1,6 +1,6 @@
 use std::{io, sync::Arc};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::ServerName;
 use thiserror::Error;
@@ -104,6 +104,7 @@ impl CryptoConn {
 }
 
 /// Cursor's position need to be at the start of the packet number
+/// When returning the Cursor's position is after the end of the header
 pub fn decrypt_header(
     keys: &rustls::quic::Keys,
     cursor: &mut io::Cursor<BytesMut>,
@@ -131,28 +132,60 @@ pub fn decrypt_header(
     PacketNumber::decode(cursor, pn_len)
 }
 
+/// Cursor posiion must be at the end of the header
+pub fn decrypt_payload(
+    keys: &rustls::quic::Keys,
+    cursor: io::Cursor<BytesMut>,
+    packet_number: u64,
+) -> Bytes {
+    let header_len = cursor.position(); // Is after the packet number
+    let mut bytes = cursor.into_inner();
+    let header_data = bytes.split_to(header_len as usize);
+    let mut payload = bytes;
+
+    let len = keys
+        .remote
+        .packet
+        .decrypt_in_place(packet_number, &header_data, &mut payload)
+        .unwrap()
+        .len(); // Size of the decrypted payload is the size of the slice returned
+
+    payload.truncate(len);
+
+    payload.freeze()
+}
+
 /// Given a packet and keys, returns the encrypted packet
 /// Uses the values from RFC 9001 section 5.4.2 to get the sample
 pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
-    let mut bytes = BytesMut::new();
+    let mut bytes = BytesMut::with_capacity(packet.size() + keys.local.packet.tag_len());
     packet.header.encode(&mut bytes).unwrap();
+
     let header_len = bytes.len();
     let pn_len = packet.packet_number().len() as usize;
     let pn_offset = header_len - pn_len; // Packet number is the last byte written
+
+    let sample_len = keys.local.header.sample_len();
+    let sample_offset = pn_offset + 4;
 
     packet
         .frames
         .iter()
         .for_each(|f| f.encode(&mut bytes).unwrap());
 
-    // TODO: Do packet encryption
+    pad_payload_to_len(&mut bytes, sample_offset + sample_len);
+
+    let (header, payload) = bytes.split_at_mut(header_len);
+    let pn = packet.packet_number().u32() as u64;
+    let tag = keys
+        .local
+        .packet
+        .encrypt_in_place(pn, header, payload)
+        .unwrap();
+
+    bytes.extend_from_slice(tag.as_ref());
 
     // Header encryption
-    let sample_len = keys.local.header.sample_len();
-    let sample_offset = pn_offset + 4;
-
-    pad_payload_to_len(&mut bytes, sample_offset + 16);
-
     let (header, sample) = bytes.split_at_mut(sample_offset);
     let (first, rest) = header.split_at_mut(1);
 
