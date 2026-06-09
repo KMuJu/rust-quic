@@ -512,21 +512,9 @@ impl ProtectedPacket {
             },
         };
 
-        let header_len = self.bytes.position(); // Is after the packet number
-        let mut bytes = self.bytes.into_inner();
-        let header_data = bytes.split_to(header_len as usize);
-        let mut payload = bytes;
+        let payload = crypto::decrypt_payload(keys, self.bytes, packet_number);
 
-        let len = keys
-            .remote
-            .packet
-            .decrypt_in_place(packet_number, &header_data, &mut payload)
-            .unwrap()
-            .len();
-
-        payload.truncate(len);
-
-        let frames = FrameIterator::new(payload.freeze()).collect();
+        let frames = FrameIterator::new(payload).collect();
 
         Ok(Packet { header, frames })
     }

@@ -132,6 +132,29 @@ pub fn decrypt_header(
     PacketNumber::decode(cursor, pn_len)
 }
 
+/// Cursor posiion must be at the end of the header
+pub fn decrypt_payload(
+    keys: &rustls::quic::Keys,
+    cursor: io::Cursor<BytesMut>,
+    packet_number: u64,
+) -> Bytes {
+    let header_len = cursor.position(); // Is after the packet number
+    let mut bytes = cursor.into_inner();
+    let header_data = bytes.split_to(header_len as usize);
+    let mut payload = bytes;
+
+    let len = keys
+        .remote
+        .packet
+        .decrypt_in_place(packet_number, &header_data, &mut payload)
+        .unwrap()
+        .len(); // Size of the decrypted payload is the size of the slice returned
+
+    payload.truncate(len);
+
+    payload.freeze()
+}
+
 /// Given a packet and keys, returns the encrypted packet
 /// Uses the values from RFC 9001 section 5.4.2 to get the sample
 pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
