@@ -1,40 +1,15 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rustls::{ClientConfig, ServerConfig};
 use rustls_pki_types::ServerName;
 use thiserror::Error;
 
-use crate::core::transport_error::TransportError;
-
-// TODO: This is just a mock, will later use rustls
-
-#[derive(Debug)]
-pub enum CryptoFrame {
-    ClientHello,
-    ServerHello,
-    Finished,
-}
-
-impl CryptoFrame {
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        match self {
-            CryptoFrame::ClientHello => buf.put_u8(0),
-            CryptoFrame::ServerHello => buf.put_u8(1),
-            CryptoFrame::Finished => buf.put_u8(2),
-        }
-    }
-
-    pub fn decode<B: Buf>(buf: &mut B) -> CryptoFrame {
-        let t = buf.get_u8();
-        match t {
-            0 => CryptoFrame::ClientHello,
-            1 => CryptoFrame::ServerHello,
-            2 => CryptoFrame::Finished,
-            _ => panic!("Got invalid cryptoframe"),
-        }
-    }
-}
+use crate::core::{
+    frame::frame_type,
+    packet::{Packet, PacketNumber},
+    transport_error::TransportError,
+};
 
 enum CryptoConfig {
     Client(Arc<rustls::ClientConfig>),
@@ -125,6 +100,77 @@ impl CryptoConn {
         };
 
         suite.keys(client_dst_connection_id, side, rustls::quic::Version::V1)
+    }
+}
+
+/// Cursor's position need to be at the start of the packet number
+pub fn decrypt_header(
+    keys: &rustls::quic::Keys,
+    cursor: &mut io::Cursor<BytesMut>,
+) -> PacketNumber {
+    let pn_offset = cursor.position() as usize;
+    let data = cursor.get_mut();
+
+    let sample_offset = pn_offset + 4;
+    let sample_len = keys.local.header.sample_len();
+
+    let (header, sample) = data.split_at_mut(sample_offset);
+    let (first, rest) = header.split_at_mut(1);
+
+    keys.remote
+        .header
+        .decrypt_in_place(
+            &sample[..sample_len],
+            &mut first[0],
+            &mut rest[pn_offset - 1..],
+        )
+        .unwrap();
+
+    let pn_len = first[0] & 0b11;
+
+    PacketNumber::decode(cursor, pn_len)
+}
+
+/// Given a packet and keys, returns the encrypted packet
+/// Uses the values from RFC 9001 section 5.4.2 to get the sample
+pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
+    let mut bytes = BytesMut::new();
+    packet.header.encode(&mut bytes).unwrap();
+    let header_len = bytes.len();
+    let pn_len = packet.packet_number().len() as usize;
+    let pn_offset = header_len - pn_len; // Packet number is the last byte written
+
+    packet
+        .frames
+        .iter()
+        .for_each(|f| f.encode(&mut bytes).unwrap());
+
+    // TODO: Do packet encryption
+
+    // Header encryption
+    let sample_len = keys.local.header.sample_len();
+    let sample_offset = pn_offset + 4;
+
+    pad_payload_to_len(&mut bytes, sample_offset + 16);
+
+    let (header, sample) = bytes.split_at_mut(sample_offset);
+    let (first, rest) = header.split_at_mut(1);
+
+    keys.local
+        .header
+        .encrypt_in_place(
+            &sample[..sample_len],
+            &mut first[0],
+            &mut rest[pn_offset - 1..],
+        )
+        .unwrap();
+
+    bytes.freeze()
+}
+
+fn pad_payload_to_len(bytes: &mut BytesMut, len: usize) {
+    if bytes.len() < len {
+        bytes.resize(len, frame_type::PADDING as u8);
     }
 }
 

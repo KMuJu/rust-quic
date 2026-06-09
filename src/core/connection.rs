@@ -5,14 +5,14 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rand::{Rng, rngs::StdRng};
 use tokio::{io::ReadBuf, time::Instant};
 
 use crate::{
     core::{
         congestion::CongestionController,
-        crypto::{CryptoConn, handshake_type},
+        crypto::{self, CryptoConn, handshake_type},
         encoding::VarInt,
         frame::{Ack, Frame, Stream},
         packet::{Header, Packet, PacketNumber, ProtectedPacket},
@@ -153,15 +153,26 @@ impl ConnectionCore {
             crypto,
         };
 
-        let initial_keys = conn.crypto.initial_keys(&cid.buf[..cid.len as usize]);
+        {
+            let cid = match side {
+                Side::Client => cid,
+                Side::Server => peer_cid,
+            };
+            let initial_keys = conn.crypto.initial_keys(&cid.buf[..cid.len as usize]);
 
-        conn.spaces[PacketSpace::Initial].set_keys(initial_keys);
+            conn.spaces[PacketSpace::Initial].set_keys(initial_keys);
+        }
 
         conn
     }
 
     pub fn handle_datagram(&mut self, protected: ProtectedPacket) {
-        let packet = match protected.unprotect() {
+        let p_space = protected.packet_space();
+        let keys = self.spaces[p_space]
+            .keys
+            .as_ref()
+            .unwrap_or_else(|| panic!("Don't have keys for {:?}", p_space));
+        let packet = match protected.unprotect(keys) {
             Ok(p) => p,
             Err(e) => {
                 println!("Error when decoding datagram: {e}");
@@ -457,18 +468,18 @@ impl ConnectionCore {
         // Handle new frame
         match id.dir() {
             Dir::Bidir => {
-                self.send.insert(id.clone(), SendStream::new(id.clone()));
-                self.recv.insert(id.clone(), RecvStream::new(id.clone()));
-                self.bidir_acceptable.push_back(id.clone());
+                self.send.insert(*id, SendStream::new(*id));
+                self.recv.insert(*id, RecvStream::new(*id));
+                self.bidir_acceptable.push_back(*id);
             }
             Dir::Uni => {
-                self.recv.insert(id.clone(), RecvStream::new(id.clone()));
-                self.unidir_acceptable.push_back(id.clone());
+                self.recv.insert(*id, RecvStream::new(*id));
+                self.unidir_acceptable.push_back(*id);
             }
         }
 
         self.conn_event_queue
-            .push_back(ConnEvent::Stream(StreamEvent::NewStream { id: id.clone() }));
+            .push_back(ConnEvent::Stream(StreamEvent::NewStream { id: *id }));
     }
 
     fn peer_completed_address_validation(&self) -> bool {
@@ -635,7 +646,7 @@ impl ConnectionCore {
         }
     }
 
-    pub fn get_packet(&mut self, p_space: PacketSpace, mtu: usize) -> Option<Packet> {
+    fn get_packet(&mut self, p_space: PacketSpace, mtu: usize) -> Option<Packet> {
         let available = self.congestion.available_space();
         let mut mtu = mtu.min(available);
         let pn = PacketNumber::from(self.spaces[p_space].packet_number);
@@ -711,7 +722,7 @@ impl ConnectionCore {
                 let fin = send.is_finished();
 
                 let frame = Frame::Stream(Stream {
-                    id: id.clone(),
+                    id,
                     fin,
                     len: true,
                     offset: VarInt(offset),
@@ -746,6 +757,30 @@ impl ConnectionCore {
 
         self.spaces[p_space].packet_number += 1;
         Some(packet)
+    }
+
+    pub fn get_encrypted_packet(&mut self, p_space: PacketSpace, mtu: usize) -> Option<Bytes> {
+        let packet = self.get_packet(p_space, mtu)?;
+        let keys = self.spaces[p_space]
+            .keys
+            .as_ref()
+            .unwrap_or_else(|| panic!("Need {p_space:?} keys in order to encrypt packet"));
+        let bytes = crypto::encrypt_packet(&packet, keys);
+
+        let size = packet.size() as u64;
+        let is_in_flight = packet.is_in_flight();
+        let is_ack_eliciting = packet.is_ack_eliciting();
+        let p_space = packet.packet_space();
+        self.packet_sent(
+            p_space,
+            packet.packet_number().clone(),
+            packet.frames,
+            is_in_flight,
+            is_ack_eliciting,
+            size,
+        );
+
+        Some(bytes)
     }
 
     fn build_pto_probe(&mut self, p_space: PacketSpace) -> Vec<Frame> {

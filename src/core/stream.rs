@@ -20,7 +20,7 @@ pub enum Dir {
     Uni,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Side {
     Client,
     Server,

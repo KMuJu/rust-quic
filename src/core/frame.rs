@@ -8,33 +8,33 @@ use crate::core::{
     stream::{Dir, StreamID},
 };
 
-mod frame_type {
+pub mod frame_type {
     use std::ops::RangeInclusive;
 
-    pub(super) const STREAM: RangeInclusive<u64> = 0x08..=0x0f;
-    pub(super) const PADDING: u64 = 0x00;
-    pub(super) const PING: u64 = 0x01;
-    pub(super) const ACK: u64 = 0x02;
-    pub(super) const ACK_ECN: u64 = 0x03;
-    pub(super) const RESET_STREAM: u64 = 0x04;
-    pub(super) const STOP_SENDING: u64 = 0x05;
-    pub(super) const CRYPTO: u64 = 0x06;
-    pub(super) const NEW_TOKEN: u64 = 0x07;
-    pub(super) const MAX_DATA: u64 = 0x10;
-    pub(super) const MAX_STREAM_DATA: u64 = 0x11;
-    pub(super) const MAX_STREAMS_BIDIR: u64 = 0x12;
-    pub(super) const MAX_STREAMS_UNI: u64 = 0x13;
-    pub(super) const DATA_BLOCKED: u64 = 0x14;
-    pub(super) const STREAM_DATA_BLOCKED: u64 = 0x15;
-    pub(super) const STREAMS_BLOCKED_BIDIR: u64 = 0x16;
-    pub(super) const STREAMS_BLOCKED_UNI: u64 = 0x17;
-    pub(super) const NEW_CONNECTION_ID: u64 = 0x18;
-    pub(super) const RETIRE_CONNECTION_ID: u64 = 0x19;
-    pub(super) const PATH_CHALLENGE: u64 = 0x1a;
-    pub(super) const PATH_RESPONSE: u64 = 0x1b;
-    pub(super) const CONNECTION_CLOSE_QUIC_LAYER: u64 = 0x1c;
-    pub(super) const CONNECTION_CLOSE_APP_LAYER: u64 = 0x1d;
-    pub(super) const HANDSHAKE_DONE: u64 = 0x1e;
+    pub const STREAM: RangeInclusive<u64> = 0x08..=0x0f;
+    pub const PADDING: u64 = 0x00;
+    pub const PING: u64 = 0x01;
+    pub const ACK: u64 = 0x02;
+    pub const ACK_ECN: u64 = 0x03;
+    pub const RESET_STREAM: u64 = 0x04;
+    pub const STOP_SENDING: u64 = 0x05;
+    pub const CRYPTO: u64 = 0x06;
+    pub const NEW_TOKEN: u64 = 0x07;
+    pub const MAX_DATA: u64 = 0x10;
+    pub const MAX_STREAM_DATA: u64 = 0x11;
+    pub const MAX_STREAMS_BIDIR: u64 = 0x12;
+    pub const MAX_STREAMS_UNI: u64 = 0x13;
+    pub const DATA_BLOCKED: u64 = 0x14;
+    pub const STREAM_DATA_BLOCKED: u64 = 0x15;
+    pub const STREAMS_BLOCKED_BIDIR: u64 = 0x16;
+    pub const STREAMS_BLOCKED_UNI: u64 = 0x17;
+    pub const NEW_CONNECTION_ID: u64 = 0x18;
+    pub const RETIRE_CONNECTION_ID: u64 = 0x19;
+    pub const PATH_CHALLENGE: u64 = 0x1a;
+    pub const PATH_RESPONSE: u64 = 0x1b;
+    pub const CONNECTION_CLOSE_QUIC_LAYER: u64 = 0x1c;
+    pub const CONNECTION_CLOSE_APP_LAYER: u64 = 0x1d;
+    pub const HANDSHAKE_DONE: u64 = 0x1e;
 }
 
 #[derive(Debug, Clone)]

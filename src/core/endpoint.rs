@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use rand::rngs::StdRng;
 
 use crate::core::{
@@ -47,7 +47,7 @@ impl EndpointCore {
         }
     }
 
-    pub fn handle_datagram(&mut self, data: Bytes, remote: SocketAddr) -> EndpointOutput {
+    pub fn handle_datagram(&mut self, data: BytesMut, remote: SocketAddr) -> EndpointOutput {
         let protected = ProtectedPacket::new(data, self.cid_len).expect("Could not decode header");
         let dst_cid = protected.dst_cid();
 

@@ -8,7 +8,7 @@ use crate::core::{
     crypto::CryptoConn,
     packet::ProtectedPacket,
     space::PacketSpace,
-    stream::{Side, StreamID},
+    stream::Side,
     transport_parameters::TransportParam,
 };
 
@@ -70,25 +70,11 @@ pub(super) fn send_all_packets(
     lost: bool,
 ) {
     for p_space in PacketSpace::iter() {
-        while let Some(packet) = sender.get_packet(p_space, mtu) {
-            let mut bytes = BytesMut::new();
-            packet.encode(&mut bytes).unwrap();
-            let bytes = bytes.freeze();
-
-            let is_in_flight = packet.is_in_flight();
-            let is_ack_eliciting = packet.is_ack_eliciting();
-            sender.packet_sent(
-                p_space,
-                packet.packet_number().clone(),
-                packet.frames,
-                is_in_flight,
-                is_ack_eliciting,
-                bytes.len() as u64,
-            );
-
+        while let Some(packet) = sender.get_encrypted_packet(p_space, mtu) {
             if lost {
                 continue;
             }
+            let bytes = BytesMut::from(packet);
 
             let protected = ProtectedPacket::new(bytes, CID_LEN).unwrap();
             receiver.handle_datagram(protected);
