@@ -45,21 +45,6 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn decode<B: Buf>(buf: &mut B, cid_len: u8) -> Result<Self, PacketError> {
-        let header = Header::decode(buf, cid_len)?;
-        let payload: Bytes = buf.copy_to_bytes(buf.remaining());
-        let frames = FrameIterator::new(payload).collect();
-
-        Ok(Self { header, frames })
-    }
-
-    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), PacketError> {
-        self.header.encode(buf)?;
-        self.frames.iter().for_each(|f| f.encode(buf).unwrap());
-
-        Ok(())
-    }
-
     pub fn size(&self) -> usize {
         self.header.size() + self.frames.iter().map(|f| f.size()).sum::<usize>()
     }
@@ -204,101 +189,6 @@ pub enum PacketError {
 }
 
 impl Header {
-    pub fn decode<B: Buf>(buf: &mut B, cid_len: u8) -> Result<Self, PacketError> {
-        // FIX: will have to handle encryption and protected stuff and multiple packet types
-
-        let first = buf.try_get_u8()?;
-        match (first >> 7, first >> 6 & 1, first >> 5 & 1, first >> 4 & 1) {
-            (1, 1, 0, 0) => {
-                // TODO: Handle panics
-                let packet_number_len = first & 0x3;
-                let version = buf.try_get_u32()?;
-                let dst_cid_len = buf.try_get_u8()?;
-                let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
-                let src_cid_len = buf.try_get_u8()?;
-                let src_cid = ConnectionID::from_buf(buf, src_cid_len);
-                if dst_cid_len > 20 || src_cid_len > 20 {
-                    return Err(PacketError::InvalidHeader);
-                }
-                // TODO: Fix token
-                let token_len = variable_length_decode(buf)?;
-                let token = if token_len > 0 {
-                    let mut v = vec![0u8; token_len as usize];
-                    buf.copy_to_slice(&mut v);
-                    Some(Token(v))
-                } else {
-                    None
-                };
-                let length = VarInt::decode(buf)?;
-                let packet_number = PacketNumber::decode(buf, packet_number_len);
-                Ok(Self::Initial {
-                    version,
-                    dst_cid,
-                    src_cid,
-                    token,
-                    length,
-                    packet_number,
-                })
-            }
-            (1, 1, 0, 1) => {
-                // TODO: 0-RTT
-                todo!()
-            }
-            (1, 1, 1, 0) => {
-                // TODO: Handshake
-                // TODO: Handle panics
-                let packet_number_len = first & 0x3;
-                let version = buf.try_get_u32()?;
-                let dst_cid_len = buf.try_get_u8()?;
-                let dst_cid = ConnectionID::from_buf(buf, dst_cid_len);
-                let src_cid_len = buf.try_get_u8()?;
-                let src_cid = ConnectionID::from_buf(buf, src_cid_len);
-                if dst_cid_len > 20 || src_cid_len > 20 {
-                    return Err(PacketError::InvalidHeader);
-                }
-                let length = VarInt::decode(buf)?;
-                let packet_number = PacketNumber::decode(buf, packet_number_len);
-                Ok(Self::Handshake {
-                    version,
-                    dst_cid,
-                    src_cid,
-                    length,
-                    packet_number,
-                })
-            }
-            (1, 1, 1, 1) => {
-                // TODO: Retry
-                todo!()
-            }
-            (0, 1, _, _) => {
-                if buf.remaining() < 1 + cid_len as usize {
-                    println!(
-                        "Not enough buffer for first byte and destination connection id: {}",
-                        buf.remaining()
-                    );
-                    return Err(PacketError::InvalidHeader);
-                }
-                let dst_cid = ConnectionID::from_buf(buf, cid_len);
-                let packet_number_len = first & 0x3;
-                if buf.remaining() < packet_number_len as usize {
-                    println!("Not enough buffer for packet number");
-                    return Err(PacketError::InvalidHeader);
-                }
-
-                Ok(Header::Short {
-                    spin: first & 0x20 == 0x20,
-                    key_phase: first & 0x04 == 0x04,
-                    dst_cid,
-                    packet_number: PacketNumber::decode(buf, packet_number_len),
-                })
-            }
-            _ => {
-                println!("Invalid first four bits");
-                Err(PacketError::InvalidHeader)
-            }
-        }
-    }
-
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), PacketError> {
         match self {
             Header::Initial {
@@ -461,7 +351,6 @@ pub struct ProtectedPacket {
     header: ProtectedHeader,
     /// The rest of the packet, can be multiple packets
     bytes: io::Cursor<BytesMut>,
-    cid_len: u8,
 }
 
 impl ProtectedHeader {
@@ -573,7 +462,6 @@ impl ProtectedPacket {
         Ok(Self {
             header: ProtectedHeader::decode(&mut header_data, cid_len)?,
             bytes: header_data,
-            cid_len,
         })
     }
 
@@ -673,7 +561,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn initial_header_encode_decode() -> Result<(), PacketError> {
+    fn initial_header_encode() -> Result<(), PacketError> {
         let mut bytes: Vec<u8> = Vec::new();
         let dst_cid_o = ConnectionID::from_buf(&mut Cursor::new([1]), 1);
         let src_cid_o = ConnectionID::from_buf(&mut Cursor::new([1]), 1);
@@ -686,25 +574,25 @@ mod test {
             packet_number: PacketNumber::U8(2),
         };
         header.encode(&mut bytes).unwrap();
-        let output = Header::decode(&mut Cursor::new(bytes), 0)?;
-        match output {
-            Header::Initial {
-                version,
-                dst_cid,
-                src_cid,
-                token,
-                length,
-                packet_number,
-            } => {
-                assert_eq!(version, 1);
-                assert_eq!(dst_cid, dst_cid);
-                assert_eq!(src_cid, src_cid);
-                assert_eq!(token, Some(Token(vec![1, 2])));
-                assert_eq!(length.0, 0);
-                assert!(matches!(packet_number, PacketNumber::U8(x) if x == 2));
-            }
-            _ => unreachable!(),
-        }
+
+        let expected: Vec<u8> = vec![
+            0b11_00_00_01, // First byte
+            0,             // version
+            0,             // version
+            0,             // version
+            1,             // version
+            1,             // dst_cid
+            1,             // dst_cid
+            1,             // src_cid
+            1,             // src_cid
+            2,             // Token
+            1,             // Token
+            2,             // Token
+            0,             // Length
+            2,             // Packet number
+        ];
+
+        assert_eq!(bytes, expected);
 
         Ok(())
     }
@@ -804,8 +692,14 @@ mod test {
 
         let mut encoded = Vec::new();
         packet
+            .header
             .encode(&mut encoded)
             .expect("Encoding should not fail");
+
+        packet
+            .frames
+            .iter()
+            .for_each(|f| f.encode(&mut encoded).unwrap());
 
         assert_eq!(packet.size(), encoded.len());
     }
