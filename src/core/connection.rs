@@ -172,7 +172,7 @@ impl ConnectionCore {
             .keys
             .as_ref()
             .unwrap_or_else(|| panic!("Don't have keys for {:?}", p_space));
-        let packet = match protected.unprotect(keys) {
+        let packet = match protected.unprotect(keys, self.spaces[p_space].largest_received) {
             Ok(p) => p,
             Err(e) => {
                 println!("Error when decoding datagram: {e}");
@@ -180,21 +180,22 @@ impl ConnectionCore {
             }
         };
         let p_space = packet.packet_space();
+        let pn = packet
+            .packet_number()
+            .expand(self.spaces[p_space].largest_received + 1);
         println!(
             "{:?}({:?})[{:?}]: Got {:?}",
             self.id, self.lifecycle, self.side, packet
         );
         if !self.spaces[p_space]
             .acker
-            .received(packet.packet_number(), packet.is_ack_eliciting())
+            .received(pn, packet.is_ack_eliciting())
         {
-            eprintln!(
-                "ERROR: Got dulicate packet!({:?}): {}",
-                p_space,
-                packet.packet_number().u32()
-            );
+            eprintln!("ERROR: Got dulicate packet!({:?}): {}", p_space, pn);
             return;
         }
+
+        self.spaces[p_space].largest_received = self.spaces[p_space].largest_received.max(pn);
 
         match self.lifecycle {
             LifeCycle::Handshake => {}
@@ -380,7 +381,7 @@ impl ConnectionCore {
 
         // First range: largest down to largest - first_range
         for pn in (current - ack.first_range.0..=current).rev() {
-            acked.push(pn as u32);
+            acked.push(pn);
         }
         current -= ack.first_range.0;
 
@@ -388,7 +389,7 @@ impl ConnectionCore {
         for range in ack.ranges {
             current -= range.gap.0 + 2;
             for pn in (current - range.length.0..=current).rev() {
-                acked.push(pn as u32);
+                acked.push(pn);
             }
             current -= range.length.0;
         }
@@ -403,8 +404,7 @@ impl ConnectionCore {
         }
 
         let largest_acked = newly_acked.iter().max_by_key(|acked| acked.pn).unwrap();
-        if largest_acked.pn == (ack.largest.0 as u32)
-            && newly_acked.iter().any(|acked| acked.ack_eliciting)
+        if largest_acked.pn == ack.largest.0 && newly_acked.iter().any(|acked| acked.ack_eliciting)
         {
             let latest_rtt = Instant::now() - largest_acked.timestamp;
             let ack_delay =
@@ -651,7 +651,10 @@ impl ConnectionCore {
     fn get_packet(&mut self, p_space: PacketSpace, mtu: usize) -> Option<Packet> {
         let available = self.congestion.available_space();
         let mut mtu = mtu.min(available);
-        let pn = PacketNumber::from(self.spaces[p_space].packet_number);
+        let pn = PacketNumber::new(
+            self.spaces[p_space].packet_number,
+            self.spaces[p_space].acker.largest_acked.unwrap_or(0),
+        );
 
         let header = match p_space {
             PacketSpace::Initial => Header::Initial {
@@ -767,7 +770,7 @@ impl ConnectionCore {
             .keys
             .as_ref()
             .unwrap_or_else(|| panic!("Need {p_space:?} keys in order to encrypt packet"));
-        let bytes = crypto::encrypt_packet(&packet, keys);
+        let bytes = crypto::encrypt_packet(&packet, keys, self.spaces[p_space].largest_received);
 
         let size = packet.size() as u64;
         let is_in_flight = packet.is_in_flight();
@@ -822,6 +825,7 @@ impl ConnectionCore {
         sent_bytes: u64,
     ) {
         self.congestion.on_packet_sent(sent_bytes);
+        let pn = pn.expand(self.spaces[p_space].largest_received + 1);
         self.spaces[p_space]
             .acker
             .sent_packet(pn, frames, is_in_flight, is_ack_eliciting);

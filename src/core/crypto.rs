@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::core::{
     frame::frame_type,
-    packet::{Packet, PacketNumber},
+    packet::{DecodedPacketNumber, Packet, PacketNumber},
     transport_error::TransportError,
 };
 
@@ -127,7 +127,7 @@ pub fn decrypt_header(
         )
         .unwrap();
 
-    let pn_len = first[0] & 0b11;
+    let pn_len = PacketNumber::decode_len(first[0]);
 
     PacketNumber::decode(cursor, pn_len)
 }
@@ -157,7 +157,11 @@ pub fn decrypt_payload(
 
 /// Given a packet and keys, returns the encrypted packet
 /// Uses the values from RFC 9001 section 5.4.2 to get the sample
-pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
+pub fn encrypt_packet(
+    packet: &Packet,
+    keys: &rustls::quic::Keys,
+    largest: DecodedPacketNumber,
+) -> Bytes {
     let mut bytes = BytesMut::with_capacity(packet.size() + keys.local.packet.tag_len());
     packet.header.encode(&mut bytes).unwrap();
 
@@ -176,7 +180,7 @@ pub fn encrypt_packet(packet: &Packet, keys: &rustls::quic::Keys) -> Bytes {
     pad_payload_to_len(&mut bytes, sample_offset + sample_len);
 
     let (header, payload) = bytes.split_at_mut(header_len);
-    let pn = packet.packet_number().u32() as u64;
+    let pn = packet.packet_number().expand(largest + 1);
     let tag = keys
         .local
         .packet

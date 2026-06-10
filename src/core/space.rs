@@ -3,7 +3,10 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-use crate::core::{ack_manager::Acker, frame::Frame, transport_parameters::SharedConfig};
+use crate::core::{
+    ack_manager::Acker, frame::Frame, packet::DecodedPacketNumber,
+    transport_parameters::SharedConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PacketSpace {
@@ -37,8 +40,9 @@ pub(crate) struct Space {
     discarded: bool,
     pub(super) acker: Acker,
     pub(super) pending_frames: VecDeque<Frame>,
-    pub(super) packet_number: usize,
+    pub(super) packet_number: u64,
     pub(super) keys: Option<rustls::quic::Keys>,
+    pub(super) largest_received: DecodedPacketNumber,
 }
 
 impl Space {
@@ -50,6 +54,7 @@ impl Space {
             pending_frames: VecDeque::new(),
             packet_number: 0,
             keys: None,
+            largest_received: 0,
         }
     }
 
@@ -69,11 +74,5 @@ impl Space {
 
     pub(super) fn push_back_frame(&mut self, frame: Frame) {
         self.pending_frames.push_back(frame);
-    }
-
-    pub(super) fn new_packet_num(&mut self) -> usize {
-        let pn = self.packet_number;
-        self.packet_number += 1;
-        pn
     }
 }

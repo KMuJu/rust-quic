@@ -6,16 +6,16 @@ use tokio::time::Instant;
 use crate::core::{
     encoding::VarInt,
     frame::{Ack, AckRange, Frame},
-    packet::PacketNumber,
+    packet::{DecodedPacketNumber, PacketNumber},
     rtt_estimator::RttEstimator,
     transport_parameters::SharedConfig,
 };
 
-const PACKET_THRESHOLD: u32 = 3;
+const PACKET_THRESHOLD: DecodedPacketNumber = 3;
 
 pub(super) struct SentPacket {
     pub(super) frames: Vec<Frame>,
-    pub(super) pn: u32,
+    pub(super) pn: DecodedPacketNumber,
     pub(super) timestamp: Instant,
     pub(super) sent_bytes: usize,
     pub(super) ack_eliciting: bool,
@@ -23,19 +23,19 @@ pub(super) struct SentPacket {
 }
 
 struct LargestReceived {
-    packet_number: u32,
+    packet_number: DecodedPacketNumber,
     timestamp: Instant,
 }
 
 pub(super) struct Acker {
     cleared: bool,
     transport_params: SharedConfig,
-    received: RangeSet<[RangeInclusive<u32>; 8]>,
-    sent: BTreeMap<u32, SentPacket>,
+    received: RangeSet<[RangeInclusive<DecodedPacketNumber>; 8]>,
+    sent: BTreeMap<DecodedPacketNumber, SentPacket>,
     eliciting_count: u32,
     ack_deadline: Option<Instant>,
     loss_time: Option<Instant>,
-    largest_acked: u32,
+    pub(super) largest_acked: Option<DecodedPacketNumber>,
     largest_received: Option<LargestReceived>,
     last_elicit_time: Option<Instant>,
 
@@ -52,7 +52,7 @@ impl Acker {
             eliciting_count: 0,
             ack_deadline: None,
             loss_time: None,
-            largest_acked: u32::MAX,
+            largest_acked: None,
             largest_received: None,
             last_elicit_time: None,
             need_to_send_ack: false,
@@ -62,11 +62,10 @@ impl Acker {
     /// # Returns
     /// true if not duplicate
     /// false if duplicate
-    pub(super) fn received(&mut self, pn: &PacketNumber, elicit: bool) -> bool {
+    pub(super) fn received(&mut self, pn: DecodedPacketNumber, elicit: bool) -> bool {
         if self.cleared {
             return true;
         }
-        let pn = pn.u32();
 
         if self.received.insert(pn) {
             if let Some(largest) = &self.largest_received {
@@ -145,16 +144,16 @@ impl Acker {
             let gap = prev_end - range.end() - 2;
             let length = range.end() - range.start();
             ranges.push(AckRange {
-                gap: VarInt(gap as u64),
-                length: VarInt(length as u64),
+                gap: VarInt(gap),
+                length: VarInt(length),
             });
             prev_end = *range.start();
         }
 
         Frame::Ack(Ack {
-            largest: VarInt(largest as u64),
+            largest: VarInt(largest),
             delay: VarInt(encoded_delay as u64),
-            first_range: VarInt(first_range as u64),
+            first_range: VarInt(first_range),
             ranges,
             ecn: None,
         })
@@ -162,7 +161,7 @@ impl Acker {
 
     pub(super) fn sent_packet(
         &mut self,
-        packet_number: PacketNumber,
+        pn: DecodedPacketNumber,
         in_frames: Vec<Frame>,
         in_flight: bool,
         ack_eliciting: bool,
@@ -170,7 +169,6 @@ impl Acker {
         if self.cleared {
             return;
         }
-        let pn = packet_number.u32();
         if ack_eliciting {
             self.last_elicit_time = Some(Instant::now());
         }
@@ -207,21 +205,22 @@ impl Acker {
         }
         self.loss_time = None;
         assert!(
-            self.largest_acked != u32::MAX,
-            "Largest acked was not set: {}",
+            self.largest_acked.is_some(),
+            "Largest acked was not set: {:?}",
             self.largest_acked
         );
+        let largest_acked = self.largest_acked.unwrap();
         let loss_delay = rtt.latest_rtt.max(rtt.smoothed) * 9 / 8;
         let loss_delay = loss_delay.max(Duration::from_millis(1));
         let loss_send_time = now - loss_delay;
 
         let mut lost_pns = Vec::new();
         for (pn, s) in self.sent.iter() {
-            if *pn > self.largest_acked {
+            if *pn > largest_acked {
                 continue;
             }
 
-            if s.timestamp <= loss_send_time || self.largest_acked > pn + PACKET_THRESHOLD {
+            if s.timestamp <= loss_send_time || largest_acked > pn + PACKET_THRESHOLD {
                 lost_pns.push(*pn);
             } else if let Some(deadline) = self.loss_time {
                 self.loss_time = Some(deadline.min(s.timestamp + loss_delay));
@@ -238,12 +237,11 @@ impl Acker {
         lost
     }
 
-    pub(super) fn acked(&mut self, packet_number: u32) -> Option<SentPacket> {
-        if self.largest_acked == u32::MAX {
-            self.largest_acked = packet_number;
-        } else {
-            self.largest_acked = self.largest_acked.max(packet_number);
-        }
+    pub(super) fn acked(&mut self, packet_number: DecodedPacketNumber) -> Option<SentPacket> {
+        self.largest_acked = match self.largest_acked {
+            Some(l) => Some(l.max(packet_number)),
+            None => Some(packet_number),
+        };
         self.sent.remove(&packet_number)
     }
 
@@ -284,12 +282,12 @@ mod tests {
     #[test]
     fn test_build_frame() {
         let mut acker = Acker::new(Arc::new(TransportParam::new()));
-        assert!(acker.received(&PacketNumber::U8(1), false));
-        assert!(acker.received(&PacketNumber::U8(2), false));
-        assert!(acker.received(&PacketNumber::U8(3), false));
-        assert!(acker.received(&PacketNumber::U8(5), false));
-        assert!(acker.received(&PacketNumber::U8(6), false));
-        assert!(acker.received(&PacketNumber::U8(9), false));
+        assert!(acker.received(1, false));
+        assert!(acker.received(2, false));
+        assert!(acker.received(3, false));
+        assert!(acker.received(5, false));
+        assert!(acker.received(6, false));
+        assert!(acker.received(9, false));
         let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
@@ -318,9 +316,9 @@ mod tests {
     #[test]
     fn test_build_frame_simple() {
         let mut acker = Acker::new(Arc::new(TransportParam::new()));
-        assert!(acker.received(&PacketNumber::U8(1), false));
-        assert!(acker.received(&PacketNumber::U8(2), false));
-        assert!(acker.received(&PacketNumber::U8(3), false));
+        assert!(acker.received(1, false));
+        assert!(acker.received(2, false));
+        assert!(acker.received(3, false));
         let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
@@ -345,13 +343,13 @@ mod tests {
     #[test]
     fn test_build_frame_first_range() {
         let mut acker = Acker::new(Arc::new(TransportParam::new()));
-        assert!(acker.received(&PacketNumber::U8(1), false));
-        assert!(acker.received(&PacketNumber::U8(2), false));
-        assert!(acker.received(&PacketNumber::U8(3), false));
-        assert!(acker.received(&PacketNumber::U8(5), false));
-        assert!(acker.received(&PacketNumber::U8(6), false));
-        assert!(acker.received(&PacketNumber::U8(8), false));
-        assert!(acker.received(&PacketNumber::U8(9), false));
+        assert!(acker.received(1, false));
+        assert!(acker.received(2, false));
+        assert!(acker.received(3, false));
+        assert!(acker.received(5, false));
+        assert!(acker.received(6, false));
+        assert!(acker.received(8, false));
+        assert!(acker.received(9, false));
         let frame = acker.build_frame();
 
         println!("Frame: {frame:?}");
@@ -382,10 +380,10 @@ mod tests {
         let mut acker = Acker::new(Arc::new(TransportParam::new()));
         let frames = vec![Frame::Ping, Frame::HandshakeDone];
 
-        acker.sent_packet(PacketNumber::U8(1), frames.clone(), true, true);
-        acker.sent_packet(PacketNumber::U8(2), frames.clone(), true, true);
-        acker.sent_packet(PacketNumber::U8(5), frames.clone(), true, true);
-        acker.sent_packet(PacketNumber::U8(6), frames.clone(), true, true);
+        acker.sent_packet(1, frames.clone(), true, true);
+        acker.sent_packet(2, frames.clone(), true, true);
+        acker.sent_packet(5, frames.clone(), true, true);
+        acker.sent_packet(6, frames.clone(), true, true);
         acker.acked(6);
 
         let lost: Vec<_> = acker

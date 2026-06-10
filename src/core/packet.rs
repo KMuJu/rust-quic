@@ -110,7 +110,8 @@ impl Debug for Packet {
     }
 }
 
-#[derive(Clone)]
+/// Encoded packet number
+#[derive(Clone, Debug)]
 pub enum PacketNumber {
     U8(u8),
     U16(u16),
@@ -118,7 +119,25 @@ pub enum PacketNumber {
     U32(u32),
 }
 
+/// Internal Packet Number
+pub type DecodedPacketNumber = u64;
+
 impl PacketNumber {
+    pub(super) fn new(n: u64, largest_acked: u64) -> Self {
+        let range = (n - largest_acked) * 2;
+        if range < 1 << 8 {
+            Self::U8(n as u8)
+        } else if range < 1 << 16 {
+            Self::U16(n as u16)
+        } else if range < 1 << 24 {
+            Self::U24(n as u32)
+        } else if range < 1 << 32 {
+            Self::U32(n as u32)
+        } else {
+            panic!("packet number too large to encode")
+        }
+    }
+
     pub(super) fn decode<B: Buf>(buf: &mut B, len: u8) -> Self {
         use PacketNumber::*;
         match len {
@@ -139,6 +158,10 @@ impl PacketNumber {
         }
     }
 
+    pub(super) fn decode_len(tag: u8) -> u8 {
+        1 + (tag & 0b11)
+    }
+
     pub(super) fn len(&self) -> u8 {
         match self {
             PacketNumber::U8(_) => 1_u8,
@@ -148,33 +171,52 @@ impl PacketNumber {
         }
     }
 
-    pub(super) fn u32(&self) -> u32 {
+    pub(super) fn tag(&self) -> u8 {
         match self {
-            PacketNumber::U8(x) => u32::from(*x),
-            PacketNumber::U16(x) => u32::from(*x),
-            PacketNumber::U24(x) => *x,
-            PacketNumber::U32(x) => *x,
+            PacketNumber::U8(_) => 0b00,
+            PacketNumber::U16(_) => 0b01,
+            PacketNumber::U24(_) => 0b10,
+            PacketNumber::U32(_) => 0b11,
         }
     }
-}
 
-impl From<usize> for PacketNumber {
-    fn from(value: usize) -> Self {
-        if value <= 255 {
-            Self::U8(value as u8)
-        } else if value <= 65_535 {
-            Self::U16(value as u16)
-        } else if value <= 16_777_215 {
-            Self::U24(value as u32)
+    fn u64(&self) -> u64 {
+        match self {
+            PacketNumber::U8(x) => u64::from(*x),
+            PacketNumber::U16(x) => u64::from(*x),
+            PacketNumber::U24(x) => u64::from(*x),
+            PacketNumber::U32(x) => u64::from(*x),
+        }
+    }
+
+    pub(super) fn expand(&self, expected: DecodedPacketNumber) -> DecodedPacketNumber {
+        let truncated = self.u64();
+        let nbits = self.len() * 8;
+        let win = 1 << nbits;
+        let hwin = win / 2;
+        let mask = win - 1;
+
+        // The incoming packet number should be greater than
+        // expected_pn - pn_hwin and less than or equal to
+        // expected_pn + pn_hwin
+        //
+        // This means we cannot just strip the trailing bits from
+        // expected_pn and add the truncated_pn because that might
+        // yield a value outside the window.
+        //
+        // The following code calculates a candidate value and
+        // makes sure it's within the packet number window.
+        // Note the extra checks to prevent overflow and underflow.
+
+        let candidate = (expected & !mask) | truncated;
+        if expected.checked_sub(hwin).is_some_and(|x| candidate >= x) && candidate < (1 << 62) - win
+        {
+            candidate + win
+        } else if candidate > expected + hwin && candidate >= win {
+            candidate - win
         } else {
-            Self::U32(value as u32)
+            candidate
         }
-    }
-}
-
-impl Debug for PacketNumber {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PacketNumber").field(&self.u32()).finish()
     }
 }
 
@@ -199,7 +241,7 @@ impl Header {
                 length,
                 packet_number,
             } => {
-                let first: u8 = 0b1100_0000 + (packet_number.len() & 0b11);
+                let first: u8 = 0b1100_0000 + (packet_number.tag() & 0b11);
                 buf.put_u8(first);
                 buf.put_u32(*version);
                 buf.put_u8(dst_cid.len);
@@ -224,7 +266,7 @@ impl Header {
                 length,
                 packet_number,
             } => {
-                let first: u8 = 0b1110_0000 + (packet_number.len() & 0b11);
+                let first: u8 = 0b1110_0000 + (packet_number.tag() & 0b11);
                 buf.put_u8(first);
                 buf.put_u32(*version);
                 buf.put_u8(dst_cid.len);
@@ -243,7 +285,7 @@ impl Header {
                 let first: u8 = 0b0100_0000
                     + (if *spin { 0x20 } else { 0 })
                     + (if *key_phase { 0x04 } else { 0 })
-                    + (packet_number.len() & 0b11);
+                    + (packet_number.tag() & 0b11);
                 buf.put_u8(first);
                 buf.put_slice(&dst_cid.buf[..dst_cid.len as usize]);
                 packet_number.encode(buf);
@@ -297,13 +339,6 @@ impl Header {
         }
     }
 
-    pub(super) fn packet_space(&self) -> PacketSpace {
-        match self {
-            Header::Initial { .. } => PacketSpace::Initial,
-            Header::Handshake { .. } => PacketSpace::Handshake,
-            Header::Short { .. } => PacketSpace::Data,
-        }
-    }
     pub fn dst_cid(&self) -> ConnectionID {
         match self {
             Header::Initial { dst_cid, .. } => *dst_cid,
@@ -467,9 +502,13 @@ impl ProtectedPacket {
 
     /// Decrypts packet
     // TODO: Handle multiple packets in one datagram
-    pub fn unprotect(mut self, keys: &rustls::quic::Keys) -> Result<Packet, PacketError> {
+    pub fn unprotect(
+        mut self,
+        keys: &rustls::quic::Keys,
+        largest: DecodedPacketNumber,
+    ) -> Result<Packet, PacketError> {
         let pn = crypto::decrypt_header(keys, &mut self.bytes);
-        let packet_number = pn.u32() as u64;
+        let packet_number = pn.expand(largest + 1);
 
         // Only new information is the packet number
         // So I don't need to parse the header again
@@ -577,7 +616,7 @@ mod test {
         header.encode(&mut bytes).unwrap();
 
         let expected: Vec<u8> = vec![
-            0b11_00_00_01, // First byte
+            0b11_00_00_00, // First byte
             0,             // version
             0,             // version
             0,             // version
@@ -606,7 +645,7 @@ mod test {
             src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
             length: VarInt(1),
             token: None,
-            packet_number: PacketNumber::from(1),
+            packet_number: PacketNumber::new(1, 0),
         };
 
         let mut encoded = Vec::new();
@@ -624,7 +663,7 @@ mod test {
             dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
             src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
             length: VarInt(1),
-            packet_number: PacketNumber::from(1),
+            packet_number: PacketNumber::new(1, 0),
         };
 
         let mut encoded = Vec::new();
@@ -641,7 +680,7 @@ mod test {
             spin: false,
             key_phase: false,
             dst_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1, 2, 3, 4]), 4),
-            packet_number: PacketNumber::from(1),
+            packet_number: PacketNumber::new(1, 0),
         };
 
         let mut encoded = Vec::new();
@@ -654,7 +693,7 @@ mod test {
 
     #[test]
     fn test_packet_size() {
-        let mut c_data = vec![1, 2, 3, 4, 5];
+        let c_data = vec![1, 2, 3, 4, 5];
         let crypto_frame = Frame::Crypto {
             offset: VarInt(0),
             data: c_data,
@@ -686,7 +725,7 @@ mod test {
                 src_cid: ConnectionID::from_buf(&mut io::Cursor::new(&[1]), 1),
                 length: VarInt(1),
                 token: None,
-                packet_number: PacketNumber::from(1),
+                packet_number: PacketNumber::new(1, 0),
             },
             frames: payload,
         };
