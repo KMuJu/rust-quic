@@ -58,6 +58,8 @@ A stream has two possible statemachines, one for receiving and one for sending
 
 #### Sending
 
+```
+     +
        o
        | Create Stream (Sending)
        | Peer Creates Bidirectional Stream
@@ -88,6 +90,8 @@ A stream has two possible statemachines, one for receiving and one for sending
    | Data  |                   | Reset |
    | Recvd |                   | Recvd |
    +-------+                   +-------+
+     +
+```
 
 Ready state is a stream that is able to accept data from the application
 Send state
@@ -108,6 +112,7 @@ Reset sent
 
 #### Receiving
 
+```
        o
        | Recv STREAM / STREAM_DATA_BLOCKED / RESET_STREAM
        | Create Bidirectional Stream (Sending)
@@ -139,6 +144,7 @@ Reset sent
    | Data  |                   | Reset |
    | Read  |                   | Read  |
    +-------+                   +-------+
+```
 
 Initiated when the first STREAM, STREAM_DATA_BLOCKED or RESET_STREAM frame is received
 For bidirectional initiated by a peer, MAX_STREAM_DATA or STOP_SENDING frame also initiates
