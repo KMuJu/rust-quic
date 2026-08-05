@@ -161,7 +161,7 @@ impl<S: Socket> Endpoint<S> {
 }
 
 impl<S: Socket> EndpointIO<S> {
-    fn insert_new_connection(
+    fn create_new_connection(
         &mut self,
         dst_cid: ConnectionID,
         src_cid: ConnectionID,
@@ -178,7 +178,7 @@ impl<S: Socket> EndpointIO<S> {
             incoming_rx,
             self.outgoing_tx.clone(),
         );
-        println!("Received new connection: {dst_cid:?}=>{local_cid:?}, {src_cid:?}");
+        println!("Received new connection: {local_cid:?}, {src_cid:?}");
 
         let handle = ConnectionHandle {
             addr,
@@ -207,9 +207,7 @@ impl<S: Socket> EndpointIO<S> {
                         .send(EndpointToConnection { protected, addr })
                         .unwrap();
                 } else {
-                    eprintln!(
-                        "[Route to connection] Could not get connection handle to {dst_cid:?}"
-                    );
+                    eprintln!("Could not get connection handle for {dst_cid:?}");
                     eprintln!("{:?}", self.connection_handles);
                 }
             }
@@ -219,12 +217,11 @@ impl<S: Socket> EndpointIO<S> {
                 protected,
                 remote,
             } => {
-                let (handle, local_cid) = self.insert_new_connection(dst_cid, src_cid, remote);
+                let (handle, local_cid) = self.create_new_connection(dst_cid, src_cid, remote);
                 handle
                     .incoming_data
                     .send(EndpointToConnection { protected, addr })
                     .unwrap();
-                println!("Inserting handle for {local_cid:?}");
                 self.connection_handles.insert(local_cid, handle);
             }
             EndpointOutput::Drop => todo!(),

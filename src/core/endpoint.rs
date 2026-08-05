@@ -51,8 +51,6 @@ impl EndpointCore {
         let protected = ProtectedPacket::new(data, self.cid_len).expect("Could not decode header");
         let dst_cid = protected.dst_cid();
 
-        println!("Got datagram with dst_cid={dst_cid:?}");
-
         if let Some(old_remote) = self.connections.get(&dst_cid) {
             if old_remote == &remote {
                 return EndpointOutput::RouteToConnection {
