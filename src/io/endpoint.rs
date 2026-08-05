@@ -166,10 +166,10 @@ impl<S: Socket> EndpointIO<S> {
         dst_cid: ConnectionID,
         src_cid: ConnectionID,
         addr: SocketAddr,
-    ) {
+    ) -> (ConnectionHandle, ConnectionID) {
         let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let (connected_send, connected_recv) = oneshot::channel();
-        let core = self.core.new_server_conn(dst_cid, src_cid);
+        let (core, local_cid) = self.core.new_server_conn(dst_cid, src_cid, addr);
         // TODO: Always server??
         let connection = Connection::new(
             addr,
@@ -178,19 +178,20 @@ impl<S: Socket> EndpointIO<S> {
             incoming_rx,
             self.outgoing_tx.clone(),
         );
-        println!("Received new connection: {dst_cid:?}, {src_cid:?}");
+        println!("Received new connection: {dst_cid:?}=>{local_cid:?}, {src_cid:?}");
 
         let handle = ConnectionHandle {
             addr,
             incoming_data,
         };
 
-        self.connection_handles.insert(dst_cid, handle);
-        self.connections.insert(dst_cid, connection);
+        self.connections.insert(local_cid, connection);
 
         // TODO: Handle create incomming connection
-        let incoming = IncomingInner::new(dst_cid, connected_recv);
+        let incoming = IncomingInner::new(local_cid, connected_recv);
         self.incoming_tx.send(incoming).unwrap();
+
+        (handle, local_cid)
     }
 
     fn handle_datagram(&mut self, data: BytesMut, addr: SocketAddr) {
@@ -206,7 +207,9 @@ impl<S: Socket> EndpointIO<S> {
                         .send(EndpointToConnection { protected, addr })
                         .unwrap();
                 } else {
-                    eprintln!("Could not get connection handle to {dst_cid:?}");
+                    eprintln!(
+                        "[Route to connection] Could not get connection handle to {dst_cid:?}"
+                    );
                     eprintln!("{:?}", self.connection_handles);
                 }
             }
@@ -216,16 +219,13 @@ impl<S: Socket> EndpointIO<S> {
                 protected,
                 remote,
             } => {
-                self.insert_new_connection(dst_cid, src_cid, remote);
-                if let Some(handle) = self.connection_handles.get(&dst_cid) {
-                    handle
-                        .incoming_data
-                        .send(EndpointToConnection { protected, addr })
-                        .unwrap();
-                } else {
-                    eprintln!("Could not get connection handle to {dst_cid:?}");
-                    eprintln!("{:?}", self.connection_handles);
-                }
+                let (handle, local_cid) = self.insert_new_connection(dst_cid, src_cid, remote);
+                handle
+                    .incoming_data
+                    .send(EndpointToConnection { protected, addr })
+                    .unwrap();
+                println!("Inserting handle for {local_cid:?}");
+                self.connection_handles.insert(local_cid, handle);
             }
             EndpointOutput::Drop => todo!(),
             EndpointOutput::SendDatagram => todo!(),

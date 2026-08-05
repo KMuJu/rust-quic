@@ -50,8 +50,9 @@ pub enum StreamEvent {
 
 pub struct ConnectionCore {
     id: ConnectionID,
-    // Peer's cid
     peer_cid: ConnectionID,
+    /// The CID assigned to the server in the first message
+    first_cid: ConnectionID,
     side: Side,
     lifecycle: LifeCycle,
 
@@ -122,6 +123,7 @@ impl ConnectionCore {
     pub(crate) fn new(
         cid: ConnectionID,
         peer_cid: ConnectionID,
+        first_cid: ConnectionID,
         side: Side,
         crypto: CryptoConn,
         transport_params: SharedConfig,
@@ -129,6 +131,7 @@ impl ConnectionCore {
         let mut conn = ConnectionCore {
             id: cid,
             peer_cid,
+            first_cid,
             side,
             lifecycle: LifeCycle::Handshake,
             recv: HashMap::new(),
@@ -153,15 +156,11 @@ impl ConnectionCore {
             crypto,
         };
 
-        {
-            let cid = match side {
-                Side::Client => cid,
-                Side::Server => peer_cid,
-            };
-            let initial_keys = conn.crypto.initial_keys(&cid.buf[..cid.len as usize]);
+        let initial_keys = conn
+            .crypto
+            .initial_keys(&first_cid.buf[..first_cid.len as usize]);
 
-            conn.spaces[PacketSpace::Initial].set_keys(initial_keys);
-        }
+        conn.spaces[PacketSpace::Initial].set_keys(initial_keys);
 
         conn
     }
@@ -206,6 +205,13 @@ impl ConnectionCore {
                 }
             },
         };
+
+        if let Side::Client = self.side
+            && let Some(src_cid) = packet.src_cid()
+            && self.peer_cid == self.first_cid
+        {
+            self.peer_cid = src_cid;
+        }
 
         match &packet.header {
             Header::Initial { .. } => {
@@ -637,9 +643,7 @@ impl ConnectionCore {
                     } else {
                         let p_space = self.pto_space();
                         let pto_frames = self.build_pto_probe(p_space);
-                        self.spaces[p_space]
-                            .pending_frames
-                            .extend(pto_frames.into_iter());
+                        self.spaces[p_space].pending_frames.extend(pto_frames);
                     }
                     self.pto_count += 1;
                     self.set_loss_timer();

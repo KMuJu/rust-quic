@@ -30,7 +30,7 @@ use crate::{
     socket::Socket,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ConnectionHandle {
     pub(super) addr: SocketAddr,
     pub(super) incoming_data: UnboundedSender<EndpointToConnection>,

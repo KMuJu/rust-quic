@@ -51,6 +51,8 @@ impl EndpointCore {
         let protected = ProtectedPacket::new(data, self.cid_len).expect("Could not decode header");
         let dst_cid = protected.dst_cid();
 
+        println!("Got datagram with dst_cid={dst_cid:?}");
+
         if let Some(old_remote) = self.connections.get(&dst_cid) {
             if old_remote == &remote {
                 return EndpointOutput::RouteToConnection {
@@ -100,7 +102,7 @@ impl EndpointCore {
 
     pub fn new_client_conn(&mut self, name: &str) -> (ConnectionCore, ConnectionID) {
         let transport_params = Arc::new(TransportParam::new());
-        let (cid, peer_cid) = self.initial_cids();
+        let (local_cid, remote_cid) = self.initial_cids();
 
         let crypto = CryptoConn::new_client(
             self.client_config.as_ref().unwrap().crypto.clone(),
@@ -109,22 +111,44 @@ impl EndpointCore {
         )
         .unwrap();
 
-        let core = ConnectionCore::new(cid, peer_cid, Side::Client, crypto, transport_params);
+        let core = ConnectionCore::new(
+            local_cid,
+            remote_cid,
+            remote_cid,
+            Side::Client,
+            crypto,
+            transport_params,
+        );
 
-        (core, cid)
+        (core, local_cid)
     }
 
     pub fn new_server_conn(
         &mut self,
-        dst_cid: ConnectionID,
-        src_cid: ConnectionID,
-    ) -> ConnectionCore {
+        first_cid: ConnectionID,
+        remote_cid: ConnectionID,
+        remote: SocketAddr,
+    ) -> (ConnectionCore, ConnectionID) {
         let transport_params = Arc::new(TransportParam::new());
 
         let crypto =
             CryptoConn::new_server(self.server_config.as_ref().unwrap().crypto.clone(), vec![])
                 .unwrap();
 
-        ConnectionCore::new(dst_cid, src_cid, Side::Server, crypto, transport_params)
+        let local_cid = ConnectionID::new(self.cid_len, &mut self.rng);
+
+        self.connections.insert(local_cid, remote);
+
+        (
+            ConnectionCore::new(
+                local_cid,
+                remote_cid,
+                first_cid,
+                Side::Server,
+                crypto,
+                transport_params,
+            ),
+            local_cid,
+        )
     }
 }

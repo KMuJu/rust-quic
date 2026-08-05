@@ -26,6 +26,7 @@ pub(super) fn create_connections() -> (ConnectionCore, ConnectionCore) {
     let client = ConnectionCore::new(
         client_cid,
         server_cid,
+        server_cid,
         Side::Client,
         client_crypto,
         transport_params.clone(),
@@ -33,6 +34,7 @@ pub(super) fn create_connections() -> (ConnectionCore, ConnectionCore) {
     let server = ConnectionCore::new(
         server_cid,
         client_cid,
+        server_cid,
         Side::Server,
         server_crypto,
         transport_params,
