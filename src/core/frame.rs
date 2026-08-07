@@ -2,7 +2,7 @@ use bytes::{Buf, BufMut, Bytes};
 use thiserror::Error;
 
 use crate::core::{
-    connection::ConnectionID,
+    connection_id::ConnectionID,
     encoding::{VarInt, VarIntError, variable_length, variable_length_encode},
     packet::Token,
     stream::{Dir, StreamID},

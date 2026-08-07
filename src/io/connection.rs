@@ -22,7 +22,8 @@ use tokio::{
 
 use crate::{
     core::{
-        connection::{ConnEvent, ConnectionCore, ConnectionID, StreamEvent},
+        connection::{ConnEvent, ConnectionCore, StreamEvent},
+        connection_id::ConnectionID,
         space::PacketSpace,
         stream::{Dir, StreamID},
     },

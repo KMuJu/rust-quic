@@ -2,6 +2,7 @@ pub mod ack_manager;
 pub mod config;
 pub mod congestion;
 pub mod connection;
+pub mod connection_id;
 pub mod crypto;
 pub mod encoding;
 pub mod endpoint;

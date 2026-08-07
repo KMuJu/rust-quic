@@ -21,7 +21,7 @@ use tokio::{
 use crate::{
     core::{
         config::{ClientConfig, ServerConfig},
-        connection::ConnectionID,
+        connection_id::ConnectionID,
         endpoint::{EndpointCore, EndpointOutput},
         packet::PacketError,
     },

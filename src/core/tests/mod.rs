@@ -4,7 +4,8 @@ use bytes::BytesMut;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::core::{
-    connection::{ConnEvent, ConnectionCore, ConnectionID},
+    connection::{ConnEvent, ConnectionCore},
+    connection_id::ConnectionID,
     crypto::CryptoConn,
     packet::ProtectedPacket,
     space::PacketSpace,

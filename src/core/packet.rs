@@ -4,7 +4,7 @@ use bytes::{Buf, BufMut, BytesMut, TryGetError};
 use thiserror::Error;
 
 use crate::core::{
-    connection::ConnectionID,
+    connection_id::ConnectionID,
     crypto,
     encoding::{VarInt, VarIntError, variable_length_decode, variable_length_encode},
     frame::{Frame, FrameIterator},

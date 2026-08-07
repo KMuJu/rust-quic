@@ -5,13 +5,13 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
-use rand::{Rng, rngs::StdRng};
+use bytes::{Bytes, BytesMut};
 use tokio::{io::ReadBuf, time::Instant};
 
 use crate::{
     core::{
         congestion::CongestionController,
+        connection_id::ConnectionID,
         crypto::{self, CryptoConn, handshake_type},
         encoding::VarInt,
         frame::{Ack, Frame, Stream},
@@ -82,41 +82,6 @@ pub struct ConnectionCore {
     conn_event_queue: VecDeque<ConnEvent>,
 
     crypto: CryptoConn,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ConnectionID {
-    pub len: u8,
-    pub buf: [u8; 20],
-}
-
-impl ConnectionID {
-    pub fn from_buf<B: Buf>(buf: &mut B, len: u8) -> Self {
-        let mut id = Self {
-            len,
-            buf: [0u8; 20],
-        };
-        // TODO: Potential bug
-        buf.copy_to_slice(&mut id.buf[..len as usize]);
-        id
-    }
-
-    pub fn new(len: u8, rng: &mut StdRng) -> Self {
-        let mut id = Self {
-            len,
-            buf: [0u8; 20],
-        };
-        rng.fill_bytes(&mut id.buf[..len as usize]);
-        id
-    }
-}
-
-impl Debug for ConnectionID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("CID")
-            .field(&&self.buf[..self.len as usize])
-            .finish()
-    }
 }
 
 impl ConnectionCore {

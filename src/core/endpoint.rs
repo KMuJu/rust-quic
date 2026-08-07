@@ -5,7 +5,8 @@ use rand::rngs::StdRng;
 
 use crate::core::{
     config::{ClientConfig, ServerConfig},
-    connection::{ConnectionCore, ConnectionID},
+    connection::ConnectionCore,
+    connection_id::ConnectionID,
     crypto::CryptoConn,
     packet::ProtectedPacket,
     stream::Side,
