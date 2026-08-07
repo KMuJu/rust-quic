@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use bytes::Buf;
 use rand::{Rng, rngs::StdRng};
 
+pub type InternalCID = u64;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConnectionID {
     pub len: u8,
@@ -35,5 +37,19 @@ impl std::fmt::Debug for ConnectionID {
         f.debug_tuple("CID")
             .field(&&self.buf[..self.len as usize])
             .finish()
+    }
+}
+
+pub struct ConnectionIDQueue {
+    pub current: ConnectionID,
+    queue: VecDeque<ConnectionID>,
+}
+
+impl ConnectionIDQueue {
+    pub fn new(current: ConnectionID) -> Self {
+        Self {
+            current,
+            queue: VecDeque::new(),
+        }
     }
 }

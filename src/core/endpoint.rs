@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, atomic::Ordering},
+};
 
 use bytes::BytesMut;
 use rand::rngs::StdRng;
@@ -6,7 +10,7 @@ use rand::rngs::StdRng;
 use crate::core::{
     config::{ClientConfig, ServerConfig},
     connection::ConnectionCore,
-    connection_id::ConnectionID,
+    connection_id::{self, ConnectionID, InternalCID},
     crypto::CryptoConn,
     packet::ProtectedPacket,
     stream::Side,
@@ -16,14 +20,16 @@ use crate::core::{
 pub struct EndpointCore {
     rng: StdRng,
     cid_len: u8,
-    connections: HashMap<ConnectionID, SocketAddr>,
+    connections_addresses: HashMap<InternalCID, SocketAddr>,
+    connections: HashMap<ConnectionID, InternalCID>,
+    current_internal_cid: InternalCID,
     client_config: Option<ClientConfig>,
     server_config: Option<ServerConfig>,
 }
 
 pub enum EndpointOutput {
     RouteToConnection {
-        dst_cid: ConnectionID,
+        dst_cid: InternalCID,
         protected: ProtectedPacket,
         migration: Option<SocketAddr>,
     },
@@ -42,7 +48,9 @@ impl EndpointCore {
         Self {
             rng: rand::make_rng(),
             cid_len: 4,
+            connections_addresses: HashMap::new(),
             connections: HashMap::new(),
+            current_internal_cid: 0,
             client_config,
             server_config,
         }
@@ -52,17 +60,21 @@ impl EndpointCore {
         let protected = ProtectedPacket::new(data, self.cid_len).expect("Could not decode header");
         let dst_cid = protected.dst_cid();
 
-        if let Some(old_remote) = self.connections.get(&dst_cid) {
+        println!("[INTERNAL] Current connections: {:?}", self.connections);
+
+        if let Some(internal_cid) = self.connections.get(&dst_cid)
+            && let Some(old_remote) = self.connections_addresses.get(internal_cid)
+        {
             if old_remote == &remote {
                 return EndpointOutput::RouteToConnection {
-                    dst_cid,
+                    dst_cid: *internal_cid,
                     protected,
                     migration: None,
                 };
             }
 
             return EndpointOutput::RouteToConnection {
-                dst_cid,
+                dst_cid: *internal_cid,
                 protected,
                 migration: Some(remote),
             };
@@ -78,7 +90,6 @@ impl EndpointCore {
         // Do retry?
         // Validate token?
 
-        self.connections.insert(dst_cid, remote);
         let src_cid = protected.src_cid().unwrap();
         EndpointOutput::NewConnection {
             dst_cid,
@@ -88,8 +99,8 @@ impl EndpointCore {
         }
     }
 
-    pub fn add_cid(&mut self, local_cid: ConnectionID, remote: SocketAddr) {
-        self.connections.insert(local_cid, remote);
+    pub fn add_cid(&mut self, internal_cid: InternalCID, remote: SocketAddr) {
+        self.connections_addresses.insert(internal_cid, remote);
     }
 
     fn initial_cids(&mut self) -> (ConnectionID, ConnectionID) {
@@ -99,7 +110,13 @@ impl EndpointCore {
         )
     }
 
-    pub fn new_client_conn(&mut self, name: &str) -> (ConnectionCore, ConnectionID) {
+    fn current_icid(&mut self) -> InternalCID {
+        let t = self.current_internal_cid;
+        self.current_internal_cid += 1;
+        t
+    }
+
+    pub fn new_client_conn(&mut self, name: &str) -> (ConnectionCore, InternalCID) {
         let transport_params = Arc::new(TransportParam::new());
         let (local_cid, remote_cid) = self.initial_cids();
 
@@ -110,6 +127,9 @@ impl EndpointCore {
         )
         .unwrap();
 
+        let internal_cid = self.current_icid();
+        self.connections.insert(local_cid, internal_cid);
+
         let core = ConnectionCore::new(
             local_cid,
             remote_cid,
@@ -119,7 +139,7 @@ impl EndpointCore {
             transport_params,
         );
 
-        (core, local_cid)
+        (core, internal_cid)
     }
 
     pub fn new_server_conn(
@@ -127,7 +147,7 @@ impl EndpointCore {
         first_cid: ConnectionID,
         remote_cid: ConnectionID,
         remote: SocketAddr,
-    ) -> (ConnectionCore, ConnectionID) {
+    ) -> (ConnectionCore, InternalCID) {
         let transport_params = Arc::new(TransportParam::new());
 
         let crypto =
@@ -135,8 +155,10 @@ impl EndpointCore {
                 .unwrap();
 
         let local_cid = ConnectionID::new(self.cid_len, &mut self.rng);
+        let internal_cid = self.current_icid();
+        self.connections.insert(local_cid, internal_cid);
 
-        self.connections.insert(local_cid, remote);
+        self.connections_addresses.insert(internal_cid, remote);
 
         (
             ConnectionCore::new(
@@ -147,7 +169,7 @@ impl EndpointCore {
                 crypto,
                 transport_params,
             ),
-            local_cid,
+            internal_cid,
         )
     }
 }

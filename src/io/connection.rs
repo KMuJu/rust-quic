@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     core::{
         connection::{ConnEvent, ConnectionCore, StreamEvent},
-        connection_id::ConnectionID,
+        connection_id::{ConnectionID, InternalCID},
         space::PacketSpace,
         stream::{Dir, StreamID},
     },
@@ -132,13 +132,13 @@ impl Connection {
 }
 
 pub struct IncomingInner {
-    id: ConnectionID,
+    id: InternalCID,
     // src_cid: ConnectionID,
     connected: oneshot::Receiver<()>,
 }
 
 impl IncomingInner {
-    pub fn new(id: ConnectionID, connected: oneshot::Receiver<()>) -> Self {
+    pub fn new(id: InternalCID, connected: oneshot::Receiver<()>) -> Self {
         Self {
             id,
             // src_cid,

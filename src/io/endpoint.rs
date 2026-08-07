@@ -21,7 +21,7 @@ use tokio::{
 use crate::{
     core::{
         config::{ClientConfig, ServerConfig},
-        connection_id::ConnectionID,
+        connection_id::{ConnectionID, InternalCID},
         endpoint::{EndpointCore, EndpointOutput},
         packet::PacketError,
     },
@@ -37,8 +37,8 @@ pub struct EndpointIO<S: Socket> {
     core: EndpointCore,
     // TODO: Multiple connectionids can point to the same connection, so add a map between
     // connectionid and internal handle
-    connection_handles: HashMap<ConnectionID, ConnectionHandle>,
-    pub(super) connections: HashMap<ConnectionID, Connection>,
+    connection_handles: HashMap<InternalCID, ConnectionHandle>,
+    pub(super) connections: HashMap<InternalCID, Connection>,
     incoming_tx: UnboundedSender<IncomingInner>,
     stashed_packet: VecDeque<(Bytes, SocketAddr)>,
     outgoing_rx: UnboundedReceiver<ConnectionToEndpoint>, // Receives data from connections
@@ -130,7 +130,7 @@ impl<S: Socket> Endpoint<S> {
             let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
             let (connected_send, connected_recv) = oneshot::channel();
 
-            let (core, cid) = endpoint.core.new_client_conn(name);
+            let (core, internal_cid) = endpoint.core.new_client_conn(name);
             println!("Connecting to endpoint");
             let conn = Connection::new(
                 addr,
@@ -144,9 +144,9 @@ impl<S: Socket> Endpoint<S> {
                 incoming_data,
             };
 
-            endpoint.connection_handles.insert(cid, handle);
-            endpoint.connections.insert(cid, conn.clone());
-            endpoint.core.add_cid(cid, addr);
+            endpoint.connection_handles.insert(internal_cid, handle);
+            endpoint.connections.insert(internal_cid, conn.clone());
+            endpoint.core.add_cid(internal_cid, addr);
 
             (conn, connected_recv)
         };
@@ -166,10 +166,10 @@ impl<S: Socket> EndpointIO<S> {
         dst_cid: ConnectionID,
         src_cid: ConnectionID,
         addr: SocketAddr,
-    ) -> (ConnectionHandle, ConnectionID) {
+    ) -> (ConnectionHandle, InternalCID) {
         let (incoming_data, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         let (connected_send, connected_recv) = oneshot::channel();
-        let (core, local_cid) = self.core.new_server_conn(dst_cid, src_cid, addr);
+        let (core, internal_cid) = self.core.new_server_conn(dst_cid, src_cid, addr);
         // TODO: Always server??
         let connection = Connection::new(
             addr,
@@ -178,20 +178,20 @@ impl<S: Socket> EndpointIO<S> {
             incoming_rx,
             self.outgoing_tx.clone(),
         );
-        println!("Received new connection: {local_cid:?}, {src_cid:?}");
+        println!("Received new connection: {internal_cid:?}, {src_cid:?}");
 
         let handle = ConnectionHandle {
             addr,
             incoming_data,
         };
 
-        self.connections.insert(local_cid, connection);
+        self.connections.insert(internal_cid, connection);
 
         // TODO: Handle create incomming connection
-        let incoming = IncomingInner::new(local_cid, connected_recv);
+        let incoming = IncomingInner::new(internal_cid, connected_recv);
         self.incoming_tx.send(incoming).unwrap();
 
-        (handle, local_cid)
+        (handle, internal_cid)
     }
 
     fn handle_datagram(&mut self, data: BytesMut, addr: SocketAddr) {
@@ -217,12 +217,13 @@ impl<S: Socket> EndpointIO<S> {
                 protected,
                 remote,
             } => {
-                let (handle, local_cid) = self.create_new_connection(dst_cid, src_cid, remote);
+                let (handle, internal_cid) = self.create_new_connection(dst_cid, src_cid, remote);
                 handle
                     .incoming_data
                     .send(EndpointToConnection { protected, addr })
                     .unwrap();
-                self.connection_handles.insert(local_cid, handle);
+                self.core.add_cid(internal_cid, remote);
+                self.connection_handles.insert(internal_cid, handle);
             }
             EndpointOutput::Drop => todo!(),
             EndpointOutput::SendDatagram => todo!(),
