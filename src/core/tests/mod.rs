@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicU64};
 
 use bytes::BytesMut;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::core::{
     connection::{ConnEvent, ConnectionCore},
-    connection_id::ConnectionID,
+    connection_id::{ConnectionID, InternalCID},
     crypto::CryptoConn,
     packet::ProtectedPacket,
     space::PacketSpace,
@@ -18,6 +18,8 @@ mod timers;
 // Will contain utils for the other tests
 const CID_LEN: u8 = 4;
 const MTU: usize = 1500;
+static CLIENT_INTERNAL_CID: AtomicU64 = AtomicU64::new(0);
+static SERVER_INTERNAL_CID: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn create_connections() -> (ConnectionCore, ConnectionCore) {
     let transport_params = Arc::new(TransportParam::new());
@@ -25,6 +27,7 @@ pub(super) fn create_connections() -> (ConnectionCore, ConnectionCore) {
     let (client_crypto, server_crypto) = new_crypto_conns();
 
     let client = ConnectionCore::new(
+        CLIENT_INTERNAL_CID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         client_cid,
         server_cid,
         server_cid,
@@ -33,6 +36,7 @@ pub(super) fn create_connections() -> (ConnectionCore, ConnectionCore) {
         transport_params.clone(),
     );
     let server = ConnectionCore::new(
+        SERVER_INTERNAL_CID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         server_cid,
         client_cid,
         server_cid,

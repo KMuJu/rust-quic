@@ -281,7 +281,14 @@ impl ConnectionIO {
 
     pub(crate) fn handle_data(&mut self, data: Vec<EndpointToConnection>) {
         for data in data {
-            self.core.handle_datagram(data.protected);
+            match data {
+                EndpointToConnection::Packet { protected, addr } => {
+                    self.core.handle_datagram(protected)
+                }
+                EndpointToConnection::NewConnectionId { cid } => {
+                    todo!();
+                }
+            }
         }
     }
 
@@ -306,7 +313,7 @@ impl ConnectionIO {
             }
             while let Some(packet) = self.core.get_encrypted_packet(p_space, mtu) {
                 self.outgoing_data
-                    .send(ConnectionToEndpoint {
+                    .send(ConnectionToEndpoint::Datagram {
                         data: packet,
                         addr: self.addr,
                     })

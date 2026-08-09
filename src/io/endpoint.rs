@@ -197,17 +197,17 @@ impl<S: Socket> EndpointIO<S> {
     fn handle_datagram(&mut self, data: BytesMut, addr: SocketAddr) {
         match self.core.handle_datagram(data, addr) {
             EndpointOutput::RouteToConnection {
-                dst_cid,
+                internal_cid,
                 protected,
                 migration,
             } => {
-                if let Some(handle) = self.connection_handles.get(&dst_cid) {
+                if let Some(handle) = self.connection_handles.get(&internal_cid) {
                     handle
                         .incoming_data
-                        .send(EndpointToConnection { protected, addr })
+                        .send(EndpointToConnection::Packet { protected, addr })
                         .unwrap();
                 } else {
-                    eprintln!("Could not get connection handle for {dst_cid:?}");
+                    eprintln!("Could not get connection handle for {internal_cid:?}");
                     eprintln!("{:?}", self.connection_handles);
                 }
             }
@@ -220,7 +220,7 @@ impl<S: Socket> EndpointIO<S> {
                 let (handle, internal_cid) = self.create_new_connection(dst_cid, src_cid, remote);
                 handle
                     .incoming_data
-                    .send(EndpointToConnection { protected, addr })
+                    .send(EndpointToConnection::Packet { protected, addr })
                     .unwrap();
                 self.core.add_cid(internal_cid, remote);
                 self.connection_handles.insert(internal_cid, handle);
@@ -270,13 +270,25 @@ impl<S: Socket> EndpointIO<S> {
             }
             .unwrap(); // WARN: Handle?
 
-            if self
-                .socket
-                .poll_send_to(cx, &msg.data, msg.addr)
-                .is_pending()
-            {
-                self.stashed_packet.push_back((msg.data, msg.addr));
-            }
+            match msg {
+                ConnectionToEndpoint::Datagram { data, addr } => {
+                    if self.socket.poll_send_to(cx, &data, addr).is_pending() {
+                        self.stashed_packet.push_back((data, addr));
+                    }
+                }
+                ConnectionToEndpoint::NewConnectionIdRequest { internal_cid } => {
+                    let cid = self.core.new_connection_id(internal_cid);
+                    if let Some(handle) = self.connection_handles.get(&internal_cid) {
+                        handle
+                            .incoming_data
+                            .send(EndpointToConnection::NewConnectionId { cid })
+                            .unwrap();
+                    } else {
+                        eprintln!("Could not get connection handle for {internal_cid:?}");
+                        eprintln!("{:?}", self.connection_handles);
+                    }
+                }
+            };
         }
     }
 }

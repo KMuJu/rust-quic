@@ -11,7 +11,7 @@ use tokio::{io::ReadBuf, time::Instant};
 use crate::{
     core::{
         congestion::CongestionController,
-        connection_id::ConnectionID,
+        connection_id::{ConnectionID, InternalCID},
         crypto::{self, CryptoConn, handshake_type},
         encoding::VarInt,
         frame::{Ack, Frame, Stream},
@@ -49,7 +49,8 @@ pub enum StreamEvent {
 }
 
 pub struct ConnectionCore {
-    id: ConnectionID,
+    internal_cid: InternalCID,
+    cid: ConnectionID,
     peer_cid: ConnectionID,
     /// The CID assigned to the server in the first message
     first_cid: ConnectionID,
@@ -86,6 +87,7 @@ pub struct ConnectionCore {
 
 impl ConnectionCore {
     pub(crate) fn new(
+        internal_cid: InternalCID,
         cid: ConnectionID,
         peer_cid: ConnectionID,
         first_cid: ConnectionID,
@@ -94,7 +96,8 @@ impl ConnectionCore {
         transport_params: SharedConfig,
     ) -> Self {
         let mut conn = ConnectionCore {
-            id: cid,
+            internal_cid,
+            cid,
             peer_cid,
             first_cid,
             side,
@@ -149,7 +152,7 @@ impl ConnectionCore {
             .expand(self.spaces[p_space].largest_received + 1);
         println!(
             "{:?}({:?})[{:?}]: Got {:?}",
-            self.id, self.lifecycle, self.side, packet
+            self.cid, self.lifecycle, self.side, packet
         );
         if !self.spaces[p_space]
             .acker
@@ -628,7 +631,7 @@ impl ConnectionCore {
         let header = match p_space {
             PacketSpace::Initial => Header::Initial {
                 dst_cid: self.peer_cid,
-                src_cid: self.id,
+                src_cid: self.cid,
                 packet_number: pn,
                 version: 0,
                 token: None,
@@ -636,7 +639,7 @@ impl ConnectionCore {
             },
             PacketSpace::Handshake => Header::Handshake {
                 dst_cid: self.peer_cid,
-                src_cid: self.id,
+                src_cid: self.cid,
                 packet_number: pn,
                 version: 0,
                 length: VarInt(0),

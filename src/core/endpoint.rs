@@ -29,7 +29,7 @@ pub struct EndpointCore {
 
 pub enum EndpointOutput {
     RouteToConnection {
-        dst_cid: InternalCID,
+        internal_cid: InternalCID,
         protected: ProtectedPacket,
         migration: Option<SocketAddr>,
     },
@@ -60,21 +60,20 @@ impl EndpointCore {
         let protected = ProtectedPacket::new(data, self.cid_len).expect("Could not decode header");
         let dst_cid = protected.dst_cid();
 
-        println!("[INTERNAL] Current connections: {:?}", self.connections);
-
+        // Should probably error if there is an internal cid but no remote
         if let Some(internal_cid) = self.connections.get(&dst_cid)
             && let Some(old_remote) = self.connections_addresses.get(internal_cid)
         {
             if old_remote == &remote {
                 return EndpointOutput::RouteToConnection {
-                    dst_cid: *internal_cid,
+                    internal_cid: *internal_cid,
                     protected,
                     migration: None,
                 };
             }
 
             return EndpointOutput::RouteToConnection {
-                dst_cid: *internal_cid,
+                internal_cid: *internal_cid,
                 protected,
                 migration: Some(remote),
             };
@@ -131,6 +130,7 @@ impl EndpointCore {
         self.connections.insert(local_cid, internal_cid);
 
         let core = ConnectionCore::new(
+            internal_cid,
             local_cid,
             remote_cid,
             remote_cid,
@@ -162,6 +162,7 @@ impl EndpointCore {
 
         (
             ConnectionCore::new(
+                internal_cid,
                 local_cid,
                 remote_cid,
                 first_cid,
@@ -171,5 +172,13 @@ impl EndpointCore {
             ),
             internal_cid,
         )
+    }
+
+    pub fn new_connection_id(&mut self, internal_cid: InternalCID) -> ConnectionID {
+        let cid = ConnectionID::new(self.cid_len, &mut self.rng);
+
+        self.connections.insert(cid, internal_cid);
+
+        cid
     }
 }

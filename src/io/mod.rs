@@ -2,17 +2,25 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
-use crate::core::packet::ProtectedPacket;
+use crate::core::{
+    connection_id::{ConnectionID, InternalCID},
+    packet::ProtectedPacket,
+};
 
 pub mod connection;
 pub mod endpoint;
 
-pub(crate) struct ConnectionToEndpoint {
-    data: Bytes,
-    addr: SocketAddr,
+pub(crate) enum ConnectionToEndpoint {
+    Datagram { data: Bytes, addr: SocketAddr },
+    NewConnectionIdRequest { internal_cid: InternalCID },
 }
 
-pub(crate) struct EndpointToConnection {
-    protected: ProtectedPacket,
-    addr: SocketAddr,
+pub(crate) enum EndpointToConnection {
+    Packet {
+        protected: ProtectedPacket,
+        addr: SocketAddr,
+    },
+    NewConnectionId {
+        cid: ConnectionID,
+    },
 }
