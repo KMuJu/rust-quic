@@ -23,7 +23,7 @@ use tokio::{
 use crate::{
     core::{
         connection::{ConnEvent, ConnectionCore, StreamEvent},
-        connection_id::{ConnectionID, InternalCID},
+        connection_id::InternalCID,
         space::PacketSpace,
         stream::{Dir, StreamID},
     },
@@ -286,7 +286,7 @@ impl ConnectionIO {
                     self.core.handle_datagram(protected)
                 }
                 EndpointToConnection::NewConnectionId { cid } => {
-                    todo!();
+                    self.core.new_cid(cid);
                 }
             }
         }
@@ -360,6 +360,10 @@ impl ConnectionIO {
                     StreamEvent::Writeable { id } => todo!(),
                 },
                 ConnEvent::CloseConnection => todo!(),
+                ConnEvent::NewConnectionId(internal_cid) => self
+                    .outgoing_data
+                    .send(ConnectionToEndpoint::NewConnectionIdRequest { internal_cid })
+                    .unwrap(),
             }
         }
     }

@@ -11,7 +11,7 @@ use tokio::{io::ReadBuf, time::Instant};
 use crate::{
     core::{
         congestion::CongestionController,
-        connection_id::{ConnectionID, InternalCID},
+        connection_id::{ConnectionID, ConnectionIDQueue, InternalCID},
         crypto::{self, CryptoConn, handshake_type},
         encoding::VarInt,
         frame::{Ack, Frame, Stream},
@@ -38,6 +38,7 @@ pub enum ConnEvent {
     HandshakeDone,
     CloseConnection,
     Stream(StreamEvent),
+    NewConnectionId(InternalCID),
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -50,8 +51,8 @@ pub enum StreamEvent {
 
 pub struct ConnectionCore {
     internal_cid: InternalCID,
-    cid: ConnectionID,
-    peer_cid: ConnectionID,
+    cid: ConnectionIDQueue,
+    peer_cid: ConnectionIDQueue,
     /// The CID assigned to the server in the first message
     first_cid: ConnectionID,
     side: Side,
@@ -81,6 +82,7 @@ pub struct ConnectionCore {
     timers: TimerTable,
 
     conn_event_queue: VecDeque<ConnEvent>,
+    endpoint_event_queue: VecDeque<u8>,
 
     crypto: CryptoConn,
 }
@@ -97,8 +99,8 @@ impl ConnectionCore {
     ) -> Self {
         let mut conn = ConnectionCore {
             internal_cid,
-            cid,
-            peer_cid,
+            cid: ConnectionIDQueue::new(cid),
+            peer_cid: ConnectionIDQueue::new(peer_cid),
             first_cid,
             side,
             lifecycle: LifeCycle::Handshake,
@@ -121,6 +123,7 @@ impl ConnectionCore {
             congestion: CongestionController::new(transport_params.clone()),
             timers: TimerTable::new(),
             conn_event_queue: VecDeque::new(),
+            endpoint_event_queue: VecDeque::new(),
             crypto,
         };
 
@@ -152,7 +155,7 @@ impl ConnectionCore {
             .expand(self.spaces[p_space].largest_received + 1);
         println!(
             "{:?}({:?})[{:?}]: Got {:?}",
-            self.cid, self.lifecycle, self.side, packet
+            self.cid.current, self.lifecycle, self.side, packet
         );
         if !self.spaces[p_space]
             .acker
@@ -176,9 +179,9 @@ impl ConnectionCore {
 
         if let Side::Client = self.side
             && let Some(src_cid) = packet.src_cid()
-            && self.peer_cid == self.first_cid
+            && self.peer_cid.current == self.first_cid
         {
-            self.peer_cid = src_cid;
+            self.peer_cid.reset(src_cid);
         }
 
         match &packet.header {
@@ -212,7 +215,7 @@ impl ConnectionCore {
                 }
             }
             Header::Short { .. } => self.handle_data_packet(packet),
-        }
+        };
     }
 
     fn handle_data_packet(&mut self, packet: Packet) {
@@ -263,8 +266,15 @@ impl ConnectionCore {
                     retire,
                     cid,
                     stateless_reset_token,
-                } => todo!(),
-                Frame::RetireConnectionId { seq_num } => todo!(),
+                } => {
+                    self.peer_cid.retire_prior(retire.0);
+                    let mut cid = cid;
+                    cid.seq_num = seq_num.0;
+                    self.peer_cid.add_cid(cid);
+                }
+                Frame::RetireConnectionId { seq_num } => {
+                    self.peer_cid.retire(seq_num.0);
+                }
                 Frame::PathChallenge { data } => todo!(),
                 Frame::PathResponse { data } => todo!(),
                 Frame::ConnectionCloseQuic {
@@ -630,16 +640,16 @@ impl ConnectionCore {
 
         let header = match p_space {
             PacketSpace::Initial => Header::Initial {
-                dst_cid: self.peer_cid,
-                src_cid: self.cid,
+                dst_cid: self.peer_cid.current,
+                src_cid: self.cid.current,
                 packet_number: pn,
                 version: 0,
                 token: None,
                 length: VarInt(0),
             },
             PacketSpace::Handshake => Header::Handshake {
-                dst_cid: self.peer_cid,
-                src_cid: self.cid,
+                dst_cid: self.peer_cid.current,
+                src_cid: self.cid.current,
                 packet_number: pn,
                 version: 0,
                 length: VarInt(0),
@@ -647,7 +657,7 @@ impl ConnectionCore {
             PacketSpace::Data => Header::Short {
                 spin: false,
                 key_phase: false,
-                dst_cid: self.peer_cid,
+                dst_cid: self.peer_cid.current,
                 packet_number: pn,
             },
         };
@@ -760,6 +770,36 @@ impl ConnectionCore {
         Some(bytes)
     }
 
+    #[cfg(test)]
+    pub(crate) fn send_new_cid(&mut self, cid: ConnectionID) {
+        use crate::core::packet::Token;
+
+        self.cid.add_cid(cid);
+        let frame = Frame::NewConnectionId {
+            seq_num: VarInt(cid.seq_num),
+            retire: VarInt(0),
+            cid,
+            stateless_reset_token: Token(vec![]),
+        };
+
+        self.spaces[PacketSpace::Data]
+            .pending_frames
+            .push_back(frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_current_cid(&mut self) {
+        let curr_seq_num = self.cid.current.seq_num;
+        self.cid.retire(curr_seq_num);
+        let frame = Frame::RetireConnectionId {
+            seq_num: VarInt(curr_seq_num),
+        };
+
+        self.spaces[PacketSpace::Data]
+            .pending_frames
+            .push_back(frame);
+    }
+
     fn build_pto_probe(&mut self, p_space: PacketSpace) -> Vec<Frame> {
         let unacked = self.spaces[p_space].acker.unacked_frames();
         if !unacked.is_empty() {
@@ -805,6 +845,15 @@ impl ConnectionCore {
         if is_in_flight {
             self.set_loss_timer();
         }
+    }
+
+    pub(crate) fn new_cid(&mut self, cid: ConnectionID) {
+        self.cid.add_cid(cid);
+    }
+
+    pub(crate) fn queue_connection_id_request(&mut self) {
+        self.conn_event_queue
+            .push_back(ConnEvent::NewConnectionId(self.internal_cid));
     }
 
     pub fn recv(&mut self, id: &StreamID) -> Option<&mut RecvStream> {

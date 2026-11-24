@@ -597,8 +597,17 @@ impl Frame {
                 retire,
                 cid,
                 stateless_reset_token,
-            } => todo!(),
-            Frame::RetireConnectionId { seq_num } => todo!(),
+            } => {
+                variable_length(NEW_CONNECTION_ID)
+                    + seq_num.length()
+                    + retire.length()
+                    + variable_length(cid.len as u64)
+                    + cid.len as usize
+                    + 128
+            }
+            Frame::RetireConnectionId { seq_num } => {
+                variable_length(RETIRE_CONNECTION_ID) + seq_num.length()
+            }
             Frame::PathChallenge { data } => todo!(),
             Frame::PathResponse { data } => todo!(),
             Frame::ConnectionCloseQuic {

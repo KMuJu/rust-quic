@@ -5,7 +5,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::core::{
     connection::{ConnEvent, ConnectionCore},
-    connection_id::{ConnectionID, InternalCID},
+    connection_id::ConnectionID,
     crypto::CryptoConn,
     packet::ProtectedPacket,
     space::PacketSpace,
@@ -13,6 +13,7 @@ use crate::core::{
     transport_parameters::TransportParam,
 };
 
+mod connection_ids;
 mod timers;
 
 // Will contain utils for the other tests
@@ -20,10 +21,12 @@ const CID_LEN: u8 = 4;
 const MTU: usize = 1500;
 static CLIENT_INTERNAL_CID: AtomicU64 = AtomicU64::new(0);
 static SERVER_INTERNAL_CID: AtomicU64 = AtomicU64::new(0);
+static CLIENT_CID_SEQ_NUM: AtomicU64 = AtomicU64::new(0);
+static SERVER_CID_SEQ_NUM: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn create_connections() -> (ConnectionCore, ConnectionCore) {
     let transport_params = Arc::new(TransportParam::new());
-    let (client_cid, server_cid) = (new_cid(), new_cid());
+    let (client_cid, server_cid) = (new_cid(Side::Client), new_cid(Side::Server));
     let (client_crypto, server_crypto) = new_crypto_conns();
 
     let client = ConnectionCore::new(
@@ -99,8 +102,13 @@ fn handshake_is_done(conn: &mut ConnectionCore) -> bool {
     false
 }
 
-fn new_cid() -> ConnectionID {
-    ConnectionID::new(CID_LEN, &mut rand::make_rng())
+pub(super) fn new_cid(side: Side) -> ConnectionID {
+    let seq_num = match side {
+        Side::Client => CLIENT_CID_SEQ_NUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        Side::Server => SERVER_CID_SEQ_NUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    };
+
+    ConnectionID::new(seq_num, CID_LEN, &mut rand::make_rng())
 }
 
 fn new_crypto_conns() -> (CryptoConn, CryptoConn) {

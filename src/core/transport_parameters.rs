@@ -5,6 +5,7 @@ use std::{sync::Arc, time::Duration};
 pub(crate) struct TransportParam {
     pub(crate) max_ack_delay: Duration,
     pub(crate) ack_delay_exponent: u32,
+    pub(crate) active_connection_id_limit: u32,
 }
 
 pub(crate) type SharedConfig = Arc<TransportParam>;
@@ -14,6 +15,7 @@ impl TransportParam {
         Self {
             max_ack_delay: Duration::from_millis(25),
             ack_delay_exponent: 3,
+            active_connection_id_limit: 5,
         }
     }
 }

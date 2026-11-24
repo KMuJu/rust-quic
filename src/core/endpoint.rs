@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::BytesMut;
 use rand::rngs::StdRng;
@@ -10,7 +6,7 @@ use rand::rngs::StdRng;
 use crate::core::{
     config::{ClientConfig, ServerConfig},
     connection::ConnectionCore,
-    connection_id::{self, ConnectionID, InternalCID},
+    connection_id::{ConnectionID, InternalCID},
     crypto::CryptoConn,
     packet::ProtectedPacket,
     stream::Side,
@@ -23,6 +19,7 @@ pub struct EndpointCore {
     connections_addresses: HashMap<InternalCID, SocketAddr>,
     connections: HashMap<ConnectionID, InternalCID>,
     current_internal_cid: InternalCID,
+    current_cid_seq_num: u64,
     client_config: Option<ClientConfig>,
     server_config: Option<ServerConfig>,
 }
@@ -51,6 +48,7 @@ impl EndpointCore {
             connections_addresses: HashMap::new(),
             connections: HashMap::new(),
             current_internal_cid: 0,
+            current_cid_seq_num: 0,
             client_config,
             server_config,
         }
@@ -102,11 +100,11 @@ impl EndpointCore {
         self.connections_addresses.insert(internal_cid, remote);
     }
 
-    fn initial_cids(&mut self) -> (ConnectionID, ConnectionID) {
-        (
-            ConnectionID::new(self.cid_len, &mut self.rng),
-            ConnectionID::new(self.cid_len, &mut self.rng),
-        )
+    fn create_cid(&mut self) -> ConnectionID {
+        let cid = ConnectionID::new(self.current_cid_seq_num, self.cid_len, &mut self.rng);
+        self.current_cid_seq_num += 1;
+
+        cid
     }
 
     fn current_icid(&mut self) -> InternalCID {
@@ -117,7 +115,8 @@ impl EndpointCore {
 
     pub fn new_client_conn(&mut self, name: &str) -> (ConnectionCore, InternalCID) {
         let transport_params = Arc::new(TransportParam::new());
-        let (local_cid, remote_cid) = self.initial_cids();
+        let local_cid = self.create_cid();
+        let remote_cid = self.create_cid();
 
         let crypto = CryptoConn::new_client(
             self.client_config.as_ref().unwrap().crypto.clone(),
@@ -154,7 +153,7 @@ impl EndpointCore {
             CryptoConn::new_server(self.server_config.as_ref().unwrap().crypto.clone(), vec![])
                 .unwrap();
 
-        let local_cid = ConnectionID::new(self.cid_len, &mut self.rng);
+        let local_cid = self.create_cid();
         let internal_cid = self.current_icid();
         self.connections.insert(local_cid, internal_cid);
 
@@ -175,7 +174,7 @@ impl EndpointCore {
     }
 
     pub fn new_connection_id(&mut self, internal_cid: InternalCID) -> ConnectionID {
-        let cid = ConnectionID::new(self.cid_len, &mut self.rng);
+        let cid = self.create_cid();
 
         self.connections.insert(cid, internal_cid);
 
